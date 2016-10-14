@@ -74,12 +74,19 @@ PyObject   *PLy_interp_globals = NULL;
 /* this doesn't need to be global; use PLy_current_execution_context() */
 static PLyExecutionContext *PLy_execution_contexts = NULL;
 
+/* postgres backend handler for interruption */
+static pqsigfunc coreIntHandler = 0;
+static void PLy_handle_interrupt(int sig);
+
 
 void
 _PG_init(void)
 {
 	int		  **bitmask_ptr;
 	const int **version_ptr;
+
+  	// Catch and process signals
+  	coreIntHandler = pqsignal(SIGINT, PLy_handle_interrupt);
 
 	/*
 	 * Set up a shared bitmask variable telling which Python version(s) are
@@ -454,3 +461,31 @@ PLy_pop_execution_context(void)
 	MemoryContextDelete(context->scratch_ctx);
 	PLy_free(context);
 }
+
+void _PG_fini(void);
+void
+_PG_fini(void)
+{
+	if (coreIntHandler) {
+		pqsignal(SIGINT, coreIntHandler);
+	}
+}
+
+static int
+PLy_python_interruption_handler()
+{
+	PyErr_SetString(PyExc_RuntimeError, "Execution of function interrupted by signal");
+	return 0;
+}
+
+static void
+PLy_handle_interrupt(int sig)
+{
+	// custom interruption
+	Py_AddPendingCall(PLy_python_interruption_handler, NULL);
+
+	if (coreIntHandler) {
+		(*coreIntHandler)(sig);
+	}
+}
+
