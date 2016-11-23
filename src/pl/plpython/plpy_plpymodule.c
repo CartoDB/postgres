@@ -258,6 +258,7 @@ PLy_generate_spi_exceptions(PyObject *mod, PyObject *base)
 		PyDict_SetItemString(dict, "sqlstate", sqlstate);
 		Py_DECREF(sqlstate);
 		exc = PyErr_NewException(exception_map[i].name, base, dict);
+		Py_INCREF(exc);
 		PyModule_AddObject(mod, exception_map[i].classname, exc);
 		entry = hash_search(PLy_spi_exceptions, &exception_map[i].sqlstate,
 							HASH_ENTER, &found);
