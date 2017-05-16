@@ -39,6 +39,9 @@
 #include "utils/rel.h"
 #include "utils/sampling.h"
 
+#include <sys/time.h>
+#include <time.h>
+
 PG_MODULE_MAGIC;
 
 /* Default CPU cost to start up a foreign query. */
@@ -74,7 +77,7 @@ typedef struct PgFdwRelationInfo
 	bool		use_remote_estimate;
 	Cost		fdw_startup_cost;
 	Cost		fdw_tuple_cost;
-
+	
 	/* Cached catalog information. */
 	ForeignTable *table;
 	ForeignServer *server;
@@ -153,6 +156,9 @@ typedef struct PgFdwScanState
 	/* batch-level state, for optimizing rewinds and avoiding useless fetch */
 	int			fetch_ct_2;		/* Min(# of fetches done, 2) */
 	bool		eof_reached;	/* true if last fetch reached EOF */
+
+	/* Timing */
+	struct timeval start_time;
 
 	/* working memory contexts */
 	MemoryContext batch_cxt;	/* context holding current batch of tuples */
@@ -1019,7 +1025,10 @@ postgresIterateForeignScan(ForeignScanState *node)
 	 * cursor on the remote side.
 	 */
 	if (!fsstate->cursor_exists)
+    {
+		gettimeofday(&(fsstate->start_time), NULL);
 		create_cursor(node);
+    }
 
 	/*
 	 * Get some more tuples, if we've run out.
@@ -1116,7 +1125,15 @@ postgresEndForeignScan(ForeignScanState *node)
 
 	/* Close the cursor if open, to prevent accumulation of cursors */
 	if (fsstate->cursor_exists)
+	{
+		struct timeval end_time;
+		double secs;
+		gettimeofday(&end_time, NULL);
+		secs  = 1000 * end_time.tv_sec + end_time.tv_usec/1000.0;
+		secs -= 1000 * (fsstate->start_time).tv_sec + (fsstate->start_time).tv_usec/1000.0;
+		elog(DEBUG1, "FDW Query Duration: %.3lf ms", secs);
 		close_cursor(fsstate->conn, fsstate->cursor_number);
+	}
 
 	/* Release remote connection */
 	ReleaseConnection(fsstate->conn);
