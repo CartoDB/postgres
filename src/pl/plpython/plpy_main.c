@@ -74,9 +74,9 @@ PyObject   *PLy_interp_globals = NULL;
 /* this doesn't need to be global; use PLy_current_execution_context() */
 static PLyExecutionContext *PLy_execution_contexts = NULL;
 
-+/* postgres backend handler for interruption */
-+static pqsigfunc coreIntHandler = 0;
-+static void PLy_handle_interrupt(int sig);
+/* postgres backend handler for interruption */
+static pqsigfunc coreIntHandler = 0;
+static void PLy_handle_interrupt(int sig);
 
 void
 _PG_init(void)
