@@ -3,7 +3,7 @@
  * indexcmds.c
  *	  POSTGRES define and remove index code.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,12 +15,15 @@
 
 #include "postgres.h"
 
+#include "access/amapi.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "access/sysattr.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_tablespace.h"
@@ -35,6 +38,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
+#include "optimizer/var.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
@@ -47,6 +51,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
@@ -65,8 +70,6 @@ static void ComputeIndexAttrs(IndexInfo *indexInfo,
 				  char *accessMethodName, Oid accessMethodId,
 				  bool amcanorder,
 				  bool isconstraint);
-static Oid GetIndexOpClass(List *opclass, Oid attrType,
-				char *accessMethodName, Oid accessMethodId);
 static char *ChooseIndexName(const char *tabname, Oid namespaceId,
 				List *colnames, List *exclusionOpNames,
 				bool primary, bool isconstraint);
@@ -96,7 +99,7 @@ static void RangeVarCallbackForReindexIndex(const RangeVar *relation,
  * Errors arising from the attribute list still apply.
  *
  * Most column type changes that can skip a table rewrite do not invalidate
- * indexes.  We ackowledge this when all operator classes, collations and
+ * indexes.  We acknowledge this when all operator classes, collations and
  * exclusion operators match.  Though we could further permit intra-opfamily
  * changes for btree and hash indexes, that adds subtle complexity with no
  * concrete benefit for core types.
@@ -125,6 +128,7 @@ CheckIndexCompatible(Oid oldId,
 	HeapTuple	tuple;
 	Form_pg_index indexForm;
 	Form_pg_am	accessMethodForm;
+	IndexAmRoutine *amRoutine;
 	bool		amcanorder;
 	int16	   *coloptions;
 	IndexInfo  *indexInfo;
@@ -160,8 +164,10 @@ CheckIndexCompatible(Oid oldId,
 						accessMethodName)));
 	accessMethodId = HeapTupleGetOid(tuple);
 	accessMethodForm = (Form_pg_am) GETSTRUCT(tuple);
-	amcanorder = accessMethodForm->amcanorder;
+	amRoutine = GetIndexAmRoutine(accessMethodForm->amhandler);
 	ReleaseSysCache(tuple);
+
+	amcanorder = amRoutine->amcanorder;
 
 	/*
 	 * Compute the operator classes, collations, and exclusion operators for
@@ -173,10 +179,12 @@ CheckIndexCompatible(Oid oldId,
 	indexInfo = makeNode(IndexInfo);
 	indexInfo->ii_Expressions = NIL;
 	indexInfo->ii_ExpressionsState = NIL;
-	indexInfo->ii_PredicateState = NIL;
+	indexInfo->ii_PredicateState = NULL;
 	indexInfo->ii_ExclusionOps = NULL;
 	indexInfo->ii_ExclusionProcs = NULL;
 	indexInfo->ii_ExclusionStrats = NULL;
+	indexInfo->ii_AmCache = NULL;
+	indexInfo->ii_Context = CurrentMemoryContext;
 	typeObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
 	collationObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
 	classObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
@@ -234,7 +242,7 @@ CheckIndexCompatible(Oid oldId,
 	for (i = 0; i < old_natts; i++)
 	{
 		if (IsPolymorphicType(get_opclass_input_type(classObjectId[i])) &&
-			irel->rd_att->attrs[i]->atttypid != typeObjectId[i])
+			TupleDescAttr(irel->rd_att, i)->atttypid != typeObjectId[i])
 		{
 			ret = false;
 			break;
@@ -262,7 +270,7 @@ CheckIndexCompatible(Oid oldId,
 
 				op_input_types(indexInfo->ii_ExclusionOps[i], &left, &right);
 				if ((IsPolymorphicType(left) || IsPolymorphicType(right)) &&
-					irel->rd_att->attrs[i]->atttypid != typeObjectId[i])
+					TupleDescAttr(irel->rd_att, i)->atttypid != typeObjectId[i])
 				{
 					ret = false;
 					break;
@@ -285,8 +293,11 @@ CheckIndexCompatible(Oid oldId,
  * 'indexRelationId': normally InvalidOid, but during bootstrap can be
  *		nonzero to specify a preselected OID for the index.
  * 'is_alter_table': this is due to an ALTER rather than a CREATE operation.
- * 'check_rights': check for CREATE rights in the namespace.  (This should
- *		be true except when ALTER is deleting/recreating an index.)
+ * 'check_rights': check for CREATE rights in namespace and tablespace.  (This
+ *		should be true except when ALTER is deleting/recreating an index.)
+ * 'check_not_in_use': check for table not already in use in current session.
+ *		This should be true unless caller is holding the table open, in which
+ *		case the caller had better have checked it earlier.
  * 'skip_build': make the catalog entries but leave the index file empty;
  *		it will be filled later.
  * 'quiet': suppress the NOTICE chatter ordinarily provided for constraints.
@@ -299,6 +310,7 @@ DefineIndex(Oid relationId,
 			Oid indexRelationId,
 			bool is_alter_table,
 			bool check_rights,
+			bool check_not_in_use,
 			bool skip_build,
 			bool quiet)
 {
@@ -315,8 +327,9 @@ DefineIndex(Oid relationId,
 	Relation	indexRelation;
 	HeapTuple	tuple;
 	Form_pg_am	accessMethodForm;
+	IndexAmRoutine *amRoutine;
 	bool		amcanorder;
-	RegProcedure amoptions;
+	amoptions_function amoptions;
 	Datum		reloptions;
 	int16	   *coloptions;
 	IndexInfo  *indexInfo;
@@ -375,6 +388,11 @@ DefineIndex(Oid relationId,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot create index on foreign table \"%s\"",
 							RelationGetRelationName(rel))));
+		else if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot create index on partitioned table \"%s\"",
+							RelationGetRelationName(rel))));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -389,6 +407,15 @@ DefineIndex(Oid relationId,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot create indexes on temporary tables of other sessions")));
+
+	/*
+	 * Unless our caller vouches for having checked this already, insist that
+	 * the table not be in use by our own session, either.  Otherwise we might
+	 * fail to make entries in the new index (for instance, if an INSERT or
+	 * UPDATE is in progress and has already made its list of target indexes).
+	 */
+	if (check_not_in_use)
+		CheckTableNotInUse(rel, "CREATE INDEX");
 
 	/*
 	 * Verify we (still) have CREATE rights in the rel's namespace.
@@ -421,8 +448,9 @@ DefineIndex(Oid relationId,
 		/* note InvalidOid is OK in this case */
 	}
 
-	/* Check permissions except when using database's default */
-	if (OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
+	/* Check tablespace permissions */
+	if (check_rights &&
+		OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
 	{
 		AclResult	aclresult;
 
@@ -489,31 +517,28 @@ DefineIndex(Oid relationId,
 	}
 	accessMethodId = HeapTupleGetOid(tuple);
 	accessMethodForm = (Form_pg_am) GETSTRUCT(tuple);
+	amRoutine = GetIndexAmRoutine(accessMethodForm->amhandler);
 
-	if (strcmp(accessMethodName, "hash") == 0 &&
-		RelationNeedsWAL(rel))
-		ereport(WARNING,
-				(errmsg("hash indexes are not WAL-logged and their use is discouraged")));
-
-	if (stmt->unique && !accessMethodForm->amcanunique)
+	if (stmt->unique && !amRoutine->amcanunique)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			   errmsg("access method \"%s\" does not support unique indexes",
-					  accessMethodName)));
-	if (numberOfAttributes > 1 && !accessMethodForm->amcanmulticol)
+				 errmsg("access method \"%s\" does not support unique indexes",
+						accessMethodName)));
+	if (numberOfAttributes > 1 && !amRoutine->amcanmulticol)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		  errmsg("access method \"%s\" does not support multicolumn indexes",
-				 accessMethodName)));
-	if (stmt->excludeOpNames && !OidIsValid(accessMethodForm->amgettuple))
+				 errmsg("access method \"%s\" does not support multicolumn indexes",
+						accessMethodName)));
+	if (stmt->excludeOpNames && amRoutine->amgettuple == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		errmsg("access method \"%s\" does not support exclusion constraints",
-			   accessMethodName)));
+				 errmsg("access method \"%s\" does not support exclusion constraints",
+						accessMethodName)));
 
-	amcanorder = accessMethodForm->amcanorder;
-	amoptions = accessMethodForm->amoptions;
+	amcanorder = amRoutine->amcanorder;
+	amoptions = amRoutine->amoptions;
 
+	pfree(amRoutine);
 	ReleaseSysCache(tuple);
 
 	/*
@@ -539,7 +564,7 @@ DefineIndex(Oid relationId,
 	indexInfo->ii_Expressions = NIL;	/* for now */
 	indexInfo->ii_ExpressionsState = NIL;
 	indexInfo->ii_Predicate = make_ands_implicit((Expr *) stmt->whereClause);
-	indexInfo->ii_PredicateState = NIL;
+	indexInfo->ii_PredicateState = NULL;
 	indexInfo->ii_ExclusionOps = NULL;
 	indexInfo->ii_ExclusionProcs = NULL;
 	indexInfo->ii_ExclusionStrats = NULL;
@@ -548,6 +573,8 @@ DefineIndex(Oid relationId,
 	indexInfo->ii_ReadyForInserts = !stmt->concurrent;
 	indexInfo->ii_Concurrent = stmt->concurrent;
 	indexInfo->ii_BrokenHotChain = false;
+	indexInfo->ii_AmCache = NULL;
+	indexInfo->ii_Context = CurrentMemoryContext;
 
 	typeObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
 	collationObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
@@ -567,6 +594,41 @@ DefineIndex(Oid relationId,
 		index_check_primary_key(rel, indexInfo, is_alter_table);
 
 	/*
+	 * We disallow indexes on system columns other than OID.  They would not
+	 * necessarily get updated correctly, and they don't seem useful anyway.
+	 */
+	for (i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+	{
+		AttrNumber	attno = indexInfo->ii_KeyAttrNumbers[i];
+
+		if (attno < 0 && attno != ObjectIdAttributeNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("index creation on system columns is not supported")));
+	}
+
+	/*
+	 * Also check for system columns used in expressions or predicates.
+	 */
+	if (indexInfo->ii_Expressions || indexInfo->ii_Predicate)
+	{
+		Bitmapset  *indexattrs = NULL;
+
+		pull_varattnos((Node *) indexInfo->ii_Expressions, 1, &indexattrs);
+		pull_varattnos((Node *) indexInfo->ii_Predicate, 1, &indexattrs);
+
+		for (i = FirstLowInvalidHeapAttributeNumber + 1; i < 0; i++)
+		{
+			if (i != ObjectIdAttributeNumber &&
+				bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
+							  indexattrs))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("index creation on system columns is not supported")));
+		}
+	}
+
+	/*
 	 * Report index creation if appropriate (delay this till after most of the
 	 * error checks)
 	 */
@@ -583,14 +645,14 @@ DefineIndex(Oid relationId,
 		else
 		{
 			elog(ERROR, "unknown constraint type");
-			constraint_type = NULL;		/* keep compiler quiet */
+			constraint_type = NULL; /* keep compiler quiet */
 		}
 
 		ereport(DEBUG1,
-		  (errmsg("%s %s will create implicit index \"%s\" for table \"%s\"",
-				  is_alter_table ? "ALTER TABLE / ADD" : "CREATE TABLE /",
-				  constraint_type,
-				  indexRelationName, RelationGetRelationName(rel))));
+				(errmsg("%s %s will create implicit index \"%s\" for table \"%s\"",
+						is_alter_table ? "ALTER TABLE / ADD" : "CREATE TABLE /",
+						constraint_type,
+						indexRelationName, RelationGetRelationName(rel))));
 	}
 
 	/*
@@ -835,7 +897,7 @@ DefineIndex(Oid relationId,
 
 			newer_snapshots = GetCurrentVirtualXIDs(limitXmin,
 													true, false,
-										 PROC_IS_AUTOVACUUM | PROC_IN_VACUUM,
+													PROC_IS_AUTOVACUUM | PROC_IN_VACUUM,
 													&n_newer_snapshots);
 			for (j = i; j < n_old_snapshots; j++)
 			{
@@ -847,7 +909,7 @@ DefineIndex(Oid relationId,
 												   newer_snapshots[k]))
 						break;
 				}
-				if (k >= n_newer_snapshots)		/* not there anymore */
+				if (k >= n_newer_snapshots) /* not there anymore */
 					SetInvalidVirtualTransactionId(old_snapshots[j]);
 			}
 			pfree(newer_snapshots);
@@ -916,7 +978,7 @@ CheckMutability(Expr *expr)
  * indxpath.c could do something with.  However, that seems overly
  * restrictive.  One useful application of partial indexes is to apply
  * a UNIQUE constraint across a subset of a table, and in that scenario
- * any evaluatable predicate will work.  So accept any predicate here
+ * any evaluable predicate will work.  So accept any predicate here
  * (except ones requiring a plan), and let indxpath.c fend for itself.
  */
 static void
@@ -934,7 +996,7 @@ CheckPredicate(Expr *predicate)
 	if (CheckMutability(predicate))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-		   errmsg("functions in index predicate must be marked IMMUTABLE")));
+				 errmsg("functions in index predicate must be marked IMMUTABLE")));
 }
 
 /*
@@ -1000,8 +1062,8 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 				if (isconstraint)
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_COLUMN),
-						  errmsg("column \"%s\" named in key does not exist",
-								 attribute->name)));
+							 errmsg("column \"%s\" named in key does not exist",
+									attribute->name)));
 				else
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_COLUMN),
@@ -1100,10 +1162,10 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 		/*
 		 * Identify the opclass to use.
 		 */
-		classOidP[attn] = GetIndexOpClass(attribute->opclass,
-										  atttype,
-										  accessMethodName,
-										  accessMethodId);
+		classOidP[attn] = ResolveOpClass(attribute->opclass,
+										 atttype,
+										 accessMethodName,
+										 accessMethodId);
 
 		/*
 		 * Identify the exclusion operator, if any.
@@ -1210,10 +1272,13 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 
 /*
  * Resolve possibly-defaulted operator class specification
+ *
+ * Note: This is used to resolve operator class specification in index and
+ * partition key definitions.
  */
-static Oid
-GetIndexOpClass(List *opclass, Oid attrType,
-				char *accessMethodName, Oid accessMethodId)
+Oid
+ResolveOpClass(List *opclass, Oid attrType,
+			   char *accessMethodName, Oid accessMethodId)
 {
 	char	   *schemaname;
 	char	   *opcname;
@@ -1309,7 +1374,7 @@ GetIndexOpClass(List *opclass, Oid attrType,
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("operator class \"%s\" does not accept data type %s",
-					  NameListToString(opclass), format_type_be(attrType))));
+						NameListToString(opclass), format_type_be(attrType))));
 
 	ReleaseSysCache(tuple);
 
@@ -1398,8 +1463,8 @@ GetDefaultOpClass(Oid type_id, Oid am_id)
 	if (nexact > 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
-		errmsg("there are multiple default operator classes for data type %s",
-			   format_type_be(type_id))));
+				 errmsg("there are multiple default operator classes for data type %s",
+						format_type_be(type_id))));
 
 	if (nexact == 1 ||
 		ncompatiblepreferred == 1 ||
@@ -1639,9 +1704,9 @@ ChooseIndexColumnNames(List *indexElems)
 
 		/* Get the preliminary name from the IndexElem */
 		if (ielem->indexcolname)
-			origname = ielem->indexcolname;		/* caller-specified name */
+			origname = ielem->indexcolname; /* caller-specified name */
 		else if (ielem->name)
-			origname = ielem->name;		/* simple column reference */
+			origname = ielem->name; /* simple column reference */
 		else
 			origname = "expr";	/* default name for expression */
 
@@ -1858,9 +1923,7 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 	 */
 	private_context = AllocSetContextCreate(PortalContext,
 											"ReindexMultipleTables",
-											ALLOCSET_DEFAULT_MINSIZE,
-											ALLOCSET_DEFAULT_INITSIZE,
-											ALLOCSET_DEFAULT_MAXSIZE);
+											ALLOCSET_SMALL_SIZES);
 
 	/*
 	 * Define the search keys to find the objects to reindex. For a schema, we

@@ -4,7 +4,7 @@
  *	  build algorithm for GiST indexes implementation.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 
 #include "access/genam.h"
 #include "access/gist_private.h"
+#include "access/gistxlog.h"
 #include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "miscadmin.h"
@@ -109,12 +110,9 @@ static BlockNumber gistGetParent(GISTBuildState *buildstate, BlockNumber child);
  * but switches to more efficient buffering build algorithm after a certain
  * number of tuples (unless buffering mode is disabled).
  */
-Datum
-gistbuild(PG_FUNCTION_ARGS)
+IndexBuildResult *
+gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
-	Relation	heap = (Relation) PG_GETARG_POINTER(0);
-	Relation	index = (Relation) PG_GETARG_POINTER(1);
-	IndexInfo  *indexInfo = (IndexInfo *) PG_GETARG_POINTER(2);
 	IndexBuildResult *result;
 	double		reltuples;
 	GISTBuildState buildstate;
@@ -232,7 +230,7 @@ gistbuild(PG_FUNCTION_ARGS)
 	result->heap_tuples = reltuples;
 	result->index_tuples = (double) buildstate.indtuples;
 
-	PG_RETURN_POINTER(result);
+	return result;
 }
 
 /*
@@ -250,7 +248,7 @@ gistValidateBufferingOption(char *value)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid value for \"buffering\" option"),
-			  errdetail("Valid values are \"on\", \"off\", and \"auto\".")));
+				 errdetail("Valid values are \"on\", \"off\", and \"auto\".")));
 	}
 }
 
@@ -297,10 +295,10 @@ gistInitBuffering(GISTBuildState *buildstate)
 	itupMinSize = (Size) MAXALIGN(sizeof(IndexTupleData));
 	for (i = 0; i < index->rd_att->natts; i++)
 	{
-		if (index->rd_att->attrs[i]->attlen < 0)
+		if (TupleDescAttr(index->rd_att, i)->attlen < 0)
 			itupMinSize += VARHDRSZ;
 		else
-			itupMinSize += index->rd_att->attrs[i]->attlen;
+			itupMinSize += TupleDescAttr(index->rd_att, i)->attlen;
 	}
 
 	/* Calculate average and maximal number of index tuples which fit to page */
@@ -816,7 +814,7 @@ gistbufferinginserttuples(GISTBuildState *buildstate, Buffer buffer, int level,
 								  downlinks, ndownlinks, downlinkoffnum,
 								  InvalidBlockNumber, InvalidOffsetNumber);
 
-		list_free_deep(splitinfo);		/* we don't need this anymore */
+		list_free_deep(splitinfo);	/* we don't need this anymore */
 	}
 	else
 		UnlockReleaseBuffer(buffer);
@@ -1085,7 +1083,7 @@ gistGetMaxLevel(Relation index)
 		 * everywhere, so we just pick the first one.
 		 */
 		itup = (IndexTuple) PageGetItem(page,
-									 PageGetItemId(page, FirstOffsetNumber));
+										PageGetItemId(page, FirstOffsetNumber));
 		blkno = ItemPointerGetBlockNumber(&(itup->t_tid));
 		UnlockReleaseBuffer(buffer);
 
@@ -1145,7 +1143,7 @@ gistInitParentMap(GISTBuildState *buildstate)
 	buildstate->parentMap = hash_create("gistbuild parent map",
 										1024,
 										&hashCtl,
-									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+										HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
 static void

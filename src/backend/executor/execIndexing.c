@@ -2,7 +2,7 @@
  *
  * execIndexing.c
  *	  routines for inserting index tuples and enforcing unique and
- *	  exclusive constraints.
+ *	  exclusion constraints.
  *
  * ExecInsertIndexTuples() is the main entry point.  It's called after
  * inserting a tuple to the heap, and it inserts corresponding index tuples
@@ -95,7 +95,7 @@
  * with the higher XID backs out.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -119,7 +119,7 @@ typedef enum
 {
 	CEOUC_WAIT,
 	CEOUC_NOWAIT,
-	CEOUC_LIVELOCK_PREVENTING_WAIT,
+	CEOUC_LIVELOCK_PREVENTING_WAIT
 } CEOUC_WAIT_MODE;
 
 static bool check_exclusion_or_unique_constraint(Relation heap, Relation index,
@@ -259,6 +259,9 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		the same is done for non-deferred constraints, but report
  *		if conflict was speculative or deferred conflict to caller)
  *
+ *		If 'arbiterIndexes' is nonempty, noDupErr applies only to
+ *		those indexes.  NIL means noDupErr applies to all indexes.
+ *
  *		CAUTION: this must not be called for a HOT update.
  *		We can't defend against that here for lack of info.
  *		Should we change the API to make it safer?
@@ -308,18 +311,14 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 	{
 		Relation	indexRelation = relationDescs[i];
 		IndexInfo  *indexInfo;
+		bool		applyNoDupErr;
 		IndexUniqueCheck checkUnique;
 		bool		satisfiesConstraint;
-		bool		arbiter;
 
 		if (indexRelation == NULL)
 			continue;
 
 		indexInfo = indexInfoArray[i];
-
-		/* Record if speculative insertion arbiter */
-		arbiter = list_member_oid(arbiterIndexes,
-								  indexRelation->rd_index->indexrelid);
 
 		/* If the index is marked as read-only, ignore it */
 		if (!indexInfo->ii_ReadyForInserts)
@@ -328,23 +327,21 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 		/* Check for partial index */
 		if (indexInfo->ii_Predicate != NIL)
 		{
-			List	   *predicate;
+			ExprState  *predicate;
 
 			/*
 			 * If predicate state not set up yet, create it (in the estate's
 			 * per-query context)
 			 */
 			predicate = indexInfo->ii_PredicateState;
-			if (predicate == NIL)
+			if (predicate == NULL)
 			{
-				predicate = (List *)
-					ExecPrepareExpr((Expr *) indexInfo->ii_Predicate,
-									estate);
+				predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
 				indexInfo->ii_PredicateState = predicate;
 			}
 
 			/* Skip this index-update if the predicate isn't satisfied */
-			if (!ExecQual(predicate, econtext, false))
+			if (!ExecQual(predicate, econtext))
 				continue;
 		}
 
@@ -357,6 +354,12 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 					   estate,
 					   values,
 					   isnull);
+
+		/* Check whether to apply noDupErr to this index */
+		applyNoDupErr = noDupErr &&
+			(arbiterIndexes == NIL ||
+			 list_member_oid(arbiterIndexes,
+							 indexRelation->rd_index->indexrelid));
 
 		/*
 		 * The index AM does the actual insertion, plus uniqueness checking.
@@ -373,7 +376,7 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 		 */
 		if (!indexRelation->rd_index->indisunique)
 			checkUnique = UNIQUE_CHECK_NO;
-		else if (noDupErr && (arbiterIndexes == NIL || arbiter))
+		else if (applyNoDupErr)
 			checkUnique = UNIQUE_CHECK_PARTIAL;
 		else if (indexRelation->rd_index->indimmediate)
 			checkUnique = UNIQUE_CHECK_YES;
@@ -384,9 +387,10 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 			index_insert(indexRelation, /* index relation */
 						 values,	/* array of index Datums */
 						 isnull,	/* null flags */
-						 tupleid,		/* tid of heap tuple */
+						 tupleid,	/* tid of heap tuple */
 						 heapRelation,	/* heap relation */
-						 checkUnique);	/* type of uniqueness check to do */
+						 checkUnique,	/* type of uniqueness check to do */
+						 indexInfo);	/* index AM may need this */
 
 		/*
 		 * If the index has an associated exclusion constraint, check that.
@@ -407,7 +411,7 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 			bool		violationOK;
 			CEOUC_WAIT_MODE waitMode;
 
-			if (noDupErr)
+			if (applyNoDupErr)
 			{
 				violationOK = true;
 				waitMode = CEOUC_LIVELOCK_PREVENTING_WAIT;
@@ -428,7 +432,7 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 													 indexRelation, indexInfo,
 													 tupleid, values, isnull,
 													 estate, false,
-												waitMode, violationOK, NULL);
+													 waitMode, violationOK, NULL);
 		}
 
 		if ((checkUnique == UNIQUE_CHECK_PARTIAL ||
@@ -538,30 +542,28 @@ ExecCheckIndexConstraints(TupleTableSlot *slot,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"),
 					 errtableconstraint(heapRelation,
-								   RelationGetRelationName(indexRelation))));
+										RelationGetRelationName(indexRelation))));
 
 		checkedIndex = true;
 
 		/* Check for partial index */
 		if (indexInfo->ii_Predicate != NIL)
 		{
-			List	   *predicate;
+			ExprState  *predicate;
 
 			/*
 			 * If predicate state not set up yet, create it (in the estate's
 			 * per-query context)
 			 */
 			predicate = indexInfo->ii_PredicateState;
-			if (predicate == NIL)
+			if (predicate == NULL)
 			{
-				predicate = (List *)
-					ExecPrepareExpr((Expr *) indexInfo->ii_Predicate,
-									estate);
+				predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
 				indexInfo->ii_PredicateState = predicate;
 			}
 
 			/* Skip this index-update if the predicate isn't satisfied */
-			if (!ExecQual(predicate, econtext, false))
+			if (!ExecQual(predicate, econtext))
 				continue;
 		}
 
@@ -578,7 +580,7 @@ ExecCheckIndexConstraints(TupleTableSlot *slot,
 		satisfiesConstraint =
 			check_exclusion_or_unique_constraint(heapRelation, indexRelation,
 												 indexInfo, &invalidItemPtr,
-											   values, isnull, estate, false,
+												 values, isnull, estate, false,
 												 CEOUC_WAIT, true,
 												 conflictTid);
 		if (!satisfiesConstraint)
@@ -725,6 +727,7 @@ retry:
 	{
 		TransactionId xwait;
 		ItemPointerData ctid_wait;
+		XLTW_Oper	reason_wait;
 		Datum		existing_values[INDEX_MAX_KEYS];
 		bool		existing_isnull[INDEX_MAX_KEYS];
 		char	   *error_new;
@@ -783,13 +786,14 @@ retry:
 			  TransactionIdPrecedes(GetCurrentTransactionId(), xwait))))
 		{
 			ctid_wait = tup->t_data->t_ctid;
+			reason_wait = indexInfo->ii_ExclusionOps ?
+				XLTW_RecheckExclusionConstr : XLTW_InsertIndex;
 			index_endscan(index_scan);
 			if (DirtySnapshot.speculativeToken)
 				SpeculativeInsertionWait(DirtySnapshot.xmin,
 										 DirtySnapshot.speculativeToken);
 			else
-				XactLockTableWait(xwait, heap, &ctid_wait,
-								  XLTW_RecheckExclusionConstr);
+				XactLockTableWait(xwait, heap, &ctid_wait, reason_wait);
 			goto retry;
 		}
 

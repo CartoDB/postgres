@@ -3,7 +3,7 @@
  * postinit.c
  *	  postgres initialization utilities
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -70,6 +70,7 @@ static void InitCommunication(void);
 static void ShutdownPostgres(int code, Datum arg);
 static void StatementTimeoutHandler(void);
 static void LockTimeoutHandler(void);
+static void IdleInTransactionSessionTimeoutHandler(void);
 static bool ThereIsAtLeastOneRole(void);
 static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
@@ -191,6 +192,7 @@ PerformAuthentication(Port *port)
 	 * FIXME: [fork/exec] Ugh.  Is there a way around this overhead?
 	 */
 #ifdef EXEC_BACKEND
+
 	/*
 	 * load_hba() and load_ident() want to work within the PostmasterContext,
 	 * so create that if it doesn't exist (which it won't).  We'll delete it
@@ -199,9 +201,7 @@ PerformAuthentication(Port *port)
 	if (PostmasterContext == NULL)
 		PostmasterContext = AllocSetContextCreate(TopMemoryContext,
 												  "Postmaster",
-												  ALLOCSET_DEFAULT_MINSIZE,
-												  ALLOCSET_DEFAULT_INITSIZE,
-												  ALLOCSET_DEFAULT_MAXSIZE);
+												  ALLOCSET_DEFAULT_SIZES);
 
 	if (!load_hba())
 	{
@@ -275,7 +275,7 @@ PerformAuthentication(Port *port)
 
 	set_ps_display("startup", false);
 
-	ClientAuthInProgress = false;		/* client_min_messages is active now */
+	ClientAuthInProgress = false;	/* client_min_messages is active now */
 }
 
 
@@ -322,8 +322,8 @@ CheckMyDatabase(const char *name, bool am_superuser)
 		if (!dbform->datallowconn)
 			ereport(FATAL,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-			 errmsg("database \"%s\" is not currently accepting connections",
-					name)));
+					 errmsg("database \"%s\" is not currently accepting connections",
+							name)));
 
 		/*
 		 * Check privilege to connect to the database.  (The am_superuser test
@@ -350,7 +350,7 @@ CheckMyDatabase(const char *name, bool am_superuser)
 		 */
 		if (dbform->datconnlimit >= 0 &&
 			!am_superuser &&
-			CountDBBackends(MyDatabaseId) > dbform->datconnlimit)
+			CountDBConnections(MyDatabaseId) > dbform->datconnlimit)
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 					 errmsg("too many connections for database \"%s\"",
@@ -375,17 +375,17 @@ CheckMyDatabase(const char *name, bool am_superuser)
 
 	if (pg_perm_setlocale(LC_COLLATE, collate) == NULL)
 		ereport(FATAL,
-			(errmsg("database locale is incompatible with operating system"),
-			 errdetail("The database was initialized with LC_COLLATE \"%s\", "
-					   " which is not recognized by setlocale().", collate),
-			 errhint("Recreate the database with another locale or install the missing locale.")));
+				(errmsg("database locale is incompatible with operating system"),
+				 errdetail("The database was initialized with LC_COLLATE \"%s\", "
+						   " which is not recognized by setlocale().", collate),
+				 errhint("Recreate the database with another locale or install the missing locale.")));
 
 	if (pg_perm_setlocale(LC_CTYPE, ctype) == NULL)
 		ereport(FATAL,
-			(errmsg("database locale is incompatible with operating system"),
-			 errdetail("The database was initialized with LC_CTYPE \"%s\", "
-					   " which is not recognized by setlocale().", ctype),
-			 errhint("Recreate the database with another locale or install the missing locale.")));
+				(errmsg("database locale is incompatible with operating system"),
+				 errdetail("The database was initialized with LC_CTYPE \"%s\", "
+						   " which is not recognized by setlocale().", ctype),
+				 errhint("Recreate the database with another locale or install the missing locale.")));
 
 	/* Make the locale settings visible as GUC variables, too */
 	SetConfigOption("lc_collate", collate, PGC_INTERNAL, PGC_S_OVERRIDE);
@@ -498,7 +498,7 @@ InitializeMaxBackends(void)
 
 	/* the extra unit accounts for the autovacuum launcher */
 	MaxBackends = MaxConnections + autovacuum_max_workers + 1 +
-		+max_worker_processes;
+		max_worker_processes;
 
 	/* internal error because the values were all checked previously */
 	if (MaxBackends > MAX_BACKENDS)
@@ -597,6 +597,8 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		RegisterTimeout(DEADLOCK_TIMEOUT, CheckDeadLockAlert);
 		RegisterTimeout(STATEMENT_TIMEOUT, StatementTimeoutHandler);
 		RegisterTimeout(LOCK_TIMEOUT, LockTimeoutHandler);
+		RegisterTimeout(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+						IdleInTransactionSessionTimeoutHandler);
 	}
 
 	/*
@@ -663,7 +665,12 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 
 	/* The autovacuum launcher is done here */
 	if (IsAutoVacuumLauncherProcess())
+	{
+		/* report this backend in the PgBackendStatus array */
+		pgstat_bestart();
+
 		return;
+	}
 
 	/*
 	 * Start a new transaction here before first access to db, and get a
@@ -750,7 +757,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		else
 			ereport(FATAL,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			errmsg("must be superuser to connect during database shutdown")));
+					 errmsg("must be superuser to connect during database shutdown")));
 	}
 
 	/*
@@ -760,7 +767,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	{
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			 errmsg("must be superuser to connect in binary upgrade mode")));
+				 errmsg("must be superuser to connect in binary upgrade mode")));
 	}
 
 	/*
@@ -867,12 +874,15 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	{
 		/*
 		 * If this is a background worker not bound to any particular
-		 * database, we're done now.  Everything that follows only makes
-		 * sense if we are bound to a specific database.  We do need to
-		 * close the transaction we started before returning.
+		 * database, we're done now.  Everything that follows only makes sense
+		 * if we are bound to a specific database.  We do need to close the
+		 * transaction we started before returning.
 		 */
 		if (!bootstrap)
+		{
+			pgstat_bestart();
 			CommitTransactionCommand();
+		}
 		return;
 	}
 
@@ -939,7 +949,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 			ereport(FATAL,
 					(errcode(ERRCODE_UNDEFINED_DATABASE),
 					 errmsg("database \"%s\" does not exist", dbname),
-			   errdetail("It seems to have just been dropped or renamed.")));
+					 errdetail("It seems to have just been dropped or renamed.")));
 	}
 
 	/*
@@ -957,8 +967,8 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 						(errcode(ERRCODE_UNDEFINED_DATABASE),
 						 errmsg("database \"%s\" does not exist",
 								dbname),
-					errdetail("The database subdirectory \"%s\" is missing.",
-							  fullpath)));
+						 errdetail("The database subdirectory \"%s\" is missing.",
+								   fullpath)));
 			else
 				ereport(FATAL,
 						(errcode_for_file_access(),
@@ -1106,7 +1116,7 @@ process_settings(Oid databaseid, Oid roleid)
 
 	relsetting = heap_open(DbRoleSettingRelationId, AccessShareLock);
 
-	/* read all the settings under the same snapsot for efficiency */
+	/* read all the settings under the same snapshot for efficiency */
 	snapshot = RegisterSnapshot(GetCatalogSnapshot(DbRoleSettingRelationId));
 
 	/* Later settings are ignored if set earlier. */
@@ -1178,6 +1188,13 @@ LockTimeoutHandler(void)
 	kill(MyProcPid, SIGINT);
 }
 
+static void
+IdleInTransactionSessionTimeoutHandler(void)
+{
+	IdleInTransactionSessionTimeoutPending = true;
+	InterruptPending = true;
+	SetLatch(MyLatch);
+}
 
 /*
  * Returns true if at least one role is defined in this database cluster.

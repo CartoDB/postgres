@@ -290,17 +290,30 @@
        be considered shippable to the remote server.
        This option can only be specified for foreign servers, not per-table.
       </para>
+
+      <para>
+       When using the <literal>extensions</literal> option, <emphasis>it is the
+       user's responsibility</> that the listed extensions exist and behave
+       identically on both the local and remote servers.  Otherwise, remote
+       queries may fail or behave unexpectedly.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>fetch_size</literal></term>
+     <listitem>
+      <para>
+       This option specifies the number of rows <filename>postgres_fdw</>
+       should get in each fetch operation. It can be specified for a foreign
+       table or a foreign server. The option specified on a table overrides
+       an option specified for the server.
+       The default is <literal>100</>.
+      </para>
      </listitem>
     </varlistentry>
 
    </variablelist>
-
-   <para>
-    When using the <literal>extensions</literal> option, <emphasis>it is the
-    user's responsibility</> that the listed extensions exist and behave
-    identically on both the local and remote servers.  Otherwise, remote
-    queries may fail or behave unexpectedly.
-   </para>
 
   </sect3>
 
@@ -412,6 +425,16 @@
     For more detail about the treatment of <literal>CHECK</> constraints on
     foreign tables, see <xref linkend="sql-createforeigntable">.
    </para>
+
+   <para>
+    Tables or foreign tables which are partitions of some other table are
+    automatically excluded.  Partitioned tables are imported, unless they
+    are a partition of some other table.  Since all data can be accessed
+    through the partitioned table which is the root of the partitioning
+    hierarchy, this approach should allow access to all the data without
+    creating extra objects.
+   </para>
+
   </sect3>
  </sect2>
 
@@ -471,6 +494,27 @@
    extension that's listed in the foreign server's <literal>extensions</>
    option.  Operators and functions in such clauses must
    be <literal>IMMUTABLE</> as well.
+   For an <command>UPDATE</> or <command>DELETE</> query,
+   <filename>postgres_fdw</> attempts to optimize the query execution by
+   sending the whole query to the remote server if there are no query
+   <literal>WHERE</> clauses that cannot be sent to the remote server,
+   no local joins for the query, no row-level local <literal>BEFORE</> or
+   <literal>AFTER</> triggers on the target table, and no
+   <literal>CHECK OPTION</> constraints from parent views.
+   In <command>UPDATE</>,
+   expressions to assign to target columns must use only built-in data types,
+   <literal>IMMUTABLE</> operators, or <literal>IMMUTABLE</> functions,
+   to reduce the risk of misexecution of the query.
+  </para>
+
+  <para>
+   When <filename>postgres_fdw</> encounters a join between foreign tables on
+   the same foreign server, it sends the entire join to the foreign server,
+   unless for some reason it believes that it will be more efficient to fetch
+   rows from each table individually, or unless the table references involved
+   are subject to different user mappings.  While sending the <literal>JOIN</>
+   clauses, it takes the same precautions as mentioned above for the
+   <literal>WHERE</> clauses.
   </para>
 
   <para>
@@ -500,11 +544,32 @@
 
   <para>
    <filename>postgres_fdw</> likewise establishes remote session settings
-   for the parameters <xref linkend="guc-timezone">,
-   <xref linkend="guc-datestyle">, <xref linkend="guc-intervalstyle">,
-   and <xref linkend="guc-extra-float-digits">.  These are less likely
-   to be problematic than <varname>search_path</>, but can be handled
-   with function <literal>SET</> options if the need arises.
+   for various parameters: 
+   <itemizedlist spacing="compact">
+    <listitem>
+     <para>
+      <xref linkend="guc-timezone"> is set to <literal>UTC</>
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <xref linkend="guc-datestyle"> is set to <literal>ISO</>
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <xref linkend="guc-intervalstyle"> is set to <literal>postgres</>
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <xref linkend="guc-extra-float-digits"> is set to <literal>3</> for remote
+      servers 9.0 and newer and is set to <literal>2</> for older versions
+     </para>
+    </listitem>
+   </itemizedlist>
+   These are less likely to be problematic than <varname>search_path</>, but
+   can be handled with function <literal>SET</> options if the need arises.
   </para>
 
   <para>

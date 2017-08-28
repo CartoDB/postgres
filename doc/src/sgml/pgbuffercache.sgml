@@ -24,8 +24,9 @@
  </para>
 
  <para>
-  By default public access is revoked from both of these, just in case there
-  are security issues lurking.
+  By default use is restricted to superusers and members of the
+  <literal>pg_read_all_stats</literal> role. Access may be granted to others
+  using <command>GRANT</command>.
  </para>
 
  <sect2>
@@ -82,7 +83,7 @@
       <entry><type>smallint</type></entry>
       <entry></entry>
       <entry>Fork number within the relation;  see
-      <filename>include/storage/relfilenode.h</></entry>
+      <filename>include/common/relpath.h</></entry>
      </row>
 
      <row>

@@ -6,7 +6,7 @@
  * Joe Conway <mail@joeconway.com>
  *
  * contrib/fuzzystrmatch/fuzzystrmatch.c
- * Copyright (c) 2001-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2017, PostgreSQL Global Development Group
  * ALL RIGHTS RESERVED;
  *
  * metaphone()
@@ -42,6 +42,7 @@
 
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
+#include "utils/varlena.h"
 
 PG_MODULE_MAGIC;
 
@@ -171,12 +172,12 @@ levenshtein_with_costs(PG_FUNCTION_ARGS)
 	/* Extract a pointer to the actual character data */
 	s_data = VARDATA_ANY(src);
 	t_data = VARDATA_ANY(dst);
-	/* Determine length of each string in bytes and characters */
+	/* Determine length of each string in bytes */
 	s_bytes = VARSIZE_ANY_EXHDR(src);
 	t_bytes = VARSIZE_ANY_EXHDR(dst);
 
-	PG_RETURN_INT32(varstr_levenshtein(s_data, s_bytes, t_data, t_bytes, ins_c,
-									   del_c, sub_c));
+	PG_RETURN_INT32(varstr_levenshtein(s_data, s_bytes, t_data, t_bytes,
+									   ins_c, del_c, sub_c, false));
 }
 
 
@@ -194,12 +195,12 @@ levenshtein(PG_FUNCTION_ARGS)
 	/* Extract a pointer to the actual character data */
 	s_data = VARDATA_ANY(src);
 	t_data = VARDATA_ANY(dst);
-	/* Determine length of each string in bytes and characters */
+	/* Determine length of each string in bytes */
 	s_bytes = VARSIZE_ANY_EXHDR(src);
 	t_bytes = VARSIZE_ANY_EXHDR(dst);
 
-	PG_RETURN_INT32(varstr_levenshtein(s_data, s_bytes, t_data, t_bytes, 1, 1,
-									   1));
+	PG_RETURN_INT32(varstr_levenshtein(s_data, s_bytes, t_data, t_bytes,
+									   1, 1, 1, false));
 }
 
 
@@ -221,13 +222,14 @@ levenshtein_less_equal_with_costs(PG_FUNCTION_ARGS)
 	/* Extract a pointer to the actual character data */
 	s_data = VARDATA_ANY(src);
 	t_data = VARDATA_ANY(dst);
-	/* Determine length of each string in bytes and characters */
+	/* Determine length of each string in bytes */
 	s_bytes = VARSIZE_ANY_EXHDR(src);
 	t_bytes = VARSIZE_ANY_EXHDR(dst);
 
-	PG_RETURN_INT32(varstr_levenshtein_less_equal(s_data, s_bytes, t_data,
-												  t_bytes, ins_c, del_c,
-												  sub_c, max_d));
+	PG_RETURN_INT32(varstr_levenshtein_less_equal(s_data, s_bytes,
+												  t_data, t_bytes,
+												  ins_c, del_c, sub_c,
+												  max_d, false));
 }
 
 
@@ -246,12 +248,14 @@ levenshtein_less_equal(PG_FUNCTION_ARGS)
 	/* Extract a pointer to the actual character data */
 	s_data = VARDATA_ANY(src);
 	t_data = VARDATA_ANY(dst);
-	/* Determine length of each string in bytes and characters */
+	/* Determine length of each string in bytes */
 	s_bytes = VARSIZE_ANY_EXHDR(src);
 	t_bytes = VARSIZE_ANY_EXHDR(dst);
 
-	PG_RETURN_INT32(varstr_levenshtein_less_equal(s_data, s_bytes, t_data,
-												  t_bytes, 1, 1, 1, max_d));
+	PG_RETURN_INT32(varstr_levenshtein_less_equal(s_data, s_bytes,
+												  t_data, t_bytes,
+												  1, 1, 1,
+												  max_d, false));
 }
 
 
@@ -385,7 +389,7 @@ _metaphone(char *word,			/* IN */
 	/*-- Allocate memory for our phoned_phrase --*/
 	if (max_phonemes == 0)
 	{							/* Assume largest possible */
-		*phoned_word = palloc(sizeof(char) * strlen(word) +1);
+		*phoned_word = palloc(sizeof(char) * strlen(word) + 1);
 	}
 	else
 	{
@@ -718,7 +722,7 @@ _metaphone(char *word,			/* IN */
 	End_Phoned_Word;
 
 	return (META_SUCCESS);
-}	/* END metaphone */
+}								/* END metaphone */
 
 
 /*
@@ -732,7 +736,7 @@ soundex(PG_FUNCTION_ARGS)
 	char		outstr[SOUNDEX_LEN + 1];
 	char	   *arg;
 
-	arg = text_to_cstring(PG_GETARG_TEXT_P(0));
+	arg = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
 	_soundex(arg, outstr);
 
@@ -798,8 +802,8 @@ difference(PG_FUNCTION_ARGS)
 	int			i,
 				result;
 
-	_soundex(text_to_cstring(PG_GETARG_TEXT_P(0)), sndx1);
-	_soundex(text_to_cstring(PG_GETARG_TEXT_P(1)), sndx2);
+	_soundex(text_to_cstring(PG_GETARG_TEXT_PP(0)), sndx1);
+	_soundex(text_to_cstring(PG_GETARG_TEXT_PP(1)), sndx2);
 
 	result = 0;
 	for (i = 0; i < SOUNDEX_LEN; i++)

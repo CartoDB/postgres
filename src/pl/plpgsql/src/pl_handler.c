@@ -3,7 +3,7 @@
  * pl_handler.c		- Handler for the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,7 +13,7 @@
  *-------------------------------------------------------------------------
  */
 
-#include "plpgsql.h"
+#include "postgres.h"
 
 #include "access/htup_details.h"
 #include "catalog/pg_proc.h"
@@ -24,6 +24,9 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/varlena.h"
+
+#include "plpgsql.h"
 
 
 static bool plpgsql_extra_checks_check_hook(char **newvalue, void **extra, GucSource source);
@@ -52,7 +55,7 @@ int			plpgsql_extra_warnings;
 int			plpgsql_extra_errors;
 
 /* Hook for plugins */
-PLpgSQL_plugin **plugin_ptr = NULL;
+PLpgSQL_plugin **plpgsql_plugin_ptr = NULL;
 
 
 static bool
@@ -110,6 +113,8 @@ plpgsql_extra_checks_check_hook(char **newvalue, void **extra, GucSource source)
 	}
 
 	myextra = (int *) malloc(sizeof(int));
+	if (!myextra)
+		return false;
 	*myextra = extrachecks;
 	*extra = (void *) myextra;
 
@@ -163,7 +168,7 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("plpgsql.check_asserts",
-				  gettext_noop("Perform checks given in ASSERT statements."),
+							 gettext_noop("Perform checks given in ASSERT statements."),
 							 NULL,
 							 &plpgsql_check_asserts,
 							 true,
@@ -197,7 +202,7 @@ _PG_init(void)
 	RegisterSubXactCallback(plpgsql_subxact_cb, NULL);
 
 	/* Set up a rendezvous point with optional instrumentation plugin */
-	plugin_ptr = (PLpgSQL_plugin **) find_rendezvous_variable("PLpgSQL_plugin");
+	plpgsql_plugin_ptr = (PLpgSQL_plugin **) find_rendezvous_variable("PLpgSQL_plugin");
 
 	inited = true;
 }
@@ -242,7 +247,7 @@ plpgsql_call_handler(PG_FUNCTION_ARGS)
 		 */
 		if (CALLED_AS_TRIGGER(fcinfo))
 			retval = PointerGetDatum(plpgsql_exec_trigger(func,
-										   (TriggerData *) fcinfo->context));
+														  (TriggerData *) fcinfo->context));
 		else if (CALLED_AS_EVENT_TRIGGER(fcinfo))
 		{
 			plpgsql_exec_event_trigger(func,
@@ -285,15 +290,13 @@ PG_FUNCTION_INFO_V1(plpgsql_inline_handler);
 Datum
 plpgsql_inline_handler(PG_FUNCTION_ARGS)
 {
-	InlineCodeBlock *codeblock = (InlineCodeBlock *) DatumGetPointer(PG_GETARG_DATUM(0));
+	InlineCodeBlock *codeblock = castNode(InlineCodeBlock, DatumGetPointer(PG_GETARG_DATUM(0)));
 	PLpgSQL_function *func;
 	FunctionCallInfoData fake_fcinfo;
 	FmgrInfo	flinfo;
 	EState	   *simple_eval_estate;
 	Datum		retval;
 	int			rc;
-
-	Assert(IsA(codeblock, InlineCodeBlock));
 
 	/*
 	 * Connect to SPI manager

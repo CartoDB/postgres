@@ -3,7 +3,7 @@
  * nodeLimit.c
  *	  Routines to handle limiting of query results where appropriate
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,6 +23,7 @@
 
 #include "executor/executor.h"
 #include "executor/nodeLimit.h"
+#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 
 static void recompute_limits(LimitState *node);
@@ -36,12 +37,15 @@ static void pass_down_bound(LimitState *node, PlanState *child_node);
  *		filtering on the stream of tuples returned by a subplan.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *				/* return: a tuple or NULL */
-ExecLimit(LimitState *node)
+static TupleTableSlot *			/* return: a tuple or NULL */
+ExecLimit(PlanState *pstate)
 {
+	LimitState *node = castNode(LimitState, pstate);
 	ScanDirection direction;
 	TupleTableSlot *slot;
 	PlanState  *outerPlan;
+
+	CHECK_FOR_INTERRUPTS();
 
 	/*
 	 * get information from the node
@@ -239,8 +243,7 @@ recompute_limits(LimitState *node)
 	{
 		val = ExecEvalExprSwitchContext(node->limitOffset,
 										econtext,
-										&isNull,
-										NULL);
+										&isNull);
 		/* Interpret NULL offset as no offset */
 		if (isNull)
 			node->offset = 0;
@@ -249,8 +252,8 @@ recompute_limits(LimitState *node)
 			node->offset = DatumGetInt64(val);
 			if (node->offset < 0)
 				ereport(ERROR,
-				 (errcode(ERRCODE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE),
-				  errmsg("OFFSET must not be negative")));
+						(errcode(ERRCODE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE),
+						 errmsg("OFFSET must not be negative")));
 		}
 	}
 	else
@@ -263,8 +266,7 @@ recompute_limits(LimitState *node)
 	{
 		val = ExecEvalExprSwitchContext(node->limitCount,
 										econtext,
-										&isNull,
-										NULL);
+										&isNull);
 		/* Interpret NULL count as no count (LIMIT ALL) */
 		if (isNull)
 		{
@@ -301,11 +303,11 @@ recompute_limits(LimitState *node)
 
 /*
  * If we have a COUNT, and our input is a Sort node, notify it that it can
- * use bounded sort.  Also, if our input is a MergeAppend, we can apply the
- * same bound to any Sorts that are direct children of the MergeAppend,
- * since the MergeAppend surely need read no more than that many tuples from
- * any one input.  We also have to be prepared to look through a Result,
- * since the planner might stick one atop MergeAppend for projection purposes.
+ * use bounded sort.  We can also pass down the bound through plan nodes
+ * that cannot remove or combine input rows; for example, if our input is a
+ * MergeAppend, we can apply the same bound to any Sorts that are direct
+ * children of the MergeAppend, since the MergeAppend surely need not read
+ * more than that many tuples from any one input.
  *
  * This is a bit of a kluge, but we don't have any more-abstract way of
  * communicating between the two nodes; and it doesn't seem worth trying
@@ -318,6 +320,12 @@ recompute_limits(LimitState *node)
 static void
 pass_down_bound(LimitState *node, PlanState *child_node)
 {
+	/*
+	 * Since this function recurses, in principle we should check stack depth
+	 * here.  In practice, it's probably pointless since the earlier node
+	 * initialization tree traversal would surely have consumed more stack.
+	 */
+
 	if (IsA(child_node, SortState))
 	{
 		SortState  *sortState = (SortState *) child_node;
@@ -337,6 +345,7 @@ pass_down_bound(LimitState *node, PlanState *child_node)
 	}
 	else if (IsA(child_node, MergeAppendState))
 	{
+		/* Pass down the bound through MergeAppend */
 		MergeAppendState *maState = (MergeAppendState *) child_node;
 		int			i;
 
@@ -346,20 +355,34 @@ pass_down_bound(LimitState *node, PlanState *child_node)
 	else if (IsA(child_node, ResultState))
 	{
 		/*
-		 * An extra consideration here is that if the Result is projecting a
-		 * targetlist that contains any SRFs, we can't assume that every input
-		 * tuple generates an output tuple, so a Sort underneath might need to
-		 * return more than N tuples to satisfy LIMIT N. So we cannot use
-		 * bounded sort.
+		 * We also have to be prepared to look through a Result, since the
+		 * planner might stick one atop MergeAppend for projection purposes.
 		 *
 		 * If Result supported qual checking, we'd have to punt on seeing a
-		 * qual, too.  Note that having a resconstantqual is not a
-		 * showstopper: if that fails we're not getting any rows at all.
+		 * qual.  Note that having a resconstantqual is not a showstopper: if
+		 * that fails we're not getting any rows at all.
 		 */
-		if (outerPlanState(child_node) &&
-			!expression_returns_set((Node *) child_node->plan->targetlist))
+		if (outerPlanState(child_node))
 			pass_down_bound(node, outerPlanState(child_node));
 	}
+	else if (IsA(child_node, SubqueryScanState))
+	{
+		/*
+		 * We can also look through SubqueryScan, but only if it has no qual
+		 * (otherwise it might discard rows).
+		 */
+		SubqueryScanState *subqueryState = (SubqueryScanState *) child_node;
+
+		if (subqueryState->ss.ps.qual == NULL)
+			pass_down_bound(node, subqueryState->subplan);
+	}
+
+	/*
+	 * In principle we could look through any plan node type that is certain
+	 * not to discard or combine input rows.  In practice, there are not many
+	 * node types that the planner might put between Sort and Limit, so trying
+	 * to be very general is not worth the trouble.
+	 */
 }
 
 /* ----------------------------------------------------------------
@@ -384,6 +407,7 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
 	limitstate = makeNode(LimitState);
 	limitstate->ps.plan = (Plan *) node;
 	limitstate->ps.state = estate;
+	limitstate->ps.ExecProcNode = ExecLimit;
 
 	limitstate->lstate = LIMIT_INITIAL;
 

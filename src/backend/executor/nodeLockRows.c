@@ -3,7 +3,7 @@
  * nodeLockRows.c
  *	  Routines to handle FOR UPDATE/FOR SHARE row locking
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,6 +26,7 @@
 #include "executor/executor.h"
 #include "executor/nodeLockRows.h"
 #include "foreign/fdwapi.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 #include "utils/tqual.h"
@@ -35,14 +36,17 @@
  *		ExecLockRows
  * ----------------------------------------------------------------
  */
-TupleTableSlot *				/* return: a tuple or NULL */
-ExecLockRows(LockRowsState *node)
+static TupleTableSlot *			/* return: a tuple or NULL */
+ExecLockRows(PlanState *pstate)
 {
+	LockRowsState *node = castNode(LockRowsState, pstate);
 	TupleTableSlot *slot;
 	EState	   *estate;
 	PlanState  *outerPlan;
 	bool		epq_needed;
 	ListCell   *lc;
+
+	CHECK_FOR_INTERRUPTS();
 
 	/*
 	 * get information from the node
@@ -172,7 +176,7 @@ lnext:
 				break;
 			default:
 				elog(ERROR, "unsupported rowmark type");
-				lockmode = LockTupleNoKeyExclusive;		/* keep compiler quiet */
+				lockmode = LockTupleNoKeyExclusive; /* keep compiler quiet */
 				break;
 		}
 
@@ -262,29 +266,15 @@ lnext:
 	 */
 	if (epq_needed)
 	{
-		int			i;
-
 		/* Initialize EPQ machinery */
 		EvalPlanQualBegin(&node->lr_epqstate, estate);
 
 		/*
-		 * Transfer already-fetched tuples into the EPQ state, and make sure
-		 * its test tuples for other tables are reset to NULL.
-		 */
-		for (i = 0; i < node->lr_ntables; i++)
-		{
-			EvalPlanQualSetTuple(&node->lr_epqstate,
-								 i + 1,
-								 node->lr_curtuples[i]);
-			/* freeing this tuple is now the responsibility of EPQ */
-			node->lr_curtuples[i] = NULL;
-		}
-
-		/*
-		 * Next, fetch a copy of any rows that were successfully locked
-		 * without any update having occurred.  (We do this in a separate pass
-		 * so as to avoid overhead in the common case where there are no
-		 * concurrent updates.)
+		 * Transfer any already-fetched tuples into the EPQ state, and fetch a
+		 * copy of any rows that were successfully locked without any update
+		 * having occurred.  (We do this in a separate pass so as to avoid
+		 * overhead in the common case where there are no concurrent updates.)
+		 * Make sure any inactive child rels have NULL test tuples in EPQ.
 		 */
 		foreach(lc, node->lr_arowMarks)
 		{
@@ -293,15 +283,25 @@ lnext:
 			HeapTupleData tuple;
 			Buffer		buffer;
 
-			/* ignore non-active child tables */
+			/* skip non-active child tables, but clear their test tuples */
 			if (!erm->ermActive)
 			{
 				Assert(erm->rti != erm->prti);	/* check it's child table */
+				EvalPlanQualSetTuple(&node->lr_epqstate, erm->rti, NULL);
 				continue;
 			}
 
-			if (EvalPlanQualGetTuple(&node->lr_epqstate, erm->rti) != NULL)
-				continue;		/* it was updated and fetched above */
+			/* was tuple updated and fetched above? */
+			if (node->lr_curtuples[erm->rti - 1] != NULL)
+			{
+				/* yes, so set it as the EPQ test tuple for this rel */
+				EvalPlanQualSetTuple(&node->lr_epqstate,
+									 erm->rti,
+									 node->lr_curtuples[erm->rti - 1]);
+				/* freeing this tuple is now the responsibility of EPQ */
+				node->lr_curtuples[erm->rti - 1] = NULL;
+				continue;
+			}
 
 			/* foreign tables should have been fetched above */
 			Assert(erm->relation->rd_rel->relkind != RELKIND_FOREIGN_TABLE);
@@ -365,6 +365,7 @@ ExecInitLockRows(LockRows *node, EState *estate, int eflags)
 	lrstate = makeNode(LockRowsState);
 	lrstate->ps.plan = (Plan *) node;
 	lrstate->ps.state = estate;
+	lrstate->ps.ExecProcNode = ExecLockRows;
 
 	/*
 	 * Miscellaneous initialization
@@ -405,11 +406,9 @@ ExecInitLockRows(LockRows *node, EState *estate, int eflags)
 	epq_arowmarks = NIL;
 	foreach(lc, node->rowMarks)
 	{
-		PlanRowMark *rc = (PlanRowMark *) lfirst(lc);
+		PlanRowMark *rc = lfirst_node(PlanRowMark, lc);
 		ExecRowMark *erm;
 		ExecAuxRowMark *aerm;
-
-		Assert(IsA(rc, PlanRowMark));
 
 		/* ignore "parent" rowmarks; they are irrelevant at runtime */
 		if (rc->isParent)

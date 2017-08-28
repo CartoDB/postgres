@@ -1,7 +1,7 @@
 /*
  * AM-callable functions for BRIN indexes
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,35 +16,37 @@
 
 
 /*
- * prototypes for functions in brin.c (external entry points for BRIN)
- */
-extern Datum brinbuild(PG_FUNCTION_ARGS);
-extern Datum brinbuildempty(PG_FUNCTION_ARGS);
-extern Datum brininsert(PG_FUNCTION_ARGS);
-extern Datum brinbeginscan(PG_FUNCTION_ARGS);
-extern Datum bringetbitmap(PG_FUNCTION_ARGS);
-extern Datum brinrescan(PG_FUNCTION_ARGS);
-extern Datum brinendscan(PG_FUNCTION_ARGS);
-extern Datum brinmarkpos(PG_FUNCTION_ARGS);
-extern Datum brinrestrpos(PG_FUNCTION_ARGS);
-extern Datum brinbulkdelete(PG_FUNCTION_ARGS);
-extern Datum brinvacuumcleanup(PG_FUNCTION_ARGS);
-extern Datum brincostestimate(PG_FUNCTION_ARGS);
-extern Datum brinoptions(PG_FUNCTION_ARGS);
-
-/*
  * Storage type for BRIN's reloptions
  */
 typedef struct BrinOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	BlockNumber pagesPerRange;
+	bool		autosummarize;
 } BrinOptions;
+
+
+/*
+ * BrinStatsData represents stats data for planner use
+ */
+typedef struct BrinStatsData
+{
+	BlockNumber pagesPerRange;
+	BlockNumber revmapNumPages;
+} BrinStatsData;
+
 
 #define BRIN_DEFAULT_PAGES_PER_RANGE	128
 #define BrinGetPagesPerRange(relation) \
 	((relation)->rd_options ? \
 	 ((BrinOptions *) (relation)->rd_options)->pagesPerRange : \
 	  BRIN_DEFAULT_PAGES_PER_RANGE)
+#define BrinGetAutoSummarize(relation) \
+	((relation)->rd_options ? \
+	 ((BrinOptions *) (relation)->rd_options)->autosummarize : \
+	  false)
 
-#endif   /* BRIN_H */
+
+extern void brinGetStats(Relation index, BrinStatsData *stats);
+
+#endif							/* BRIN_H */

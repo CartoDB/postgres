@@ -3,7 +3,7 @@
  * nbtinsert.c
  *	  Item insertion in Lehman and Yao btrees for Postgres.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
 
 #include "access/heapam.h"
 #include "access/nbtree.h"
+#include "access/nbtxlog.h"
 #include "access/transam.h"
 #include "access/xloginsert.h"
 #include "miscadmin.h"
@@ -35,7 +36,7 @@ typedef struct
 	OffsetNumber newitemoff;	/* where the new item is to be inserted */
 	int			leftspace;		/* space available for items on left page */
 	int			rightspace;		/* space available for items on right page */
-	int			olddataitemstotal;		/* space taken by old items */
+	int			olddataitemstotal;	/* space taken by old items */
 
 	bool		have_split;		/* found a valid split? */
 
@@ -119,7 +120,7 @@ _bt_doinsert(Relation rel, IndexTuple itup,
 
 top:
 	/* find the first page containing this key */
-	stack = _bt_search(rel, natts, itup_scankey, false, &buf, BT_WRITE);
+	stack = _bt_search(rel, natts, itup_scankey, false, &buf, BT_WRITE, NULL);
 
 	offset = InvalidOffsetNumber;
 
@@ -135,7 +136,7 @@ top:
 	 * precise description.
 	 */
 	buf = _bt_moveright(rel, buf, natts, itup_scankey, false,
-						true, stack, BT_WRITE);
+						true, stack, BT_WRITE, NULL);
 
 	/*
 	 * If we're not allowing duplicates, make sure the key isn't already in
@@ -392,6 +393,15 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 					}
 
 					/*
+					 * Check for a conflict-in as we would if we were going to
+					 * write to this page.  We aren't actually going to write,
+					 * but we want a chance to report SSI conflicts that would
+					 * otherwise be masked by this unique constraint
+					 * violation.
+					 */
+					CheckForSerializableConflictIn(rel, NULL, buf);
+
+					/*
 					 * This is a definite conflict.  Break the tuple down into
 					 * datums and report the error.  But first, make sure we
 					 * release the buffer locks we're holding ---
@@ -418,10 +428,10 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 								(errcode(ERRCODE_UNIQUE_VIOLATION),
 								 errmsg("duplicate key value violates unique constraint \"%s\"",
 										RelationGetRelationName(rel)),
-							   key_desc ? errdetail("Key %s already exists.",
-													key_desc) : 0,
+								 key_desc ? errdetail("Key %s already exists.",
+													  key_desc) : 0,
 								 errtableconstraint(heapRel,
-											 RelationGetRelationName(rel))));
+													RelationGetRelationName(rel))));
 					}
 				}
 				else if (all_dead)
@@ -487,7 +497,7 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to re-find tuple within index \"%s\"",
 						RelationGetRelationName(rel)),
-		 errhint("This may be because of a non-immutable index expression."),
+				 errhint("This may be because of a non-immutable index expression."),
 				 errtableconstraint(heapRel,
 									RelationGetRelationName(rel))));
 
@@ -564,12 +574,12 @@ _bt_findinsertloc(Relation rel,
 	if (itemsz > BTMaxItemSize(page))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-			errmsg("index row size %zu exceeds maximum %zu for index \"%s\"",
-				   itemsz, BTMaxItemSize(page),
-				   RelationGetRelationName(rel)),
-		errhint("Values larger than 1/3 of a buffer page cannot be indexed.\n"
-				"Consider a function index of an MD5 hash of the value, "
-				"or use full text indexing."),
+				 errmsg("index row size %zu exceeds maximum %zu for index \"%s\"",
+						itemsz, BTMaxItemSize(page),
+						RelationGetRelationName(rel)),
+				 errhint("Values larger than 1/3 of a buffer page cannot be indexed.\n"
+						 "Consider a function index of an MD5 hash of the value, "
+						 "or use full text indexing."),
 				 errtableconstraint(heapRel,
 									RelationGetRelationName(rel))));
 
@@ -970,7 +980,6 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 				rightoff;
 	OffsetNumber maxoff;
 	OffsetNumber i;
-	bool		isroot;
 	bool		isleaf;
 
 	/* Acquire a new page to split into */
@@ -1009,7 +1018,6 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 	lopaque = (BTPageOpaque) PageGetSpecialPointer(leftpage);
 	ropaque = (BTPageOpaque) PageGetSpecialPointer(rightpage);
 
-	isroot = P_ISROOT(oopaque);
 	isleaf = P_ISLEAF(oopaque);
 
 	/* if we're splitting this page, it won't be the root when we're done */
@@ -1184,7 +1192,7 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 		{
 			memset(rightpage, 0, BufferGetPageSize(rbuf));
 			elog(ERROR, "right sibling's left-link doesn't match: "
-			   "block %u links to %u instead of expected %u in index \"%s\"",
+				 "block %u links to %u instead of expected %u in index \"%s\"",
 				 oopaque->btpo_next, sopaque->btpo_prev, origpagenumber,
 				 RelationGetRelationName(rel));
 		}
@@ -1317,14 +1325,10 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 		 * _bt_restore_page().
 		 */
 		XLogRegisterBufData(1,
-					 (char *) rightpage + ((PageHeader) rightpage)->pd_upper,
+							(char *) rightpage + ((PageHeader) rightpage)->pd_upper,
 							((PageHeader) rightpage)->pd_special - ((PageHeader) rightpage)->pd_upper);
 
-		if (isroot)
-			xlinfo = newitemonleft ? XLOG_BTREE_SPLIT_L_ROOT : XLOG_BTREE_SPLIT_R_ROOT;
-		else
-			xlinfo = newitemonleft ? XLOG_BTREE_SPLIT_L : XLOG_BTREE_SPLIT_R;
-
+		xlinfo = newitemonleft ? XLOG_BTREE_SPLIT_L : XLOG_BTREE_SPLIT_R;
 		recptr = XLogInsert(RM_BTREE_ID, xlinfo);
 
 		PageSetLSN(origpage, recptr);
@@ -1671,7 +1675,8 @@ _bt_insert_parent(Relation rel,
 			elog(DEBUG2, "concurrent ROOT page split");
 			lpageop = (BTPageOpaque) PageGetSpecialPointer(page);
 			/* Find the leftmost page at the next level up */
-			pbuf = _bt_get_endpoint(rel, lpageop->btpo.level + 1, false);
+			pbuf = _bt_get_endpoint(rel, lpageop->btpo.level + 1, false,
+									NULL);
 			/* Set up a phony stack entry pointing there */
 			stack = &fakestack;
 			stack->bts_blkno = BufferGetBlockNumber(pbuf);
@@ -2041,7 +2046,7 @@ _bt_newroot(Relation rel, Buffer lbuf, Buffer rbuf)
 		 * some new func in page API.
 		 */
 		XLogRegisterBufData(0,
-					   (char *) rootpage + ((PageHeader) rootpage)->pd_upper,
+							(char *) rootpage + ((PageHeader) rootpage)->pd_upper,
 							((PageHeader) rootpage)->pd_special -
 							((PageHeader) rootpage)->pd_upper);
 

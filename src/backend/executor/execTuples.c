@@ -12,7 +12,7 @@
  *	  This information is needed by routines manipulating tuples
  *	  (getattribute, formtuple, etc.).
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -88,7 +88,6 @@
 #include "nodes/nodeFuncs.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
-#include "utils/expandeddatum.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
@@ -161,10 +160,7 @@ ExecResetTupleTable(List *tupleTable,	/* tuple table */
 
 	foreach(lc, tupleTable)
 	{
-		TupleTableSlot *slot = (TupleTableSlot *) lfirst(lc);
-
-		/* Sanity checks */
-		Assert(IsA(slot, TupleTableSlot));
+		TupleTableSlot *slot = lfirst_node(TupleTableSlot, lc);
 
 		/* Always release resources and reset the slot to empty */
 		ExecClearTuple(slot);
@@ -248,8 +244,8 @@ ExecDropSingleTupleTableSlot(TupleTableSlot *slot)
  * --------------------------------
  */
 void
-ExecSetSlotDescriptor(TupleTableSlot *slot,		/* slot to change */
-					  TupleDesc tupdesc)		/* new tuple descriptor */
+ExecSetSlotDescriptor(TupleTableSlot *slot, /* slot to change */
+					  TupleDesc tupdesc)	/* new tuple descriptor */
 {
 	/* For safety, make sure slot is empty before changing it */
 	ExecClearTuple(slot);
@@ -813,52 +809,6 @@ ExecCopySlot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
 	return ExecStoreTuple(newTuple, dstslot, InvalidBuffer, true);
 }
 
-/* --------------------------------
- *		ExecMakeSlotContentsReadOnly
- *			Mark any R/W expanded datums in the slot as read-only.
- *
- * This is needed when a slot that might contain R/W datum references is to be
- * used as input for general expression evaluation.  Since the expression(s)
- * might contain more than one Var referencing the same R/W datum, we could
- * get wrong answers if functions acting on those Vars thought they could
- * modify the expanded value in-place.
- *
- * For notational reasons, we return the same slot passed in.
- * --------------------------------
- */
-TupleTableSlot *
-ExecMakeSlotContentsReadOnly(TupleTableSlot *slot)
-{
-	/*
-	 * sanity checks
-	 */
-	Assert(slot != NULL);
-	Assert(slot->tts_tupleDescriptor != NULL);
-	Assert(!slot->tts_isempty);
-
-	/*
-	 * If the slot contains a physical tuple, it can't contain any expanded
-	 * datums, because we flatten those when making a physical tuple.  This
-	 * might change later; but for now, we need do nothing unless the slot is
-	 * virtual.
-	 */
-	if (slot->tts_tuple == NULL)
-	{
-		Form_pg_attribute *att = slot->tts_tupleDescriptor->attrs;
-		int			attnum;
-
-		for (attnum = 0; attnum < slot->tts_nvalid; attnum++)
-		{
-			slot->tts_values[attnum] =
-				MakeExpandedObjectReadOnly(slot->tts_values[attnum],
-										   slot->tts_isnull[attnum],
-										   att[attnum]->attlen);
-		}
-	}
-
-	return slot;
-}
-
 
 /* ----------------------------------------------------------------
  *				convenience initialization routines
@@ -1047,7 +997,8 @@ ExecTypeSetColNames(TupleDesc typeInfo, List *namesList)
 		/* Guard against too-long names list */
 		if (colno >= typeInfo->natts)
 			break;
-		attr = typeInfo->attrs[colno++];
+		attr = TupleDescAttr(typeInfo, colno);
+		colno++;
 
 		/* Ignore empty aliases (these must be for dropped columns) */
 		if (cname[0] == '\0')
@@ -1140,13 +1091,15 @@ TupleDescGetAttInMetadata(TupleDesc tupdesc)
 
 	for (i = 0; i < natts; i++)
 	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
 		/* Ignore dropped attributes */
-		if (!tupdesc->attrs[i]->attisdropped)
+		if (!att->attisdropped)
 		{
-			atttypeid = tupdesc->attrs[i]->atttypid;
+			atttypeid = att->atttypid;
 			getTypeInputInfo(atttypeid, &attinfuncid, &attioparams[i]);
 			fmgr_info(attinfuncid, &attinfuncinfo[i]);
-			atttypmods[i] = tupdesc->attrs[i]->atttypmod;
+			atttypmods[i] = att->atttypmod;
 		}
 	}
 	attinmeta->attinfuncs = attinfuncinfo;
@@ -1177,7 +1130,7 @@ BuildTupleFromCStrings(AttInMetadata *attinmeta, char **values)
 	/* Call the "in" function for each non-dropped attribute */
 	for (i = 0; i < natts; i++)
 	{
-		if (!tupdesc->attrs[i]->attisdropped)
+		if (!TupleDescAttr(tupdesc, i)->attisdropped)
 		{
 			/* Non-dropped attributes */
 			dvalues[i] = InputFunctionCall(&attinmeta->attinfuncs[i],
@@ -1263,7 +1216,7 @@ HeapTupleHeaderGetDatum(HeapTupleHeader tuple)
 
 	/* And do the flattening */
 	result = toast_flatten_tuple_to_datum(tuple,
-										HeapTupleHeaderGetDatumLength(tuple),
+										  HeapTupleHeaderGetDatumLength(tuple),
 										  tupDesc);
 
 	ReleaseTupleDesc(tupDesc);
@@ -1313,7 +1266,7 @@ do_tup_output(TupOutputState *tstate, Datum *values, bool *isnull)
 	ExecStoreVirtualTuple(slot);
 
 	/* send the tuple to the receiver */
-	(*tstate->dest->receiveSlot) (slot, tstate->dest);
+	(void) (*tstate->dest->receiveSlot) (slot, tstate->dest);
 
 	/* clean up */
 	ExecClearTuple(slot);
@@ -1325,33 +1278,32 @@ do_tup_output(TupOutputState *tstate, Datum *values, bool *isnull)
  * Should only be used with a single-TEXT-attribute tupdesc.
  */
 void
-do_text_output_multiline(TupOutputState *tstate, char *text)
+do_text_output_multiline(TupOutputState *tstate, const char *txt)
 {
 	Datum		values[1];
 	bool		isnull[1] = {false};
 
-	while (*text)
+	while (*txt)
 	{
-		char	   *eol;
+		const char *eol;
 		int			len;
 
-		eol = strchr(text, '\n');
+		eol = strchr(txt, '\n');
 		if (eol)
 		{
-			len = eol - text;
-
+			len = eol - txt;
 			eol++;
 		}
 		else
 		{
-			len = strlen(text);
-			eol += len;
+			len = strlen(txt);
+			eol = txt + len;
 		}
 
-		values[0] = PointerGetDatum(cstring_to_text_with_len(text, len));
+		values[0] = PointerGetDatum(cstring_to_text_with_len(txt, len));
 		do_tup_output(tstate, values, isnull);
 		pfree(DatumGetPointer(values[0]));
-		text = eol;
+		txt = eol;
 	}
 }
 

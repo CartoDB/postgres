@@ -3,7 +3,7 @@
  * pruneheap.c
  *	  heap page pruning and HOT-chain management code
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,8 +31,7 @@
 typedef struct
 {
 	TransactionId new_prune_xid;	/* new prune hint value for page */
-	TransactionId latestRemovedXid;		/* latest xid to be removed by this
-										 * prune */
+	TransactionId latestRemovedXid; /* latest xid to be removed by this prune */
 	int			nredirected;	/* numbers of entries in arrays below */
 	int			ndead;
 	int			nunused;
@@ -92,12 +91,21 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 	 * need to use the horizon that includes slots, otherwise the data-only
 	 * horizon can be used. Note that the toast relation of user defined
 	 * relations are *not* considered catalog relations.
+	 *
+	 * It is OK to apply the old snapshot limit before acquiring the cleanup
+	 * lock because the worst that can happen is that we are not quite as
+	 * aggressive about the cleanup (by however many transaction IDs are
+	 * consumed between this point and acquiring the lock).  This allows us to
+	 * save significant overhead in the case where the page is found not to be
+	 * prunable.
 	 */
 	if (IsCatalogRelation(relation) ||
 		RelationIsAccessibleInLogicalDecoding(relation))
 		OldestXmin = RecentGlobalXmin;
 	else
-		OldestXmin = RecentGlobalDataXmin;
+		OldestXmin =
+			TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin,
+												relation);
 
 	Assert(TransactionIdIsValid(OldestXmin));
 
@@ -140,8 +148,8 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 		 */
 		if (PageIsFull(page) || PageGetHeapFreeSpace(page) < minfree)
 		{
-			TransactionId ignore = InvalidTransactionId;		/* return value not
-																 * needed */
+			TransactionId ignore = InvalidTransactionId;	/* return value not
+															 * needed */
 
 			/* OK to prune */
 			(void) heap_page_prune(relation, buffer, OldestXmin, true, &ignore);
@@ -399,7 +407,7 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 			{
 				heap_prune_record_unused(prstate, rootoffnum);
 				HeapTupleHeaderAdvanceLatestRemovedXid(htup,
-												 &prstate->latestRemovedXid);
+													   &prstate->latestRemovedXid);
 				ndeleted++;
 			}
 
@@ -532,7 +540,7 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		{
 			latestdead = offnum;
 			HeapTupleHeaderAdvanceLatestRemovedXid(htup,
-												 &prstate->latestRemovedXid);
+												   &prstate->latestRemovedXid);
 		}
 		else if (!recent_dead)
 			break;

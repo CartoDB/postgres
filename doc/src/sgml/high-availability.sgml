@@ -40,7 +40,7 @@
   server to modify the data.  Servers that can modify data are
   called read/write, <firstterm>master</> or <firstterm>primary</> servers.
   Servers that track changes in the master are called <firstterm>standby</>
-  or <firstterm>slave</> servers. A standby server that cannot be connected
+  or <firstterm>secondary</> servers. A standby server that cannot be connected
   to until it is promoted to a master server is called a <firstterm>warm
   standby</> server, and one that can accept connections and serves read-only
   queries is called a <firstterm>hot standby</> server.
@@ -76,9 +76,7 @@
 
  <para>
   The remainder of this section outlines various failover, replication,
-  and load balancing solutions.  A <ulink
-  url="http://www.postgres-r.org/documentation/terms">glossary</ulink> is
-  also available.
+  and load balancing solutions.
  </para>
 
  <sect1 id="different-replication-solutions">
@@ -113,7 +111,7 @@
   </varlistentry>
 
   <varlistentry>
-   <term>File System (Block-Device) Replication</term>
+   <term>File System (Block Device) Replication</term>
    <listitem>
 
     <para>
@@ -140,7 +138,7 @@ protocol to make nodes agree on a serializable transactional order.
   </varlistentry>
 
   <varlistentry>
-   <term>Transaction Log Shipping</term>
+   <term>Write-Ahead Log Shipping</term>
    <listitem>
 
     <para>
@@ -156,6 +154,24 @@ protocol to make nodes agree on a serializable transactional order.
      (<xref linkend="warm-standby">) or streaming replication (see
      <xref linkend="streaming-replication">), or a combination of both. For
      information on hot standby, see <xref linkend="hot-standby">.
+    </para>
+   </listitem>
+  </varlistentry>
+
+  <varlistentry>
+   <term>Logical Replication</term>
+   <listitem>
+    <para>
+     Logical replication allows a database server to send a stream of data
+     modifications to another server.  <productname>PostgreSQL</productname>
+     logical replication constructs a stream of logical data modifications
+     from the WAL.  Logical replication allows the data changes from
+     individual tables to be replicated.  Logical replication doesn't require
+     a particular server to be designated as a master or a replica but allows
+     data to flow in multiple directions.  For more information on logical
+     replication, see <xref linkend="logical-replication">.  Through the
+     logical decoding interface (<xref linkend="logicaldecoding">),
+     third-party extensions can also provide similar functionality.
     </para>
    </listitem>
   </varlistentry>
@@ -209,7 +225,7 @@ protocol to make nodes agree on a serializable transactional order.
      middleware.  Care must also be taken that all
      transactions either commit or abort on all servers, perhaps
      using two-phase commit (<xref linkend="sql-prepare-transaction">
-     and <xref linkend="sql-commit-prepared">.
+     and <xref linkend="sql-commit-prepared">).
      <productname>Pgpool-II</> and <productname>Continuent Tungsten</>
      are examples of this type of replication.
     </para>
@@ -285,13 +301,14 @@ protocol to make nodes agree on a serializable transactional order.
 
  <table id="high-availability-matrix">
   <title>High Availability, Load Balancing, and Replication Feature Matrix</title>
-  <tgroup cols="8">
+  <tgroup cols="9">
    <thead>
     <row>
      <entry>Feature</entry>
      <entry>Shared Disk Failover</entry>
      <entry>File System Replication</entry>
-     <entry>Transaction Log Shipping</entry>
+     <entry>Write-Ahead Log Shipping</entry>
+     <entry>Logical Replication</entry>
      <entry>Trigger-Based Master-Standby Replication</entry>
      <entry>Statement-Based Replication Middleware</entry>
      <entry>Asynchronous Multimaster Replication</entry>
@@ -302,21 +319,23 @@ protocol to make nodes agree on a serializable transactional order.
    <tbody>
 
     <row>
-     <entry>Most Common Implementation</entry>
+     <entry>Most common implementations</entry>
      <entry align="center">NAS</entry>
      <entry align="center">DRBD</entry>
-     <entry align="center">Streaming Repl.</entry>
-     <entry align="center">Slony</entry>
+     <entry align="center">built-in streaming replication</entry>
+     <entry align="center">built-in logical replication, pglogical</entry>
+     <entry align="center">Londiste, Slony</entry>
      <entry align="center">pgpool-II</entry>
      <entry align="center">Bucardo</entry>
      <entry align="center"></entry>
     </row>
 
     <row>
-     <entry>Communication Method</entry>
+     <entry>Communication method</entry>
      <entry align="center">shared disk</entry>
      <entry align="center">disk blocks</entry>
      <entry align="center">WAL</entry>
+     <entry align="center">logical decoding</entry>
      <entry align="center">table rows</entry>
      <entry align="center">SQL</entry>
      <entry align="center">table rows</entry>
@@ -332,6 +351,7 @@ protocol to make nodes agree on a serializable transactional order.
      <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
+     <entry align="center">&bull;</entry>
     </row>
 
     <row>
@@ -339,6 +359,7 @@ protocol to make nodes agree on a serializable transactional order.
      <entry align="center"></entry>
      <entry align="center"></entry>
      <entry align="center"></entry>
+     <entry align="center">&bull;</entry>
      <entry align="center"></entry>
      <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
@@ -349,6 +370,7 @@ protocol to make nodes agree on a serializable transactional order.
      <entry>No master server overhead</entry>
      <entry align="center">&bull;</entry>
      <entry align="center"></entry>
+     <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
      <entry align="center"></entry>
      <entry align="center">&bull;</entry>
@@ -361,6 +383,7 @@ protocol to make nodes agree on a serializable transactional order.
      <entry align="center">&bull;</entry>
      <entry align="center"></entry>
      <entry align="center">with sync off</entry>
+     <entry align="center">with sync off</entry>
      <entry align="center">&bull;</entry>
      <entry align="center"></entry>
      <entry align="center">&bull;</entry>
@@ -372,6 +395,7 @@ protocol to make nodes agree on a serializable transactional order.
      <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
      <entry align="center">with sync on</entry>
+     <entry align="center">with sync on</entry>
      <entry align="center"></entry>
      <entry align="center">&bull;</entry>
      <entry align="center"></entry>
@@ -379,10 +403,11 @@ protocol to make nodes agree on a serializable transactional order.
     </row>
 
     <row>
-     <entry>Standby accept read-only queries</entry>
+     <entry>Replicas accept read-only queries</entry>
      <entry align="center"></entry>
      <entry align="center"></entry>
-     <entry align="center">with hot</entry>
+     <entry align="center">with hot standby</entry>
+     <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
@@ -395,6 +420,7 @@ protocol to make nodes agree on a serializable transactional order.
      <entry align="center"></entry>
      <entry align="center"></entry>
      <entry align="center">&bull;</entry>
+     <entry align="center">&bull;</entry>
      <entry align="center"></entry>
      <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
@@ -405,6 +431,7 @@ protocol to make nodes agree on a serializable transactional order.
      <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
      <entry align="center">&bull;</entry>
+     <entry align="center"></entry>
      <entry align="center">&bull;</entry>
      <entry align="center"></entry>
      <entry align="center"></entry>
@@ -594,24 +621,24 @@ protocol to make nodes agree on a serializable transactional order.
     (see <xref linkend="restore-command">) or directly from the master
     over a TCP connection (streaming replication). The standby server will
     also attempt to restore any WAL found in the standby cluster's
-    <filename>pg_xlog</> directory. That typically happens after a server
+    <filename>pg_wal</> directory. That typically happens after a server
     restart, when the standby replays again WAL that was streamed from the
     master before the restart, but you can also manually copy files to
-    <filename>pg_xlog</> at any time to have them replayed.
+    <filename>pg_wal</> at any time to have them replayed.
    </para>
 
    <para>
     At startup, the standby begins by restoring all WAL available in the
     archive location, calling <varname>restore_command</>. Once it
     reaches the end of WAL available there and <varname>restore_command</>
-    fails, it tries to restore any WAL available in the <filename>pg_xlog</> directory.
+    fails, it tries to restore any WAL available in the <filename>pg_wal</> directory.
     If that fails, and streaming replication has been configured, the
     standby tries to connect to the primary server and start streaming WAL
-    from the last valid record found in archive or <filename>pg_xlog</>. If that fails
+    from the last valid record found in archive or <filename>pg_wal</>. If that fails
     or streaming replication is not configured, or if the connection is
     later disconnected, the standby goes back to step 1 and tries to
     restore the file from the archive again. This loop of retries from the
-    archive, <filename>pg_xlog</>, and via streaming replication goes on until the server
+    archive, <filename>pg_wal</>, and via streaming replication goes on until the server
     is stopped or failover is triggered by a trigger file.
    </para>
 
@@ -619,7 +646,7 @@ protocol to make nodes agree on a serializable transactional order.
     Standby mode is exited and the server switches to normal operation
     when <command>pg_ctl promote</> is run or a trigger file is found
     (<varname>trigger_file</>). Before failover,
-    any WAL immediately available in the archive or in <filename>pg_xlog</> will be
+    any WAL immediately available in the archive or in <filename>pg_wal</> will be
     restored, but no attempt is made to connect to the master.
    </para>
   </sect2>
@@ -852,9 +879,9 @@ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass'
      of WAL records generated in the primary, but not yet applied in the
      standby. You can calculate this lag by comparing the current WAL write
      location on the primary with the last WAL location received by the
-     standby. They can be retrieved using
-     <function>pg_current_xlog_location</> on the primary and the
-     <function>pg_last_xlog_receive_location</> on the standby,
+     standby. These locations can be retrieved using
+     <function>pg_current_wal_lsn</> on the primary and
+     <function>pg_last_wal_receive_lsn</> on the standby,
      respectively (see <xref linkend="functions-admin-backup-table"> and
      <xref linkend="functions-recovery-info-table"> for details).
      The last WAL receive location in the standby is also displayed in the
@@ -865,10 +892,10 @@ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass'
      You can retrieve a list of WAL sender processes via the
      <link linkend="monitoring-stats-views-table">
      <literal>pg_stat_replication</></link> view. Large differences between
-     <function>pg_current_xlog_location</> and <literal>sent_location</> field
+     <function>pg_current_wal_lsn</> and the view's <literal>sent_lsn</> field
      might indicate that the master server is under heavy load, while
-     differences between <literal>sent_location</> and
-     <function>pg_last_xlog_receive_location</> on the standby might indicate
+     differences between <literal>sent_lsn</> and
+     <function>pg_last_wal_receive_lsn</> on the standby might indicate
      network delay, or that the standby is under heavy load.
     </para>
    </sect3>
@@ -895,7 +922,7 @@ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass'
     However, these methods often result in retaining more WAL segments than
     required, whereas replication slots retain only the number of segments
     known to be needed.  An advantage of these methods is that they bound
-    the space requirement for <literal>pg_xlog</>; there is currently no way
+    the space requirement for <literal>pg_wal</>; there is currently no way
     to do this using replication slots.
    </para>
    <para>
@@ -914,7 +941,7 @@ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass'
     </para>
     <para>
      Existing replication slots and their state can be seen in the
-     <link linkend="catalog-pg-replication-slots"><structname>pg_replication_slots</structname></link>
+     <link linkend="view-pg-replication-slots"><structname>pg_replication_slots</structname></link>
      view.
     </para>
     <para>
@@ -929,8 +956,8 @@ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass'
      You can create a replication slot like this:
 <programlisting>
 postgres=# SELECT * FROM pg_create_physical_replication_slot('node_a_slot');
-  slot_name  | xlog_position
--------------+---------------
+  slot_name  | lsn
+-------------+-----
  node_a_slot |
 
 postgres=# SELECT * FROM pg_replication_slots;
@@ -1027,16 +1054,18 @@ primary_slot_name = 'node_a_slot'
 
    <para>
     Synchronous replication offers the ability to confirm that all changes
-    made by a transaction have been transferred to one synchronous standby
-    server. This extends the standard level of durability
+    made by a transaction have been transferred to one or more synchronous
+    standby servers. This extends that standard level of durability
     offered by a transaction commit. This level of protection is referred
-    to as 2-safe replication in computer science theory.
+    to as 2-safe replication in computer science theory, and group-1-safe
+    (group-safe and 1-safe) when <varname>synchronous_commit</> is set to
+    <literal>remote_write</>.
    </para>
 
    <para>
     When requesting synchronous replication, each commit of a
     write transaction will wait until confirmation is
-    received that the commit has been written to the transaction log on disk
+    received that the commit has been written to the write-ahead log on disk
     of both the primary and standby server. The only possibility that data
     can be lost is if both the primary and the standby suffer crashes at the
     same time. This can provide a much higher level of durability, though only
@@ -1044,7 +1073,7 @@ primary_slot_name = 'node_a_slot'
     servers.  Waiting for confirmation increases the user's confidence that the
     changes will not be lost in the event of server crashes but it also
     necessarily increases the response time for the requesting transaction.
-    The minimum wait time is the roundtrip time between primary to standby.
+    The minimum wait time is the round-trip time between primary to standby.
    </para>
 
    <para>
@@ -1054,6 +1083,18 @@ primary_slot_name = 'node_a_slot'
     running actions such as data loading or index building do not wait
     until the very final commit message. All two-phase commit actions
     require commit waits, including both prepare and commit.
+   </para>
+
+   <para>
+    A synchronous standby can be a physical replication standby or a logical
+    replication subscriber.  It can also be any other physical or logical WAL
+    replication stream consumer that knows how to send the appropriate
+    feedback messages.  Besides the built-in physical and logical replication
+    systems, this includes special programs such
+    as <command>pg_receivewal</command> and <command>pg_recvlogical</command>
+    as well as some third-party replication systems and custom programs.
+    Check the respective documentation for details on synchronous replication
+    support.
    </para>
 
    <sect3 id="synchronous-replication-config">
@@ -1081,9 +1122,13 @@ primary_slot_name = 'node_a_slot'
     WAL record is then sent to the standby. The standby sends reply
     messages each time a new batch of WAL data is written to disk, unless
     <varname>wal_receiver_status_interval</> is set to zero on the standby.
-    If the standby is the first matching standby, as specified in
-    <varname>synchronous_standby_names</> on the primary, the reply
-    messages from that standby will be used to wake users waiting for
+    In the case that <varname>synchronous_commit</> is set to
+    <literal>remote_apply</>, the standby sends reply messages when the commit
+    record is replayed, making the transaction visible.
+    If the standby is chosen as a synchronous standby, according to the setting
+    of <varname>synchronous_standby_names</> on the primary, the reply
+    messages from that standby will be considered along with those from other
+    synchronous standbys to decide when to release transactions waiting for
     confirmation that the commit record has been received. These parameters
     allow the administrator to specify which standby servers should be
     synchronous standbys. Note that the configuration of synchronous
@@ -1107,12 +1152,82 @@ primary_slot_name = 'node_a_slot'
    </para>
 
    <para>
+    Setting <varname>synchronous_commit</> to <literal>remote_apply</> will
+    cause each commit to wait until the current synchronous standbys report
+    that they have replayed the transaction, making it visible to user
+    queries.  In simple cases, this allows for load balancing with causal
+    consistency.
+   </para>
+
+   <para>
     Users will stop waiting if a fast shutdown is requested.  However, as
     when using asynchronous replication, the server will not fully
     shutdown until all outstanding WAL records are transferred to the currently
     connected standby servers.
    </para>
 
+   </sect3>
+
+   <sect3 id="synchronous-replication-multiple-standbys">
+    <title>Multiple Synchronous Standbys</title>
+
+   <para>
+    Synchronous replication supports one or more synchronous standby servers;
+    transactions will wait until all the standby servers which are considered
+    as synchronous confirm receipt of their data. The number of synchronous
+    standbys that transactions must wait for replies from is specified in
+    <varname>synchronous_standby_names</>. This parameter also specifies
+    a list of standby names and the method (<literal>FIRST</> and
+    <literal>ANY</>) to choose synchronous standbys from the listed ones.
+   </para>
+   <para>
+    The method <literal>FIRST</> specifies a priority-based synchronous
+    replication and makes transaction commits wait until their WAL records are
+    replicated to the requested number of synchronous standbys chosen based on
+    their priorities. The standbys whose names appear earlier in the list are
+    given higher priority and will be considered as synchronous. Other standby
+    servers appearing later in this list represent potential synchronous
+    standbys. If any of the current synchronous standbys disconnects for
+    whatever reason, it will be replaced immediately with the
+    next-highest-priority standby.
+   </para>
+   <para>
+    An example of <varname>synchronous_standby_names</> for
+    a priority-based multiple synchronous standbys is:
+<programlisting>
+synchronous_standby_names = 'FIRST 2 (s1, s2, s3)'
+</programlisting>
+    In this example, if four standby servers <literal>s1</>, <literal>s2</>,
+    <literal>s3</> and <literal>s4</> are running, the two standbys
+    <literal>s1</> and <literal>s2</> will be chosen as synchronous standbys
+    because their names appear early in the list of standby names.
+    <literal>s3</> is a potential synchronous standby and will take over
+    the role of synchronous standby when either of <literal>s1</> or
+    <literal>s2</> fails. <literal>s4</> is an asynchronous standby since
+    its name is not in the list.
+   </para>
+   <para>
+    The method <literal>ANY</> specifies a quorum-based synchronous
+    replication and makes transaction commits wait until their WAL records
+    are replicated to <emphasis>at least</> the requested number of
+    synchronous standbys in the list.
+   </para>
+   <para>
+    An example of <varname>synchronous_standby_names</> for
+    a quorum-based multiple synchronous standbys is:
+<programlisting>
+synchronous_standby_names = 'ANY 2 (s1, s2, s3)'
+</programlisting>
+    In this example, if four standby servers <literal>s1</>, <literal>s2</>,
+    <literal>s3</> and <literal>s4</> are running, transaction commits will
+    wait for replies from at least any two standbys of <literal>s1</>,
+    <literal>s2</> and <literal>s3</>. <literal>s4</> is an asynchronous
+    standby since its name is not in the list.
+   </para>
+   <para>
+    The synchronous states of standby servers can be viewed using
+    the <structname>pg_stat_replication</structname> view.
+   </para>
    </sect3>
 
    <sect3 id="synchronous-replication-performance">
@@ -1160,18 +1275,32 @@ primary_slot_name = 'node_a_slot'
     <title>Planning for High Availability</title>
 
    <para>
-    Commits made when <varname>synchronous_commit</> is set to <literal>on</>
-    or <literal>remote_write</> will wait until the synchronous standby responds. The response
-    may never occur if the last, or only, standby should crash.
+    <varname>synchronous_standby_names</> specifies the number and
+    names of synchronous standbys that transaction commits made when
+    <varname>synchronous_commit</> is set to <literal>on</>,
+    <literal>remote_apply</> or <literal>remote_write</> will wait for
+    responses from. Such transaction commits may never be completed
+    if any one of synchronous standbys should crash.
    </para>
 
    <para>
-    The best solution for avoiding data loss is to ensure you don't lose
-    your last remaining synchronous standby. This can be achieved by naming multiple
+    The best solution for high availability is to ensure you keep as many
+    synchronous standbys as requested. This can be achieved by naming multiple
     potential synchronous standbys using <varname>synchronous_standby_names</>.
-    The first named standby will be used as the synchronous standby. Standbys
-    listed after this will take over the role of synchronous standby if the
-    first one should fail.
+   </para>
+
+   <para>
+    In a priority-based synchronous replication, the standbys whose names
+    appear earlier in the list will be used as synchronous standbys.
+    Standbys listed after these will take over the role of synchronous standby
+    if one of current ones should fail.
+   </para>
+
+   <para>
+    In a quorum-based synchronous replication, all the standbys appearing
+    in the list will be used as candidates for synchronous standbys.
+    Even if one of them should fail, the other standbys will keep performing
+    the role of candidates of synchronous standby.
    </para>
 
    <para>
@@ -1184,6 +1313,8 @@ primary_slot_name = 'node_a_slot'
     will increase according to the length of time the standby has been down.
     The standby is only able to become a synchronous standby
     once it has reached <literal>streaming</> state.
+    This state can be viewed using
+    the <structname>pg_stat_replication</structname> view.
    </para>
 
    <para>
@@ -1196,13 +1327,15 @@ primary_slot_name = 'node_a_slot'
     they show as committed on the primary. The guarantee we offer is that
     the application will not receive explicit acknowledgement of the
     successful commit of a transaction until the WAL data is known to be
-    safely received by the standby.
+    safely received by all the synchronous standbys.
    </para>
 
    <para>
-    If you really do lose your last standby server then you should disable
-    <varname>synchronous_standby_names</> and reload the configuration file
-    on the primary server.
+    If you really cannot keep as many synchronous standbys as requested
+    then you should decrease the number of synchronous standbys that
+    transaction commits must wait for responses from
+    in <varname>synchronous_standby_names</> (or disable it) and
+    reload the configuration file on the primary server.
    </para>
 
    <para>
@@ -1504,7 +1637,7 @@ if (!triggered)
    </para>
 
    <para>
-    An external program can call the <function>pg_xlogfile_name_offset()</>
+    An external program can call the <function>pg_walfile_name_offset()</>
     function (see <xref linkend="functions-admin">)
     to find out the file name and the exact byte offset within it of
     the current end of WAL.  It can then access the WAL file directly
@@ -1732,7 +1865,7 @@ if (!triggered)
 
    <para>
     In normal operation, <quote>read-only</> transactions are allowed to
-    update sequences and to use <command>LISTEN</>, <command>UNLISTEN</>, and
+    use <command>LISTEN</>, <command>UNLISTEN</>, and
     <command>NOTIFY</>, so Hot Standby sessions operate under slightly tighter
     restrictions than ordinary read-only sessions.  It is possible that some
     of these restrictions might be loosened in a future release.
@@ -1965,8 +2098,8 @@ if (!triggered)
    <title>Administrator's Overview</title>
 
    <para>
-    If <varname>hot_standby</> is turned <literal>on</> in
-    <filename>postgresql.conf</> and there is a <filename>recovery.conf</>
+    If <varname>hot_standby</> is <literal>on</> in <filename>postgresql.conf</>
+    (the default value) and there is a <filename>recovery.conf</>
     file present, the server will run in Hot Standby mode.
     However, it may take some time for Hot Standby connections to be allowed,
     because the server will not accept connections until it has completed
@@ -1988,7 +2121,7 @@ LOG:  database system is ready to accept read only connections
     Consistency information is recorded once per checkpoint on the primary.
     It is not possible to enable hot standby when reading WAL
     written during a period when <varname>wal_level</> was not set to
-    <literal>hot_standby</> or <literal>logical</> on the primary.  Reaching
+    <literal>replica</> or <literal>logical</> on the primary.  Reaching
     a consistent state can also be delayed in the presence of both of these
     conditions:
 
@@ -2111,12 +2244,12 @@ LOG:  database system is ready to accept read only connections
     <function>pg_cancel_backend()</>
     and <function>pg_terminate_backend()</> will work on user backends,
     but not the Startup process, which performs
-    recovery. <structname>pg_stat_activity</structname> does not show an
-    entry for the Startup process, nor do recovering transactions show
-    as active. As a result, <structname>pg_prepared_xacts</structname>
-    is always empty during recovery. If you wish to resolve in-doubt
-    prepared transactions, view <literal>pg_prepared_xacts</> on the
-    primary and issue commands to resolve transactions there.
+    recovery. <structname>pg_stat_activity</structname> does not show
+    recovering transactions as active. As a result,
+    <structname>pg_prepared_xacts</structname> is always empty during
+    recovery. If you wish to resolve in-doubt prepared transactions, view
+    <literal>pg_prepared_xacts</> on the primary and issue commands to
+    resolve transactions there or resolve them after the end of recovery.
    </para>
 
    <para>
@@ -2142,7 +2275,7 @@ LOG:  database system is ready to accept read only connections
 
    <para>
     WAL file control commands will not work during recovery,
-    e.g. <function>pg_start_backup</>, <function>pg_switch_xlog</> etc.
+    e.g. <function>pg_start_backup</>, <function>pg_switch_wal</> etc.
    </para>
 
    <para>
@@ -2268,12 +2401,6 @@ LOG:  database system is ready to accept read only connections
     These can and probably will be fixed in future releases:
 
   <itemizedlist>
-   <listitem>
-    <para>
-     Operations on hash indexes are not presently WAL-logged, so
-     replay will not update these indexes.
-    </para>
-   </listitem>
    <listitem>
     <para>
      Full knowledge of running transactions is required before snapshots

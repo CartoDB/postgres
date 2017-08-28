@@ -23,7 +23,7 @@
 #ifndef PG_BACKUP_H
 #define PG_BACKUP_H
 
-#include "dumputils.h"
+#include "fe_utils/simple_list.h"
 #include "libpq-fe.h"
 
 
@@ -58,44 +58,15 @@ typedef enum _teSection
 	SECTION_POST_DATA			/* stuff to be processed after data */
 } teSection;
 
-/*
- *	We may want to have some more user-readable data, but in the mean
- *	time this gives us some abstraction and type checking.
- */
-typedef struct Archive
-{
-	int			verbose;
-	char	   *remoteVersionStr;		/* server's version string */
-	int			remoteVersion;	/* same in numeric form */
-
-	int			minRemoteVersion;		/* allowable range */
-	int			maxRemoteVersion;
-
-	int			numWorkers;		/* number of parallel processes */
-	char	   *sync_snapshot_id;		/* sync snapshot id for parallel
-										 * operation */
-
-	/* info needed for string escaping */
-	int			encoding;		/* libpq code for client_encoding */
-	bool		std_strings;	/* standard_conforming_strings */
-	char	   *use_role;		/* Issue SET ROLE to this */
-
-	/* error handling */
-	bool		exit_on_error;	/* whether to exit on SQL errors... */
-	int			n_errors;		/* number of errors (if no die) */
-
-	/* The rest is private */
-} Archive;
-
 typedef struct _restoreOptions
 {
 	int			createDB;		/* Issue commands to create the database */
 	int			noOwner;		/* Don't try to match original object owner */
 	int			noTablespace;	/* Don't issue tablespace-related commands */
-	int			disable_triggers;		/* disable triggers during data-only
-										 * restore */
-	int			use_setsessauth;/* Use SET SESSION AUTHORIZATION commands
-								 * instead of OWNER TO */
+	int			disable_triggers;	/* disable triggers during data-only
+									 * restore */
+	int			use_setsessauth;	/* Use SET SESSION AUTHORIZATION commands
+									 * instead of OWNER TO */
 	char	   *superuser;		/* Username to use as superuser */
 	char	   *use_role;		/* Issue SET ROLE to this */
 	int			dropSchema;
@@ -103,7 +74,9 @@ typedef struct _restoreOptions
 	int			dump_inserts;
 	int			column_inserts;
 	int			if_exists;
-	int			no_security_labels;		/* Skip security label entries */
+	int			no_publications;	/* Skip publication entries */
+	int			no_security_labels; /* Skip security label entries */
+	int			no_subscriptions;	/* Skip subscription entries */
 	int			strict_names;
 
 	const char *filename;
@@ -128,11 +101,12 @@ typedef struct _restoreOptions
 	SimpleStringList indexNames;
 	SimpleStringList functionNames;
 	SimpleStringList schemaNames;
+	SimpleStringList schemaExcludeNames;
 	SimpleStringList triggerNames;
 	SimpleStringList tableNames;
 
 	int			useDB;
-	char	   *dbname;
+	char	   *dbname;			/* subject to expand_dbname */
 	char	   *pgport;
 	char	   *pghost;
 	char	   *username;
@@ -146,11 +120,13 @@ typedef struct _restoreOptions
 
 	bool	   *idWanted;		/* array showing which dump IDs to emit */
 	int			enable_row_security;
+	int			sequence_data;	/* dump sequence data even in schema-only mode */
+	int			binary_upgrade;
 } RestoreOptions;
 
 typedef struct _dumpOptions
 {
-	const char *dbname;
+	const char *dbname;			/* subject to expand_dbname */
 	const char *pghost;
 	const char *pgport;
 	const char *username;
@@ -171,6 +147,8 @@ typedef struct _dumpOptions
 	int			column_inserts;
 	int			if_exists;
 	int			no_security_labels;
+	int			no_publications;
+	int			no_subscriptions;
 	int			no_synchronized_snapshots;
 	int			no_unlogged_table_data;
 	int			serializable_deferrable;
@@ -179,6 +157,7 @@ typedef struct _dumpOptions
 	int			outputNoTablespaces;
 	int			use_setsessauth;
 	int			enable_row_security;
+	int			load_via_partition_root;
 
 	/* default, if no "inclusion" switches appear, is to dump everything */
 	bool		include_everything;
@@ -186,9 +165,44 @@ typedef struct _dumpOptions
 	int			outputClean;
 	int			outputCreateDB;
 	bool		outputBlobs;
+	bool		dontOutputBlobs;
 	int			outputNoOwner;
 	char	   *outputSuperuser;
+
+	int			sequence_data;	/* dump sequence data even in schema-only mode */
 } DumpOptions;
+
+/*
+ *	We may want to have some more user-readable data, but in the mean
+ *	time this gives us some abstraction and type checking.
+ */
+typedef struct Archive
+{
+	DumpOptions *dopt;			/* options, if dumping */
+	RestoreOptions *ropt;		/* options, if restoring */
+
+	int			verbose;
+	char	   *remoteVersionStr;	/* server's version string */
+	int			remoteVersion;	/* same in numeric form */
+	bool		isStandby;		/* is server a standby node */
+
+	int			minRemoteVersion;	/* allowable range */
+	int			maxRemoteVersion;
+
+	int			numWorkers;		/* number of parallel processes */
+	char	   *sync_snapshot_id;	/* sync snapshot id for parallel operation */
+
+	/* info needed for string escaping */
+	int			encoding;		/* libpq code for client_encoding */
+	bool		std_strings;	/* standard_conforming_strings */
+	char	   *use_role;		/* Issue SET ROLE to this */
+
+	/* error handling */
+	bool		exit_on_error;	/* whether to exit on SQL errors... */
+	int			n_errors;		/* number of errors (if no die) */
+
+	/* The rest is private */
+} Archive;
 
 
 /*
@@ -215,9 +229,9 @@ typedef struct
 
 typedef int DumpId;
 
-typedef int (*DataDumperPtr) (Archive *AH, DumpOptions *dopt, void *userArg);
+typedef int (*DataDumperPtr) (Archive *AH, void *userArg);
 
-typedef void (*SetupWorkerPtr) (Archive *AH, DumpOptions *dopt, RestoreOptions *ropt);
+typedef void (*SetupWorkerPtrType) (Archive *AH);
 
 /*
  * Main archiver interface.
@@ -250,9 +264,11 @@ extern void WriteData(Archive *AH, const void *data, size_t dLen);
 extern int	StartBlob(Archive *AH, Oid oid);
 extern int	EndBlob(Archive *AH, Oid oid);
 
-extern void CloseArchive(Archive *AH, DumpOptions *dopt);
+extern void CloseArchive(Archive *AH);
 
-extern void SetArchiveRestoreOptions(Archive *AH, RestoreOptions *ropt);
+extern void SetArchiveOptions(Archive *AH, DumpOptions *dopt, RestoreOptions *ropt);
+
+extern void ProcessArchiveRestoreOptions(Archive *AH);
 
 extern void RestoreArchive(Archive *AH);
 
@@ -261,11 +277,11 @@ extern Archive *OpenArchive(const char *FileSpec, const ArchiveFormat fmt);
 
 /* Create a new archive */
 extern Archive *CreateArchive(const char *FileSpec, const ArchiveFormat fmt,
-			  const int compression, ArchiveMode mode,
-			  SetupWorkerPtr setupDumpWorker);
+			  const int compression, bool dosync, ArchiveMode mode,
+			  SetupWorkerPtrType setupDumpWorker);
 
 /* The --list option */
-extern void PrintTOCSummary(Archive *AH, RestoreOptions *ropt);
+extern void PrintTOCSummary(Archive *AH);
 
 extern RestoreOptions *NewRestoreOptions(void);
 
@@ -274,7 +290,7 @@ extern void InitDumpOptions(DumpOptions *opts);
 extern DumpOptions *dumpOptionsFromRestoreOptions(RestoreOptions *ropt);
 
 /* Rearrange and filter TOC entries */
-extern void SortTocFromFile(Archive *AHX, RestoreOptions *ropt);
+extern void SortTocFromFile(Archive *AHX);
 
 /* Convenience functions used only when writing DATA */
 extern void archputs(const char *s, Archive *AH);
@@ -283,4 +299,4 @@ extern int	archprintf(Archive *AH, const char *fmt,...) pg_attribute_printf(2, 3
 #define appendStringLiteralAH(buf,str,AH) \
 	appendStringLiteral(buf, str, (AH)->encoding, (AH)->std_strings)
 
-#endif   /* PG_BACKUP_H */
+#endif							/* PG_BACKUP_H */

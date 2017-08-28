@@ -3,7 +3,7 @@
 # parser generater for ecpg version 2
 # call with backend parser as stdin
 #
-# Copyright (c) 2007-2016, PostgreSQL Global Development Group
+# Copyright (c) 2007-2017, PostgreSQL Global Development Group
 #
 # Written by Mike Aubury <mike.aubury@aubit.com>
 #            Michael Meskes <meskes@postgresql.org>
@@ -98,7 +98,7 @@ my %replace_line = (
 	'VariableShowStmtSHOWSESSIONAUTHORIZATION' =>
 	  'SHOW SESSION AUTHORIZATION ecpg_into',
 	'returning_clauseRETURNINGtarget_list' =>
-	  'RETURNING target_list ecpg_into',
+	  'RETURNING target_list opt_ecpg_into',
 	'ExecuteStmtEXECUTEnameexecute_param_clause' =>
 	  'EXECUTE prepared_name execute_param_clause execute_rest',
 'ExecuteStmtCREATEOptTempTABLEcreate_as_targetASEXECUTEnameexecute_param_clause'
@@ -550,7 +550,7 @@ sub dump_fields
 			if ($len == 1)
 			{
 
-				# Straight assignement
+				# Straight assignment
 				$str = ' $$ = ' . $flds_new[0] . ';';
 				add_to_buffer('rules', $str);
 			}
@@ -632,8 +632,8 @@ sub preload_addons
 	my $filename = $path . "/ecpg.addons";
 	open(my $fh, '<', $filename) or die;
 
-  # there may be multple lines starting ECPG: and then multiple lines of code.
-  # the code need to be add to all prior ECPG records.
+ # there may be multiple lines starting ECPG: and then multiple lines of code.
+ # the code need to be add to all prior ECPG records.
 	my (@needsRules, @code, $record);
 
 	# there may be comments before the first ECPG line, skip them

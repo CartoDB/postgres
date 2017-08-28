@@ -56,7 +56,7 @@ ltree_compress(PG_FUNCTION_ARGS)
 		ltree	   *val = (ltree *) DatumGetPointer(PG_DETOAST_DATUM(entry->key));
 		int32		len = LTG_HDRSIZE + VARSIZE(val);
 
-		key = (ltree_gist *) palloc(len);
+		key = (ltree_gist *) palloc0(len);
 		SET_VARSIZE(key, len);
 		key->flag = LTG_ONENODE;
 		memcpy((void *) LTG_NODE(key), (void *) val, VARSIZE(val));
@@ -213,7 +213,7 @@ ltree_union(PG_FUNCTION_ARGS)
 	isleqr = (left == right || ISEQ(left, right)) ? true : false;
 	*size = LTG_HDRSIZE + ((isalltrue) ? 0 : SIGLEN) + VARSIZE(left) + ((isleqr) ? 0 : VARSIZE(right));
 
-	result = (ltree_gist *) palloc(*size);
+	result = (ltree_gist *) palloc0(*size);
 	SET_VARSIZE(result, *size);
 	result->flag = 0;
 
@@ -302,7 +302,7 @@ ltree_picksplit(PG_FUNCTION_ARGS)
 	for (j = FirstOffsetNumber; j <= maxoff; j = OffsetNumberNext(j))
 	{
 		array[j].index = j;
-		lu = GETENTRY(entryvec, j);		/* use as tmp val */
+		lu = GETENTRY(entryvec, j); /* use as tmp val */
 		array[j].r = LTG_GETLNODE(lu);
 	}
 
@@ -312,7 +312,7 @@ ltree_picksplit(PG_FUNCTION_ARGS)
 	lu_l = lu_r = ru_l = ru_r = NULL;
 	for (j = FirstOffsetNumber; j <= maxoff; j = OffsetNumberNext(j))
 	{
-		lu = GETENTRY(entryvec, array[j].index);		/* use as tmp val */
+		lu = GETENTRY(entryvec, array[j].index);	/* use as tmp val */
 		if (j <= (maxoff - FirstOffsetNumber + 1) / 2)
 		{
 			v->spl_left[v->spl_nleft] = array[j].index;
@@ -386,7 +386,7 @@ ltree_picksplit(PG_FUNCTION_ARGS)
 	lu_l = LTG_GETLNODE(GETENTRY(entryvec, array[FirstOffsetNumber].index));
 	isleqr = (lu_l == lu_r || ISEQ(lu_l, lu_r)) ? true : false;
 	size = LTG_HDRSIZE + ((lisat) ? 0 : SIGLEN) + VARSIZE(lu_l) + ((isleqr) ? 0 : VARSIZE(lu_r));
-	lu = (ltree_gist *) palloc(size);
+	lu = (ltree_gist *) palloc0(size);
 	SET_VARSIZE(lu, size);
 	lu->flag = 0;
 	if (lisat)
@@ -403,7 +403,7 @@ ltree_picksplit(PG_FUNCTION_ARGS)
 	ru_l = LTG_GETLNODE(GETENTRY(entryvec, array[1 + ((maxoff - FirstOffsetNumber + 1) / 2)].index));
 	isleqr = (ru_l == ru_r || ISEQ(ru_l, ru_r)) ? true : false;
 	size = LTG_HDRSIZE + ((risat) ? 0 : SIGLEN) + VARSIZE(ru_l) + ((isleqr) ? 0 : VARSIZE(ru_r));
-	ru = (ltree_gist *) palloc(size);
+	ru = (ltree_gist *) palloc0(size);
 	SET_VARSIZE(ru, size);
 	ru->flag = 0;
 	if (risat)
@@ -445,7 +445,7 @@ gist_isparent(ltree_gist *key, ltree *query)
 static ltree *
 copy_ltree(ltree *src)
 {
-	ltree	   *dst = (ltree *) palloc(VARSIZE(src));
+	ltree	   *dst = (ltree *) palloc0(VARSIZE(src));
 
 	memcpy(dst, src, VARSIZE(src));
 	return dst;
@@ -672,8 +672,8 @@ ltree_consistent(PG_FUNCTION_ARGS)
 			query = PG_GETARG_LQUERY(1);
 			if (GIST_LEAF(entry))
 				res = DatumGetBool(DirectFunctionCall2(ltq_regex,
-											  PointerGetDatum(LTG_NODE(key)),
-											PointerGetDatum((lquery *) query)
+													   PointerGetDatum(LTG_NODE(key)),
+													   PointerGetDatum((lquery *) query)
 													   ));
 			else
 				res = (gist_qe(key, (lquery *) query) && gist_between(key, (lquery *) query));
@@ -683,8 +683,8 @@ ltree_consistent(PG_FUNCTION_ARGS)
 			query = PG_GETARG_LQUERY(1);
 			if (GIST_LEAF(entry))
 				res = DatumGetBool(DirectFunctionCall2(ltxtq_exec,
-											  PointerGetDatum(LTG_NODE(key)),
-											PointerGetDatum((lquery *) query)
+													   PointerGetDatum(LTG_NODE(key)),
+													   PointerGetDatum((lquery *) query)
 													   ));
 			else
 				res = gist_qtxt(key, (ltxtquery *) query);
@@ -694,8 +694,8 @@ ltree_consistent(PG_FUNCTION_ARGS)
 			query = DatumGetPointer(PG_DETOAST_DATUM(PG_GETARG_DATUM(1)));
 			if (GIST_LEAF(entry))
 				res = DatumGetBool(DirectFunctionCall2(lt_q_regex,
-											  PointerGetDatum(LTG_NODE(key)),
-										 PointerGetDatum((ArrayType *) query)
+													   PointerGetDatum(LTG_NODE(key)),
+													   PointerGetDatum((ArrayType *) query)
 													   ));
 			else
 				res = arrq_cons(key, (ArrayType *) query);

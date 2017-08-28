@@ -11,7 +11,7 @@ my $tempdir_short = TestLib::tempdir_short;
 command_exit_is([ 'pg_ctl', 'status', '-D', "$tempdir/nonexistent" ],
 	4, 'pg_ctl status with nonexistent directory');
 
-my $node = get_new_node();
+my $node = get_new_node('main');
 $node->init;
 
 command_exit_is([ 'pg_ctl', 'status', '-D', $node->data_dir ],
@@ -22,4 +22,4 @@ system_or_bail 'pg_ctl', '-l', "$tempdir/logfile", '-D',
 command_exit_is([ 'pg_ctl', 'status', '-D', $node->data_dir ],
 	0, 'pg_ctl status with server running');
 
-system_or_bail 'pg_ctl', 'stop', '-D', $node->data_dir, '-m', 'fast';
+system_or_bail 'pg_ctl', 'stop', '-D', $node->data_dir;

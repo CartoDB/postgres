@@ -41,7 +41,7 @@ typedef struct sqlda_struct sqlda_t;
 
 #endif
 
-#endif   /* ECPG_SQLDA_H */
+#endif							/* ECPG_SQLDA_H */
 
 #line 7 "sqlda.pgc"
 
@@ -80,11 +80,11 @@ typedef struct
 	int			rscale;			/* result scale */
 	int			dscale;			/* display scale */
 	int			sign;			/* NUMERIC_POS, NUMERIC_NEG, or NUMERIC_NAN */
-	NumericDigit digits[DECSIZE];		/* decimal digits */
+	NumericDigit digits[DECSIZE];	/* decimal digits */
 } decimal;
 
 #ifdef __cplusplus
-extern		"C"
+extern "C"
 {
 #endif
 
@@ -113,7 +113,7 @@ int			PGTYPESnumeric_from_decimal(decimal *, numeric *);
 }
 #endif
 
-#endif   /* PGTYPES_NUMERIC */
+#endif							/* PGTYPES_NUMERIC */
 
 #line 8 "sqlda.pgc"
 
@@ -194,7 +194,7 @@ main (void)
 	ECPGdebug(1, stderr);
 
 	strcpy(msg, "connect");
-	{ ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , "regress1", 0); 
+	{ ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , "regress1", 0); 
 #line 70 "sqlda.pgc"
 
 if (sqlca.sqlcode < 0) exit (1);}
@@ -428,7 +428,7 @@ if (sqlca.sqlcode < 0) exit (1);}
 	 * on a named connection
 	 */
 
-	{ ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , "con2", 0); 
+	{ ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , "con2", 0); 
 #line 199 "sqlda.pgc"
 
 if (sqlca.sqlcode < 0) exit (1);}

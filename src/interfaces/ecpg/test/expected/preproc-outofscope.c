@@ -58,11 +58,11 @@ typedef struct
 	int			rscale;			/* result scale */
 	int			dscale;			/* display scale */
 	int			sign;			/* NUMERIC_POS, NUMERIC_NEG, or NUMERIC_NAN */
-	NumericDigit digits[DECSIZE];		/* decimal digits */
+	NumericDigit digits[DECSIZE];	/* decimal digits */
 } decimal;
 
 #ifdef __cplusplus
-extern		"C"
+extern "C"
 {
 #endif
 
@@ -91,7 +91,7 @@ int			PGTYPESnumeric_from_decimal(decimal *, numeric *);
 }
 #endif
 
-#endif   /* PGTYPES_NUMERIC */
+#endif							/* PGTYPES_NUMERIC */
 
 #line 8 "outofscope.pgc"
 
@@ -271,7 +271,7 @@ main (void)
 	ECPGdebug(1, stderr);
 
 	strcpy(msg, "connect");
-	{ ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); 
+	{ ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 75 "outofscope.pgc"
 
 if (sqlca.sqlcode < 0) exit (1);}

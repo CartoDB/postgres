@@ -153,7 +153,7 @@
  *				  to be coded into a tag.
  *
  *			Finally the match algorithm checks that at least a match
- *			of 3 or more bytes has been found, because thats the smallest
+ *			of 3 or more bytes has been found, because that is the smallest
  *			amount of copy information to code into a tag. If so, a tag
  *			is omitted and all the input bytes covered by that are just
  *			scanned for the history add's, otherwise a literal character
@@ -166,7 +166,7 @@
  *
  *			Jan Wieck
  *
- * Copyright (c) 1999-2016, PostgreSQL Global Development Group
+ * Copyright (c) 1999-2017, PostgreSQL Global Development Group
  *
  * src/common/pg_lzcompress.c
  * ----------
@@ -752,7 +752,7 @@ pglz_decompress(const char *source, int32 slen, char *dest,
 				 * An unset control bit means LITERAL BYTE. So we just copy
 				 * one from INPUT to OUTPUT.
 				 */
-				if (dp >= destend)		/* check for buffer overrun */
+				if (dp >= destend)	/* check for buffer overrun */
 					break;		/* do not clobber memory */
 
 				*dp++ = *sp++;

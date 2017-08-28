@@ -1583,43 +1583,66 @@
      <row>
       <entry><literal>is_identity</literal></entry>
       <entry><type>yes_or_no</type></entry>
-      <entry>Applies to a feature not available in <productname>PostgreSQL</></entry>
+      <entry>
+       If the column is an identity column, then <literal>YES</literal>,
+       else <literal>NO</literal>.
+      </entry>
      </row>
 
      <row>
       <entry><literal>identity_generation</literal></entry>
       <entry><type>character_data</type></entry>
-      <entry>Applies to a feature not available in <productname>PostgreSQL</></entry>
+      <entry>
+       If the column is an identity column, then <literal>ALWAYS</literal>
+       or <literal>BY DEFAULT</literal>, reflecting the definition of the
+       column.
+      </entry>
      </row>
 
      <row>
       <entry><literal>identity_start</literal></entry>
       <entry><type>character_data</type></entry>
-      <entry>Applies to a feature not available in <productname>PostgreSQL</></entry>
+      <entry>
+       If the column is an identity column, then the start value of the
+       internal sequence, else null.
+      </entry>
      </row>
 
      <row>
       <entry><literal>identity_increment</literal></entry>
       <entry><type>character_data</type></entry>
-      <entry>Applies to a feature not available in <productname>PostgreSQL</></entry>
+      <entry>
+       If the column is an identity column, then the increment of the internal
+       sequence, else null.
+      </entry>
      </row>
 
      <row>
       <entry><literal>identity_maximum</literal></entry>
       <entry><type>character_data</type></entry>
-      <entry>Applies to a feature not available in <productname>PostgreSQL</></entry>
+      <entry>
+       If the column is an identity column, then the maximum value of the
+       internal sequence, else null.
+      </entry>
      </row>
 
      <row>
       <entry><literal>identity_minimum</literal></entry>
       <entry><type>character_data</type></entry>
-      <entry>Applies to a feature not available in <productname>PostgreSQL</></entry>
+      <entry>
+       If the column is an identity column, then the minimum value of the
+       internal sequence, else null.
+      </entry>
      </row>
 
      <row>
       <entry><literal>identity_cycle</literal></entry>
       <entry><type>yes_or_no</type></entry>
-      <entry>Applies to a feature not available in <productname>PostgreSQL</></entry>
+      <entry>
+       If the column is an identity column, then <literal>YES</literal> if the
+       internal sequence cycles or <literal>NO</literal> if it does not;
+       otherwise null.
+      </entry>
      </row>
 
      <row>
@@ -2895,18 +2918,6 @@ ORDER BY c.ordinal_position;
       <entry><literal>foreign_table_name</literal></entry>
       <entry><type>sql_identifier</type></entry>
       <entry>Name of the foreign table</entry>
-     </row>
-
-     <row>
-      <entry><literal>foreign_server_catalog</literal></entry>
-      <entry><type>sql_identifier</type></entry>
-      <entry>Name of the database that the foreign server is defined in (always the current database)</entry>
-     </row>
-
-     <row>
-      <entry><literal>foreign_server_name</literal></entry>
-      <entry><type>sql_identifier</type></entry>
-      <entry>Name of the foreign server</entry>
      </row>
 
      <row>
@@ -4665,9 +4676,7 @@ ORDER BY c.ordinal_position;
       <entry><literal>data_type</literal></entry>
       <entry><type>character_data</type></entry>
       <entry>
-       The data type of the sequence.  In
-       <productname>PostgreSQL</productname>, this is currently always
-       <literal>bigint</literal>.
+       The data type of the sequence.
       </entry>
      </row>
 
@@ -5447,7 +5456,7 @@ ORDER BY c.ordinal_position;
       <entry>
        Type of the table: <literal>BASE TABLE</literal> for a
        persistent base table (the normal table type),
-       <literal>VIEW</literal> for a view, <literal>FOREIGN TABLE</literal>
+       <literal>VIEW</literal> for a view, <literal>FOREIGN</literal>
        for a foreign table, or
        <literal>LOCAL TEMPORARY</literal> for a temporary table
       </entry>
@@ -5881,7 +5890,7 @@ ORDER BY c.ordinal_position;
    The view <literal>udt_privileges</literal> identifies
    <literal>USAGE</literal> privileges granted on user-defined types to a
    currently enabled role or by a currently enabled role.  There is one row for
-   each combination of column, grantor, and grantee.  This view shows only
+   each combination of type, grantor, and grantee.  This view shows only
    composite types (see under <xref linkend="infoschema-user-defined-types">
    for why); see
    <xref linkend="infoschema-usage-privileges"> for domain privileges.

@@ -443,8 +443,8 @@ hstore_recv(PG_FUNCTION_ARGS)
 	if (pcount < 0 || pcount > MaxAllocSize / sizeof(Pairs))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-			  errmsg("number of pairs (%d) exceeds the maximum allowed (%d)",
-					 pcount, (int) (MaxAllocSize / sizeof(Pairs)))));
+				 errmsg("number of pairs (%d) exceeds the maximum allowed (%d)",
+						pcount, (int) (MaxAllocSize / sizeof(Pairs)))));
 	pairs = palloc(pcount * sizeof(Pairs));
 
 	for (i = 0; i < pcount; ++i)
@@ -562,8 +562,8 @@ hstore_from_arrays(PG_FUNCTION_ARGS)
 	if (key_count > MaxAllocSize / sizeof(Pairs))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-			  errmsg("number of pairs (%d) exceeds the maximum allowed (%d)",
-					 key_count, (int) (MaxAllocSize / sizeof(Pairs)))));
+				 errmsg("number of pairs (%d) exceeds the maximum allowed (%d)",
+						key_count, (int) (MaxAllocSize / sizeof(Pairs)))));
 
 	/* value_array might be NULL */
 
@@ -611,19 +611,22 @@ hstore_from_arrays(PG_FUNCTION_ARGS)
 
 		if (!value_nulls || value_nulls[i])
 		{
-			pairs[i].key = VARDATA_ANY(key_datums[i]);
+			pairs[i].key = VARDATA(key_datums[i]);
 			pairs[i].val = NULL;
-			pairs[i].keylen = hstoreCheckKeyLen(VARSIZE_ANY_EXHDR(key_datums[i]));
+			pairs[i].keylen =
+				hstoreCheckKeyLen(VARSIZE(key_datums[i]) - VARHDRSZ);
 			pairs[i].vallen = 4;
 			pairs[i].isnull = true;
 			pairs[i].needfree = false;
 		}
 		else
 		{
-			pairs[i].key = VARDATA_ANY(key_datums[i]);
-			pairs[i].val = VARDATA_ANY(value_datums[i]);
-			pairs[i].keylen = hstoreCheckKeyLen(VARSIZE_ANY_EXHDR(key_datums[i]));
-			pairs[i].vallen = hstoreCheckValLen(VARSIZE_ANY_EXHDR(value_datums[i]));
+			pairs[i].key = VARDATA(key_datums[i]);
+			pairs[i].val = VARDATA(value_datums[i]);
+			pairs[i].keylen =
+				hstoreCheckKeyLen(VARSIZE(key_datums[i]) - VARHDRSZ);
+			pairs[i].vallen =
+				hstoreCheckValLen(VARSIZE(value_datums[i]) - VARHDRSZ);
 			pairs[i].isnull = false;
 			pairs[i].needfree = false;
 		}
@@ -690,8 +693,8 @@ hstore_from_array(PG_FUNCTION_ARGS)
 	if (count > MaxAllocSize / sizeof(Pairs))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-			  errmsg("number of pairs (%d) exceeds the maximum allowed (%d)",
-					 count, (int) (MaxAllocSize / sizeof(Pairs)))));
+				 errmsg("number of pairs (%d) exceeds the maximum allowed (%d)",
+						count, (int) (MaxAllocSize / sizeof(Pairs)))));
 
 	pairs = palloc(count * sizeof(Pairs));
 
@@ -704,19 +707,22 @@ hstore_from_array(PG_FUNCTION_ARGS)
 
 		if (in_nulls[i * 2 + 1])
 		{
-			pairs[i].key = VARDATA_ANY(in_datums[i * 2]);
+			pairs[i].key = VARDATA(in_datums[i * 2]);
 			pairs[i].val = NULL;
-			pairs[i].keylen = hstoreCheckKeyLen(VARSIZE_ANY_EXHDR(in_datums[i * 2]));
+			pairs[i].keylen =
+				hstoreCheckKeyLen(VARSIZE(in_datums[i * 2]) - VARHDRSZ);
 			pairs[i].vallen = 4;
 			pairs[i].isnull = true;
 			pairs[i].needfree = false;
 		}
 		else
 		{
-			pairs[i].key = VARDATA_ANY(in_datums[i * 2]);
-			pairs[i].val = VARDATA_ANY(in_datums[i * 2 + 1]);
-			pairs[i].keylen = hstoreCheckKeyLen(VARSIZE_ANY_EXHDR(in_datums[i * 2]));
-			pairs[i].vallen = hstoreCheckValLen(VARSIZE_ANY_EXHDR(in_datums[i * 2 + 1]));
+			pairs[i].key = VARDATA(in_datums[i * 2]);
+			pairs[i].val = VARDATA(in_datums[i * 2 + 1]);
+			pairs[i].keylen =
+				hstoreCheckKeyLen(VARSIZE(in_datums[i * 2]) - VARHDRSZ);
+			pairs[i].vallen =
+				hstoreCheckValLen(VARSIZE(in_datums[i * 2 + 1]) - VARHDRSZ);
 			pairs[i].isnull = false;
 			pairs[i].needfree = false;
 		}
@@ -823,7 +829,7 @@ hstore_from_record(PG_FUNCTION_ARGS)
 		my_extra->ncolumns = ncolumns;
 	}
 
-	Assert(ncolumns <= MaxTupleAttributeNumber);		/* thus, no overflow */
+	Assert(ncolumns <= MaxTupleAttributeNumber);	/* thus, no overflow */
 	pairs = palloc(ncolumns * sizeof(Pairs));
 
 	if (rec)
@@ -849,15 +855,16 @@ hstore_from_record(PG_FUNCTION_ARGS)
 	for (i = 0, j = 0; i < ncolumns; ++i)
 	{
 		ColumnIOData *column_info = &my_extra->columns[i];
-		Oid			column_type = tupdesc->attrs[i]->atttypid;
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		Oid			column_type = att->atttypid;
 		char	   *value;
 
 		/* Ignore dropped columns in datatype */
-		if (tupdesc->attrs[i]->attisdropped)
+		if (att->attisdropped)
 			continue;
 
-		pairs[j].key = NameStr(tupdesc->attrs[i]->attname);
-		pairs[j].keylen = hstoreCheckKeyLen(strlen(NameStr(tupdesc->attrs[i]->attname)));
+		pairs[j].key = NameStr(att->attname);
+		pairs[j].keylen = hstoreCheckKeyLen(strlen(NameStr(att->attname)));
 
 		if (!nulls || nulls[i])
 		{
@@ -1028,21 +1035,22 @@ hstore_populate_record(PG_FUNCTION_ARGS)
 	for (i = 0; i < ncolumns; ++i)
 	{
 		ColumnIOData *column_info = &my_extra->columns[i];
-		Oid			column_type = tupdesc->attrs[i]->atttypid;
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		Oid			column_type = att->atttypid;
 		char	   *value;
 		int			idx;
 		int			vallen;
 
 		/* Ignore dropped columns in datatype */
-		if (tupdesc->attrs[i]->attisdropped)
+		if (att->attisdropped)
 		{
 			nulls[i] = true;
 			continue;
 		}
 
 		idx = hstoreFindKey(hs, 0,
-							NameStr(tupdesc->attrs[i]->attname),
-							strlen(NameStr(tupdesc->attrs[i]->attname)));
+							NameStr(att->attname),
+							strlen(NameStr(att->attname)));
 
 		/*
 		 * we can't just skip here if the key wasn't found since we might have
@@ -1076,7 +1084,7 @@ hstore_populate_record(PG_FUNCTION_ARGS)
 			 */
 			values[i] = InputFunctionCall(&column_info->proc, NULL,
 										  column_info->typioparam,
-										  tupdesc->attrs[i]->atttypmod);
+										  att->atttypmod);
 			nulls[i] = true;
 		}
 		else
@@ -1088,7 +1096,7 @@ hstore_populate_record(PG_FUNCTION_ARGS)
 
 			values[i] = InputFunctionCall(&column_info->proc, value,
 										  column_info->typioparam,
-										  tupdesc->attrs[i]->atttypmod);
+										  att->atttypmod);
 			nulls[i] = false;
 		}
 	}
@@ -1387,7 +1395,6 @@ hstore_to_jsonb_loose(PG_FUNCTION_ARGS)
 	JsonbParseState *state = NULL;
 	JsonbValue *res;
 	StringInfoData tmp;
-	bool		is_number;
 
 	initStringInfo(&tmp);
 
@@ -1423,55 +1430,15 @@ hstore_to_jsonb_loose(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			is_number = false;
 			resetStringInfo(&tmp);
-
 			appendBinaryStringInfo(&tmp, HSTORE_VAL(entries, base, i),
 								   HSTORE_VALLEN(entries, i));
-
-			/*
-			 * don't treat something with a leading zero followed by another
-			 * digit as numeric - could be a zip code or similar
-			 */
-			if (tmp.len > 0 &&
-				!(tmp.data[0] == '0' &&
-				  isdigit((unsigned char) tmp.data[1])) &&
-				strspn(tmp.data, "+-0123456789Ee.") == tmp.len)
-			{
-				/*
-				 * might be a number. See if we can input it as a numeric
-				 * value. Ignore any actual parsed value.
-				 */
-				char	   *endptr = "junk";
-				long		lval;
-
-				lval = strtol(tmp.data, &endptr, 10);
-				(void) lval;
-				if (*endptr == '\0')
-				{
-					/*
-					 * strol man page says this means the whole string is
-					 * valid
-					 */
-					is_number = true;
-				}
-				else
-				{
-					/* not an int - try a double */
-					double		dval;
-
-					dval = strtod(tmp.data, &endptr);
-					(void) dval;
-					if (*endptr == '\0')
-						is_number = true;
-				}
-			}
-			if (is_number)
+			if (IsValidJsonNumber(tmp.data, tmp.len))
 			{
 				val.type = jbvNumeric;
 				val.val.numeric = DatumGetNumeric(
-											  DirectFunctionCall3(numeric_in,
-										  CStringGetDatum(tmp.data), 0, -1));
+												  DirectFunctionCall3(numeric_in,
+																	  CStringGetDatum(tmp.data), 0, -1));
 			}
 			else
 			{

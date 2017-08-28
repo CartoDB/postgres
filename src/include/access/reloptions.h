@@ -9,7 +9,7 @@
  * into a lot of low-level code.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/reloptions.h
@@ -19,6 +19,7 @@
 #ifndef RELOPTIONS_H
 #define RELOPTIONS_H
 
+#include "access/amapi.h"
 #include "access/htup.h"
 #include "access/tupdesc.h"
 #include "nodes/pg_list.h"
@@ -47,8 +48,9 @@ typedef enum relopt_kind
 	RELOPT_KIND_SPGIST = (1 << 8),
 	RELOPT_KIND_VIEW = (1 << 9),
 	RELOPT_KIND_BRIN = (1 << 10),
+	RELOPT_KIND_PARTITIONED = (1 << 11),
 	/* if you add a new kind, make sure you update "last_default" too */
-	RELOPT_KIND_LAST_DEFAULT = RELOPT_KIND_BRIN,
+	RELOPT_KIND_LAST_DEFAULT = RELOPT_KIND_PARTITIONED,
 	/* some compilers treat enums as signed ints, so we can't use 1 << 31 */
 	RELOPT_KIND_MAX = (1 << 30)
 } relopt_kind;
@@ -258,7 +260,7 @@ extern Datum transformRelOptions(Datum oldOptions, List *defList,
 					bool ignoreOids, bool isReset);
 extern List *untransformRelOptions(Datum options);
 extern bytea *extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
-				  Oid amoptions);
+				  amoptions_function amoptions);
 extern relopt_value *parseRelOptions(Datum options, bool validate,
 				relopt_kind kind, int *numrelopts);
 extern void *allocateReloptStruct(Size base, relopt_value *options,
@@ -272,10 +274,10 @@ extern bytea *default_reloptions(Datum reloptions, bool validate,
 				   relopt_kind kind);
 extern bytea *heap_reloptions(char relkind, Datum reloptions, bool validate);
 extern bytea *view_reloptions(Datum reloptions, bool validate);
-extern bytea *index_reloptions(RegProcedure amoptions, Datum reloptions,
+extern bytea *index_reloptions(amoptions_function amoptions, Datum reloptions,
 				 bool validate);
 extern bytea *attribute_reloptions(Datum reloptions, bool validate);
 extern bytea *tablespace_reloptions(Datum reloptions, bool validate);
 extern LOCKMODE AlterTableGetRelOptionsLockLevel(List *defList);
 
-#endif   /* RELOPTIONS_H */
+#endif							/* RELOPTIONS_H */

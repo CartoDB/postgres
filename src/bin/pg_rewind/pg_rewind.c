@@ -3,7 +3,7 @@
  * pg_rewind.c
  *	  Synchronizes a PostgreSQL data directory to a new timeline
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -36,6 +36,7 @@ static void createBackupLabel(XLogRecPtr startpoint, TimeLineID starttli,
 static void digestControlFile(ControlFileData *ControlFile, char *source,
 				  size_t size);
 static void updateControlFile(ControlFileData *ControlFile);
+static void syncTargetDirectory(const char *argv0);
 static void sanityChecks(void);
 static void findCommonAncestorTimeline(XLogRecPtr *recptr, int *tliIndex);
 
@@ -55,7 +56,7 @@ bool		dry_run = false;
 
 /* Target history */
 TimeLineHistoryEntry *targetHistory;
-int targetNentries;
+int			targetNentries;
 
 static void
 usage(const char *progname)
@@ -161,6 +162,13 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
+	if (datadir_source != NULL && connstr_source != NULL)
+	{
+		fprintf(stderr, _("%s: only one of --source-pgdata or --source-server can be specified\n"), progname);
+		fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+		exit(1);
+	}
+
 	if (datadir_target == NULL)
 	{
 		fprintf(stderr, _("%s: no target data directory specified (--target-pgdata)\n"), progname);
@@ -223,14 +231,14 @@ main(int argc, char **argv)
 	else
 	{
 		findCommonAncestorTimeline(&divergerec, &lastcommontliIndex);
-		printf(_("servers diverged at WAL position %X/%X on timeline %u\n"),
+		printf(_("servers diverged at WAL location %X/%X on timeline %u\n"),
 			   (uint32) (divergerec >> 32), (uint32) divergerec,
 			   targetHistory[lastcommontliIndex].tli);
 
 		/*
-		 * Check for the possibility that the target is in fact a direct ancestor
-		 * of the source. In that case, there is no divergent history in the
-		 * target that needs rewinding.
+		 * Check for the possibility that the target is in fact a direct
+		 * ancestor of the source. In that case, there is no divergent history
+		 * in the target that needs rewinding.
 		 */
 		if (ControlFile_target.checkPoint >= divergerec)
 		{
@@ -247,9 +255,9 @@ main(int argc, char **argv)
 
 			/*
 			 * If the histories diverged exactly at the end of the shutdown
-			 * checkpoint record on the target, there are no WAL records in the
-			 * target that don't belong in the source's history, and no rewind is
-			 * needed.
+			 * checkpoint record on the target, there are no WAL records in
+			 * the target that don't belong in the source's history, and no
+			 * rewind is needed.
 			 */
 			if (chkptendrec == divergerec)
 				rewind_needed = false;
@@ -349,6 +357,9 @@ main(int argc, char **argv)
 	ControlFile_new.state = DB_IN_ARCHIVE_RECOVERY;
 	updateControlFile(&ControlFile_new);
 
+	pg_log(PG_PROGRESS, "syncing target data directory\n");
+	syncTargetDirectory(argv[0]);
+
 	printf(_("Done!\n"));
 
 	return 0;
@@ -404,9 +415,9 @@ sanityChecks(void)
 }
 
 /*
- * Find minimum from two XLOG positions assuming InvalidXLogRecPtr means
+ * Find minimum from two WAL locations assuming InvalidXLogRecPtr means
  * infinity as src/include/access/timeline.h states. This routine should
- * be used only when comparing XLOG positions related to history files.
+ * be used only when comparing WAL locations related to history files.
  */
 static XLogRecPtr
 MinXLogRecPtr(XLogRecPtr a, XLogRecPtr b)
@@ -426,14 +437,14 @@ MinXLogRecPtr(XLogRecPtr a, XLogRecPtr b)
 static TimeLineHistoryEntry *
 getTimelineHistory(ControlFileData *controlFile, int *nentries)
 {
-	TimeLineHistoryEntry   *history;
-	TimeLineID				tli;
+	TimeLineHistoryEntry *history;
+	TimeLineID	tli;
 
 	tli = controlFile->checkPointCopy.ThisTimeLineID;
 
 	/*
-	 * Timeline 1 does not have a history file, so there is no need to check and
-	 * fake an entry with infinite start and end positions.
+	 * Timeline 1 does not have a history file, so there is no need to check
+	 * and fake an entry with infinite start and end positions.
 	 */
 	if (tli == 1)
 	{
@@ -455,7 +466,7 @@ getTimelineHistory(ControlFileData *controlFile, int *nentries)
 		else if (controlFile == &ControlFile_target)
 			histfile = slurpFile(datadir_target, path, NULL);
 		else
-			pg_fatal("Invalid control file");
+			pg_fatal("invalid control file");
 
 		history = rewind_parseTimeLineHistory(histfile, tli, nentries);
 		pg_free(histfile);
@@ -463,12 +474,12 @@ getTimelineHistory(ControlFileData *controlFile, int *nentries)
 
 	if (debug)
 	{
-		int		i;
+		int			i;
 
 		if (controlFile == &ControlFile_source)
-			printf("Source timeline history:\n");
+			pg_log(PG_DEBUG, "Source timeline history:\n");
 		else if (controlFile == &ControlFile_target)
-			printf("Target timeline history:\n");
+			pg_log(PG_DEBUG, "Target timeline history:\n");
 		else
 			Assert(false);
 
@@ -480,9 +491,11 @@ getTimelineHistory(ControlFileData *controlFile, int *nentries)
 			TimeLineHistoryEntry *entry;
 
 			entry = &history[i];
-			printf("%d: %X/%X - %X/%X\n", entry->tli,
-				(uint32) (entry->begin >> 32), (uint32) (entry->begin),
-				(uint32) (entry->end >> 32), (uint32) (entry->end));
+			pg_log(PG_DEBUG,
+			/* translator: %d is a timeline number, others are LSN positions */
+				   "%d: %X/%X - %X/%X\n", entry->tli,
+				   (uint32) (entry->begin >> 32), (uint32) (entry->begin),
+				   (uint32) (entry->end >> 32), (uint32) (entry->end));
 		}
 	}
 
@@ -505,7 +518,8 @@ findCommonAncestorTimeline(XLogRecPtr *recptr, int *tliIndex)
 {
 	TimeLineHistoryEntry *sourceHistory;
 	int			sourceNentries;
-	int			i, n;
+	int			i,
+				n;
 
 	/* Retrieve timelines for both source and target */
 	sourceHistory = getTimelineHistory(&ControlFile_source, &sourceNentries);
@@ -575,15 +589,16 @@ createBackupLabel(XLogRecPtr startpoint, TimeLineID starttli, XLogRecPtr checkpo
 				   "BACKUP FROM: standby\n"
 				   "START TIME: %s\n",
 	/* omit LABEL: line */
-			  (uint32) (startpoint >> 32), (uint32) startpoint, xlogfilename,
+				   (uint32) (startpoint >> 32), (uint32) startpoint, xlogfilename,
 				   (uint32) (checkpointloc >> 32), (uint32) checkpointloc,
 				   strfbuf);
 	if (len >= sizeof(buf))
 		pg_fatal("backup label buffer too small\n");	/* shouldn't happen */
 
 	/* TODO: move old file out of the way, if any. */
-	open_target_file("backup_label", true);		/* BACKUP_LABEL_FILE */
+	open_target_file("backup_label", true); /* BACKUP_LABEL_FILE */
 	write_target_range(buf, 0, len);
+	close_target_file();
 }
 
 /*
@@ -610,9 +625,9 @@ checkControlFile(ControlFileData *ControlFile)
 static void
 digestControlFile(ControlFileData *ControlFile, char *src, size_t size)
 {
-	if (size != PG_CONTROL_SIZE)
+	if (size != PG_CONTROL_FILE_SIZE)
 		pg_fatal("unexpected control file size %d, expected %d\n",
-				 (int) size, PG_CONTROL_SIZE);
+				 (int) size, PG_CONTROL_FILE_SIZE);
 
 	memcpy(ControlFile, src, sizeof(ControlFileData));
 
@@ -626,7 +641,16 @@ digestControlFile(ControlFileData *ControlFile, char *src, size_t size)
 static void
 updateControlFile(ControlFileData *ControlFile)
 {
-	char		buffer[PG_CONTROL_SIZE];
+	char		buffer[PG_CONTROL_FILE_SIZE];
+
+	/*
+	 * For good luck, apply the same static assertions as in backend's
+	 * WriteControlFile().
+	 */
+	StaticAssertStmt(sizeof(ControlFileData) <= PG_CONTROL_MAX_SAFE_SIZE,
+					 "pg_control is too large for atomic disk writes");
+	StaticAssertStmt(sizeof(ControlFileData) <= PG_CONTROL_FILE_SIZE,
+					 "sizeof(ControlFileData) exceeds PG_CONTROL_FILE_SIZE");
 
 	/* Recalculate CRC of control file */
 	INIT_CRC32C(ControlFile->crc);
@@ -636,16 +660,69 @@ updateControlFile(ControlFileData *ControlFile)
 	FIN_CRC32C(ControlFile->crc);
 
 	/*
-	 * Write out PG_CONTROL_SIZE bytes into pg_control by zero-padding the
-	 * excess over sizeof(ControlFileData) to avoid premature EOF related
+	 * Write out PG_CONTROL_FILE_SIZE bytes into pg_control by zero-padding
+	 * the excess over sizeof(ControlFileData), to avoid premature EOF related
 	 * errors when reading it.
 	 */
-	memset(buffer, 0, PG_CONTROL_SIZE);
+	memset(buffer, 0, PG_CONTROL_FILE_SIZE);
 	memcpy(buffer, ControlFile, sizeof(ControlFileData));
 
 	open_target_file("global/pg_control", false);
 
-	write_target_range(buffer, 0, PG_CONTROL_SIZE);
+	write_target_range(buffer, 0, PG_CONTROL_FILE_SIZE);
 
 	close_target_file();
+}
+
+/*
+ * Sync target data directory to ensure that modifications are safely on disk.
+ *
+ * We do this once, for the whole data directory, for performance reasons.  At
+ * the end of pg_rewind's run, the kernel is likely to already have flushed
+ * most dirty buffers to disk. Additionally initdb -S uses a two-pass approach
+ * (only initiating writeback in the first pass), which often reduces the
+ * overall amount of IO noticeably.
+ */
+static void
+syncTargetDirectory(const char *argv0)
+{
+	int			ret;
+#define MAXCMDLEN (2 * MAXPGPATH)
+	char		exec_path[MAXPGPATH];
+	char		cmd[MAXCMDLEN];
+
+	/* locate initdb binary */
+	if ((ret = find_other_exec(argv0, "initdb",
+							   "initdb (PostgreSQL) " PG_VERSION "\n",
+							   exec_path)) < 0)
+	{
+		char		full_path[MAXPGPATH];
+
+		if (find_my_exec(argv0, full_path) < 0)
+			strlcpy(full_path, progname, sizeof(full_path));
+
+		if (ret == -1)
+			pg_fatal("The program \"initdb\" is needed by %s but was\n"
+					 "not found in the same directory as \"%s\".\n"
+					 "Check your installation.\n", progname, full_path);
+		else
+			pg_fatal("The program \"initdb\" was found by \"%s\"\n"
+					 "but was not the same version as %s.\n"
+					 "Check your installation.\n", full_path, progname);
+	}
+
+	/* only skip processing after ensuring presence of initdb */
+	if (dry_run)
+		return;
+
+	/* finally run initdb -S */
+	if (debug)
+		snprintf(cmd, MAXCMDLEN, "\"%s\" -D \"%s\" -S",
+				 exec_path, datadir_target);
+	else
+		snprintf(cmd, MAXCMDLEN, "\"%s\" -D \"%s\" -S > \"%s\"",
+				 exec_path, datadir_target, DEVNULL);
+
+	if (system(cmd) != 0)
+		pg_fatal("sync of target directory failed\n");
 }

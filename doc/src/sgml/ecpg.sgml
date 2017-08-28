@@ -240,8 +240,7 @@ EXEC SQL AT <replaceable>connection-name</replaceable> SELECT ...;
   <para>
    If your application uses multiple threads of execution, they cannot share a
    connection concurrently. You must either explicitly control access to the connection
-   (using mutexes) or use a connection for each thread. If each thread uses its own connection,
-   you will need to use the AT clause to specify which connection the thread will use.
+   (using mutexes) or use a connection for each thread.
   </para>
 
   <para>
@@ -251,7 +250,7 @@ EXEC SQL AT <replaceable>connection-name</replaceable> SELECT ...;
 EXEC SQL SET CONNECTION <replaceable>connection-name</replaceable>;
 </programlisting>
    This option is particularly convenient if many statements are to be
-   executed on the same connection.  It is not thread-aware.
+   executed on the same connection.
   </para>
 
   <para>
@@ -508,6 +507,33 @@ EXEC SQL COMMIT;
      </varlistentry>
 
      <varlistentry>
+      <term><literal>EXEC SQL PREPARE TRANSACTION </literal><replaceable class="PARAMETER">transaction_id</></term>
+      <listitem>
+       <para>
+        Prepare the current transaction for two-phase commit.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>EXEC SQL COMMIT PREPARED </literal><replaceable class="PARAMETER">transaction_id</></term>
+      <listitem>
+       <para>
+        Commit a transaction that is in prepared state.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>EXEC SQL ROLLBACK PREPARED </literal><replaceable class="PARAMETER">transaction_id</></term>
+      <listitem>
+       <para>
+        Roll back a transaction that is in prepared state.
+       </para>
+      </listitem>
+     </varlistentry>
+     
+     <varlistentry>
       <term><literal>EXEC SQL SET AUTOCOMMIT TO ON</literal></term>
       <listitem>
        <para>
@@ -517,7 +543,7 @@ EXEC SQL COMMIT;
      </varlistentry>
 
      <varlistentry>
-      <term><literal>SET AUTOCOMMIT TO OFF</literal></term>
+      <term><literal>EXEC SQL SET AUTOCOMMIT TO OFF</literal></term>
       <listitem>
        <para>
         Disable autocommit mode.  This is the default.
@@ -636,7 +662,7 @@ EXEC SQL DEALLOCATE PREPARE <replaceable>name</replaceable>;
 <programlisting>
 EXEC SQL INSERT INTO sometable VALUES (:v1, 'foo', :v2);
 </programlisting>
-    This statements refers to two C variables named
+    This statement refers to two C variables named
     <varname>v1</varname> and <varname>v2</varname> and also uses a
     regular SQL string literal, to illustrate that you are not
     restricted to use one kind of data or the other.
@@ -891,6 +917,11 @@ do
       <row>
        <entry><type>boolean</type></entry>
        <entry><type>bool</type><footnote><para>declared in <filename>ecpglib.h</filename> if not native</para></footnote></entry>
+      </row>
+
+      <row>
+       <entry><type>bytea</type></entry>
+       <entry><type>char *</type></entry>
       </row>
      </tbody>
     </tgroup>
@@ -1162,7 +1193,7 @@ EXEC SQL END DECLARE SECTION;
       There are two use cases for arrays as host variables.  The first
       is a way to store some text string in <type>char[]</type>
       or <type>VARCHAR[]</type>, as
-      explained <xref linkend="ecpg-char">.  The second use case is to
+      explained in <xref linkend="ecpg-char">.  The second use case is to
       retrieve multiple rows from a query result without using a
       cursor.  Without an array, to process a query result consisting
       of multiple rows, it is required to use a cursor and
@@ -3565,7 +3596,7 @@ void PGTYPESdecimal_free(decimal *var);
 EXEC SQL ALLOCATE DESCRIPTOR <replaceable>identifier</replaceable>;
 </programlisting>
     The identifier serves as the <quote>variable name</quote> of the
-    descriptor area.  <remark>The scope of the allocated descriptor is WHAT?.</remark>
+    descriptor area.  <!-- The scope of the allocated descriptor is WHAT?. -->
     When you don't need the descriptor anymore, you should deallocate
     it:
 <programlisting>
@@ -3782,7 +3813,7 @@ EXEC SQL GET DESCRIPTOR <replaceable>name</replaceable> VALUE <replaceable>num</
     keywords are different. A Descriptor Area can also be manually built to
     provide the input parameters for a query or a cursor and
     <literal>USING SQL DESCRIPTOR <replaceable>name</replaceable></literal>
-    is the way to pass the input parameters into a parametrized query. The statement
+    is the way to pass the input parameters into a parameterized query. The statement
     to build a named SQL Descriptor Area is below:
 <programlisting>
 EXEC SQL SET DESCRIPTOR <replaceable>name</replaceable> VALUE <replaceable>num</replaceable> <replaceable>field</replaceable> = :<replaceable>hostvar</replaceable>;
@@ -3917,7 +3948,7 @@ typedef struct sqlda_struct sqlda_t;
       <term><literal>sqln</></term>
       <listitem>
        <para>
-        It contains the number of input parameters for a parametrized query
+        It contains the number of input parameters for a parameterized query in
         case it's passed into <command>OPEN</command>, <command>DECLARE</command> or
         <command>EXECUTE</command> statements using the <literal>USING</literal>
         keyword. In case it's used as output of <command>SELECT</command>,
@@ -4727,6 +4758,17 @@ EXEC SQL WHENEVER <replaceable>condition</replaceable> <replaceable>action</repl
        <para>
         Execute the C statement <literal>break</literal>.  This should
         only be used in loops or <literal>switch</literal> statements.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><literal>DO CONTINUE</literal></term>
+      <listitem>
+       <para>
+        Execute the C statement <literal>continue</literal>.  This should
+        only be used in loops statements.  if executed, will cause the flow 
+        of control to return to the top of the loop.
        </para>
       </listitem>
      </varlistentry>
@@ -6190,7 +6232,7 @@ cc -c test_mod.c -o test_mod.o
 
    <para>
     Next, generate <filename>test_cpp.o</> by compiling
-    <filename>test_cpp.cpp</> with the C++ compiler:.
+    <filename>test_cpp.cpp</> with the C++ compiler:
 <programlisting>
 c++ -c test_cpp.cpp -o test_cpp.o
 </programlisting>
@@ -6296,9 +6338,9 @@ EXEC SQL ALLOCATE DESCRIPTOR mydesc;
 
    <refsynopsisdiv>
 <synopsis>
-CONNECT TO <replaceable>connection_target</replaceable> [ AS <replaceable>connection_name</replaceable> ] [ USER <replaceable>connection_user_name</replaceable> ]
+CONNECT TO <replaceable>connection_target</replaceable> [ AS <replaceable>connection_name</replaceable> ] [ USER <replaceable>connection_user</replaceable> ]
 CONNECT TO DEFAULT
-CONNECT <replaceable>connection_user_name</replaceable>
+CONNECT <replaceable>connection_user</replaceable>
 DATABASE <replaceable>connection_target</replaceable>
 </synopsis>
    </refsynopsisdiv>
@@ -7768,6 +7810,7 @@ WHENEVER { NOT FOUND | SQLERROR | SQLWARNING } <replaceable class="PARAMETER">ac
 <programlisting>
 EXEC SQL WHENEVER NOT FOUND CONTINUE;
 EXEC SQL WHENEVER NOT FOUND DO BREAK;
+EXEC SQL WHENEVER NOT FOUND DO CONTINUE;
 EXEC SQL WHENEVER SQLWARNING SQLPRINT;
 EXEC SQL WHENEVER SQLWARNING DO warn();
 EXEC SQL WHENEVER SQLERROR sqlprint;
@@ -7830,7 +7873,7 @@ main(void)
    this mode is active, it tries to behave as if it were the <productname>Informix</productname>
    precompiler for <productname>Informix</productname> E/SQL. Generally spoken this will allow you to use
    the dollar sign instead of the <literal>EXEC SQL</> primitive to introduce
-   embedded SQL commands.:
+   embedded SQL commands:
 <programlisting>
 $int j = 3;
 $CONNECT TO :dbname;
@@ -7902,7 +7945,7 @@ EXEC SQL FETCH MYCUR INTO :userid;
       <listitem>
        <para>
         This statement closes the current connection. In fact, this is a
-        synonym for ECPG's <literal>DISCONNECT CURRENT</>.:
+        synonym for ECPG's <literal>DISCONNECT CURRENT</>:
 <programlisting>
 $CLOSE DATABASE;                /* close the current connection */
 EXEC SQL CLOSE DATABASE;
@@ -8121,7 +8164,7 @@ if (*(int2 *)sqldata->sqlvar[i].sqlind != 0)
       <listitem>
        <para>
         Type of the NULL indicator data. It's always SQLSMINT when returning data from the server.
-        When the <literal>SQLDA</literal> is used for a parametrized query, the data is treated
+        When the <literal>SQLDA</literal> is used for a parameterized query, the data is treated
         according to the set type.
        </para>
       </listitem>
@@ -8165,7 +8208,7 @@ if (*(int2 *)sqldata->sqlvar[i].sqlind != 0)
      <term><literal>sqlilongdata</></term>
       <listitem>
        <para>
-        It equals to <literal>sqldata</literal> if <literal>sqllen</literal> is larger than 32KB.
+        It equals to <literal>sqldata</literal> if <literal>sqllen</literal> is larger than 32kB.
        </para>
       </listitem>
      </varlistentry>
@@ -8559,7 +8602,7 @@ int dectolong(decimal *np, long *lngp);
 int rdatestr(date d, char *str);
 </synopsis>
         The function receives two arguments, the first one is the date to
-        convert (<literal>d</> and the second one is a pointer to the target
+        convert (<literal>d</>) and the second one is a pointer to the target
         string. The output format is always <literal>yyyy-mm-dd</>, so you need
         to allocate at least 11 bytes (including the zero-byte terminator) for the
         string.
@@ -8912,7 +8955,7 @@ int dttoasc(timestamp *ts, char *output);
 </synopsis>
         The function receives a pointer to the timestamp variable to convert
         (<literal>ts</>) and the string that should hold the result of the
-        operation <literal>output</>). It converts <literal>ts</> to its
+        operation (<literal>output</>). It converts <literal>ts</> to its
         textual representation according to the SQL standard, which is
         be <literal>YYYY-MM-DD HH:MM:SS</literal>.
        </para>
@@ -8959,7 +9002,7 @@ int intoasc(interval *i, char *str);
 </synopsis>
         The function receives a pointer to the interval variable to convert
         (<literal>i</>) and the string that should hold the result of the
-        operation <literal>str</>). It converts <literal>i</> to its
+        operation (<literal>str</>). It converts <literal>i</> to its
         textual representation according to the SQL standard, which is
         be <literal>YYYY-MM-DD HH:MM:SS</literal>.
        </para>

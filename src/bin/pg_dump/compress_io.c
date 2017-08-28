@@ -4,7 +4,7 @@
  *	 Routines for archivers to write an uncompressed or compressed data
  *	 stream.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * This file includes two APIs for dealing with compressed data. The first
@@ -54,7 +54,6 @@
 #include "postgres_fe.h"
 
 #include "compress_io.h"
-#include "parallel.h"
 #include "pg_backup_utils.h"
 
 /*----------------------
@@ -184,9 +183,6 @@ void
 WriteDataToArchive(ArchiveHandle *AH, CompressorState *cs,
 				   const void *data, size_t dLen)
 {
-	/* Are we aborting? */
-	checkAborting(AH);
-
 	switch (cs->comprAlg)
 	{
 		case COMPR_ALG_LIBZ:
@@ -296,7 +292,7 @@ DeflateCompressorZlib(ArchiveHandle *AH, CompressorState *cs, bool flush)
 			if (zp->avail_out < cs->zlibOutSize)
 			{
 				/*
-				 * Any write function shoud do its own error checking but to
+				 * Any write function should do its own error checking but to
 				 * make sure we do a check here as well...
 				 */
 				size_t		len = cs->zlibOutSize - zp->avail_out;
@@ -351,9 +347,6 @@ ReadDataFromArchiveZlib(ArchiveHandle *AH, ReadFunc readF)
 	/* no minimal chunk size for zlib */
 	while ((cnt = readF(AH, &buf, &buflen)))
 	{
-		/* Are we aborting? */
-		checkAborting(AH);
-
 		zp->next_in = (void *) buf;
 		zp->avail_in = cnt;
 
@@ -395,7 +388,7 @@ ReadDataFromArchiveZlib(ArchiveHandle *AH, ReadFunc readF)
 	free(out);
 	free(zp);
 }
-#endif   /* HAVE_LIBZ */
+#endif							/* HAVE_LIBZ */
 
 
 /*
@@ -414,9 +407,6 @@ ReadDataFromArchiveNone(ArchiveHandle *AH, ReadFunc readF)
 
 	while ((cnt = readF(AH, &buf, &buflen)))
 	{
-		/* Are we aborting? */
-		checkAborting(AH);
-
 		ahwrite(buf, 1, cnt, AH);
 	}
 
@@ -602,8 +592,14 @@ cfread(void *ptr, int size, cfp *fp)
 	{
 		ret = gzread(fp->compressedfp, ptr, size);
 		if (ret != size && !gzeof(fp->compressedfp))
+		{
+			int			errnum;
+			const char *errmsg = gzerror(fp->compressedfp, &errnum);
+
 			exit_horribly(modulename,
-					"could not read from input file: %s\n", strerror(errno));
+						  "could not read from input file: %s\n",
+						  errnum == Z_ERRNO ? strerror(errno) : errmsg);
+		}
 	}
 	else
 #endif
@@ -639,10 +635,10 @@ cfgetc(cfp *fp)
 		{
 			if (!gzeof(fp->compressedfp))
 				exit_horribly(modulename,
-					"could not read from input file: %s\n", strerror(errno));
+							  "could not read from input file: %s\n", strerror(errno));
 			else
 				exit_horribly(modulename,
-							"could not read from input file: end of file\n");
+							  "could not read from input file: end of file\n");
 		}
 	}
 	else
@@ -703,6 +699,22 @@ cfeof(cfp *fp)
 	else
 #endif
 		return feof(fp->uncompressedfp);
+}
+
+const char *
+get_cfp_error(cfp *fp)
+{
+#ifdef HAVE_LIBZ
+	if (fp->compressedfp)
+	{
+		int			errnum;
+		const char *errmsg = gzerror(fp->compressedfp, &errnum);
+
+		if (errnum != Z_ERRNO)
+			return errmsg;
+	}
+#endif
+	return strerror(errno);
 }
 
 #ifdef HAVE_LIBZ

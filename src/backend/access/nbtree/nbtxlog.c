@@ -4,7 +4,7 @@
  *	  WAL replay logic for btrees.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,8 +14,10 @@
  */
 #include "postgres.h"
 
+#include "access/bufmask.h"
 #include "access/heapam_xlog.h"
 #include "access/nbtree.h"
+#include "access/nbtxlog.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
@@ -191,7 +193,7 @@ btree_xlog_insert(bool isleaf, bool ismeta, XLogReaderState *record)
 }
 
 static void
-btree_xlog_split(bool onleft, bool isroot, XLogReaderState *record)
+btree_xlog_split(bool onleft, XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
 	xl_btree_split *xlrec = (xl_btree_split *) XLogRecGetData(record);
@@ -385,12 +387,29 @@ static void
 btree_xlog_vacuum(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	xl_btree_vacuum *xlrec = (xl_btree_vacuum *) XLogRecGetData(record);
 	Buffer		buffer;
 	Page		page;
 	BTPageOpaque opaque;
+#ifdef UNUSED
+	xl_btree_vacuum *xlrec = (xl_btree_vacuum *) XLogRecGetData(record);
 
 	/*
+	 * This section of code is thought to be no longer needed, after analysis
+	 * of the calling paths. It is retained to allow the code to be reinstated
+	 * if a flaw is revealed in that thinking.
+	 *
+	 * If we are running non-MVCC scans using this index we need to do some
+	 * additional work to ensure correctness, which is known as a "pin scan"
+	 * described in more detail in next paragraphs. We used to do the extra
+	 * work in all cases, whereas we now avoid that work in most cases. If
+	 * lastBlockVacuumed is set to InvalidBlockNumber then we skip the
+	 * additional work required for the pin scan.
+	 *
+	 * Avoiding this extra work is important since it requires us to touch
+	 * every page in the index, so is an O(N) operation. Worse, it is an
+	 * operation performed in the foreground during redo, so it delays
+	 * replication directly.
+	 *
 	 * If queries might be active then we need to ensure every leaf page is
 	 * unpinned between the lastBlockVacuumed and the current block, if there
 	 * are any.  This prevents replay of the VACUUM from reaching the stage of
@@ -412,7 +431,7 @@ btree_xlog_vacuum(XLogReaderState *record)
 	 * isn't yet consistent; so we need not fear reading still-corrupt blocks
 	 * here during crash recovery.
 	 */
-	if (HotStandbyActiveInReplay())
+	if (HotStandbyActiveInReplay() && BlockNumberIsValid(xlrec->lastBlockVacuumed))
 	{
 		RelFileNode thisrnode;
 		BlockNumber thisblkno;
@@ -433,7 +452,8 @@ btree_xlog_vacuum(XLogReaderState *record)
 			 * XXX we don't actually need to read the block, we just need to
 			 * confirm it is unpinned. If we had a special call into the
 			 * buffer manager we could optimise this so that if the block is
-			 * not in shared_buffers we confirm it as unpinned.
+			 * not in shared_buffers we confirm it as unpinned. Optimizing
+			 * this is now moot, since in most cases we avoid the scan.
 			 */
 			buffer = XLogReadBufferExtended(thisrnode, MAIN_FORKNUM, blkno,
 											RBM_NORMAL_NO_LOG);
@@ -444,6 +464,7 @@ btree_xlog_vacuum(XLogReaderState *record)
 			}
 		}
 	}
+#endif
 
 	/*
 	 * Like in btvacuumpage(), we need to take a cleanup lock on every leaf
@@ -975,16 +996,10 @@ btree_redo(XLogReaderState *record)
 			btree_xlog_insert(false, true, record);
 			break;
 		case XLOG_BTREE_SPLIT_L:
-			btree_xlog_split(true, false, record);
+			btree_xlog_split(true, record);
 			break;
 		case XLOG_BTREE_SPLIT_R:
-			btree_xlog_split(false, false, record);
-			break;
-		case XLOG_BTREE_SPLIT_L_ROOT:
-			btree_xlog_split(true, true, record);
-			break;
-		case XLOG_BTREE_SPLIT_R_ROOT:
-			btree_xlog_split(false, true, record);
+			btree_xlog_split(false, record);
 			break;
 		case XLOG_BTREE_VACUUM:
 			btree_xlog_vacuum(record);
@@ -1008,4 +1023,53 @@ btree_redo(XLogReaderState *record)
 		default:
 			elog(PANIC, "btree_redo: unknown op code %u", info);
 	}
+}
+
+/*
+ * Mask a btree page before performing consistency checks on it.
+ */
+void
+btree_mask(char *pagedata, BlockNumber blkno)
+{
+	Page		page = (Page) pagedata;
+	BTPageOpaque maskopaq;
+
+	mask_page_lsn(page);
+
+	mask_page_hint_bits(page);
+	mask_unused_space(page);
+
+	maskopaq = (BTPageOpaque) PageGetSpecialPointer(page);
+
+	if (P_ISDELETED(maskopaq))
+	{
+		/*
+		 * Mask page content on a DELETED page since it will be re-initialized
+		 * during replay. See btree_xlog_unlink_page() for details.
+		 */
+		mask_page_content(page);
+	}
+	else if (P_ISLEAF(maskopaq))
+	{
+		/*
+		 * In btree leaf pages, it is possible to modify the LP_FLAGS without
+		 * emitting any WAL record. Hence, mask the line pointer flags. See
+		 * _bt_killitems(), _bt_check_unique() for details.
+		 */
+		mask_lp_flags(page);
+	}
+
+	/*
+	 * BTP_HAS_GARBAGE is just an un-logged hint bit. So, mask it. See
+	 * _bt_killitems(), _bt_check_unique() for details.
+	 */
+	maskopaq->btpo_flags &= ~BTP_HAS_GARBAGE;
+
+	/*
+	 * During replay of a btree page split, we don't set the BTP_SPLIT_END
+	 * flag of the right sibling and initialize the cycle_id to 0 for the same
+	 * page. See btree_xlog_split() for details.
+	 */
+	maskopaq->btpo_flags &= ~BTP_SPLIT_END;
+	maskopaq->btpo_cycleid = 0;
 }

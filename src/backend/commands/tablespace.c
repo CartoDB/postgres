@@ -35,7 +35,7 @@
  * and munge the system catalogs of the new database.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -48,7 +48,6 @@
 
 #include <unistd.h>
 #include <dirent.h>
-#include <sys/types.h>
 #include <sys/stat.h>
 
 #include "access/heapam.h"
@@ -82,6 +81,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/tqual.h"
+#include "utils/varlena.h"
 
 
 /* GUC variables */
@@ -159,8 +159,8 @@ TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo)
 					if (errno != ENOENT || !isRedo)
 						ereport(ERROR,
 								(errcode_for_file_access(),
-							  errmsg("could not create directory \"%s\": %m",
-									 dir)));
+								 errmsg("could not create directory \"%s\": %m",
+										dir)));
 
 					/*
 					 * Parent directories are missing during WAL replay, so
@@ -176,8 +176,8 @@ TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo)
 					if (mkdir(parentdir, S_IRWXU) < 0 && errno != EEXIST)
 						ereport(ERROR,
 								(errcode_for_file_access(),
-							  errmsg("could not create directory \"%s\": %m",
-									 parentdir)));
+								 errmsg("could not create directory \"%s\": %m",
+										parentdir)));
 					pfree(parentdir);
 
 					/* create one parent up if not exist */
@@ -187,16 +187,16 @@ TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo)
 					if (mkdir(parentdir, S_IRWXU) < 0 && errno != EEXIST)
 						ereport(ERROR,
 								(errcode_for_file_access(),
-							  errmsg("could not create directory \"%s\": %m",
-									 parentdir)));
+								 errmsg("could not create directory \"%s\": %m",
+										parentdir)));
 					pfree(parentdir);
 
 					/* Create database directory */
 					if (mkdir(dir, S_IRWXU) < 0)
 						ereport(ERROR,
 								(errcode_for_file_access(),
-							  errmsg("could not create directory \"%s\": %m",
-									 dir)));
+								 errmsg("could not create directory \"%s\": %m",
+										dir)));
 				}
 			}
 
@@ -282,7 +282,7 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 	 * reference the whole path here, but mkdir() uses the first two parts.
 	 */
 	if (strlen(location) + 1 + strlen(TABLESPACE_VERSION_DIRECTORY) + 1 +
-	  OIDCHARS + 1 + OIDCHARS + 1 + FORKNAMECHARS + 1 + OIDCHARS > MAXPGPATH)
+		OIDCHARS + 1 + OIDCHARS + 1 + FORKNAMECHARS + 1 + OIDCHARS > MAXPGPATH)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("tablespace location \"%s\" is too long",
@@ -303,7 +303,7 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("unacceptable tablespace name \"%s\"",
 						stmt->tablespacename),
-		errdetail("The prefix \"pg_\" is reserved for system tablespaces.")));
+				 errdetail("The prefix \"pg_\" is reserved for system tablespaces.")));
 
 	/*
 	 * Check that there is no other tablespace by this name.  (The unique
@@ -343,9 +343,7 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 
 	tuple = heap_form_tuple(rel->rd_att, values, nulls);
 
-	tablespaceoid = simple_heap_insert(rel, tuple);
-
-	CatalogUpdateIndexes(rel, tuple);
+	tablespaceoid = CatalogTupleInsert(rel, tuple);
 
 	heap_freetuple(tuple);
 
@@ -390,7 +388,7 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("tablespaces are not supported on this platform")));
 	return InvalidOid;			/* keep compiler quiet */
-#endif   /* HAVE_SYMLINK */
+#endif							/* HAVE_SYMLINK */
 }
 
 /*
@@ -461,7 +459,7 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	/*
 	 * Remove the pg_tablespace tuple (this will roll back if we fail below)
 	 */
-	simple_heap_delete(rel, &tuple->t_self);
+	CatalogTupleDelete(rel, &tuple->t_self);
 
 	heap_endscan(scandesc);
 
@@ -551,7 +549,7 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("tablespaces are not supported on this platform")));
-#endif   /* HAVE_SYMLINK */
+#endif							/* HAVE_SYMLINK */
 }
 
 
@@ -587,8 +585,8 @@ create_tablespace_directories(const char *location, const Oid tablespaceoid)
 		else
 			ereport(ERROR,
 					(errcode_for_file_access(),
-				  errmsg("could not set permissions on directory \"%s\": %m",
-						 location)));
+					 errmsg("could not set permissions on directory \"%s\": %m",
+							location)));
 	}
 
 	if (InRecovery)
@@ -773,13 +771,26 @@ destroy_tablespace_directories(Oid tablespaceoid, bool redo)
 remove_symlink:
 	linkloc = pstrdup(linkloc_with_version_dir);
 	get_parent_directory(linkloc);
-	if (lstat(linkloc, &st) == 0 && S_ISDIR(st.st_mode))
+	if (lstat(linkloc, &st) < 0)
+	{
+		int			saved_errno = errno;
+
+		ereport(redo ? LOG : (saved_errno == ENOENT ? WARNING : ERROR),
+				(errcode_for_file_access(),
+				 errmsg("could not stat file \"%s\": %m",
+						linkloc)));
+	}
+	else if (S_ISDIR(st.st_mode))
 	{
 		if (rmdir(linkloc) < 0)
-			ereport(redo ? LOG : ERROR,
+		{
+			int			saved_errno = errno;
+
+			ereport(redo ? LOG : (saved_errno == ENOENT ? WARNING : ERROR),
 					(errcode_for_file_access(),
 					 errmsg("could not remove directory \"%s\": %m",
 							linkloc)));
+		}
 	}
 #ifdef S_ISLNK
 	else if (S_ISLNK(st.st_mode))
@@ -799,7 +810,7 @@ remove_symlink:
 	{
 		/* Refuse to remove anything that's not a directory or symlink */
 		ereport(redo ? LOG : ERROR,
-				(ERRCODE_SYSTEM_ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("\"%s\" is not a directory or symbolic link",
 						linkloc)));
 	}
@@ -851,7 +862,7 @@ remove_tablespace_symlink(const char *linkloc)
 {
 	struct stat st;
 
-	if (lstat(linkloc, &st) != 0)
+	if (lstat(linkloc, &st) < 0)
 	{
 		if (errno == ENOENT)
 			return;
@@ -863,10 +874,10 @@ remove_tablespace_symlink(const char *linkloc)
 	if (S_ISDIR(st.st_mode))
 	{
 		/*
-		 * This will fail if the directory isn't empty, but not
-		 * if it's a junction point.
+		 * This will fail if the directory isn't empty, but not if it's a
+		 * junction point.
 		 */
-		if (rmdir(linkloc) < 0)
+		if (rmdir(linkloc) < 0 && errno != ENOENT)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not remove directory \"%s\": %m",
@@ -878,7 +889,7 @@ remove_tablespace_symlink(const char *linkloc)
 		if (unlink(linkloc) < 0 && errno != ENOENT)
 			ereport(ERROR,
 					(errcode_for_file_access(),
-						errmsg("could not remove symbolic link \"%s\": %m",
+					 errmsg("could not remove symbolic link \"%s\": %m",
 							linkloc)));
 	}
 #endif
@@ -886,7 +897,8 @@ remove_tablespace_symlink(const char *linkloc)
 	{
 		/* Refuse to remove anything that's not a directory or symlink */
 		ereport(ERROR,
-				(errmsg("\"%s\" is not a directory or symbolic link",
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("\"%s\" is not a directory or symbolic link",
 						linkloc)));
 	}
 }
@@ -936,7 +948,7 @@ RenameTableSpace(const char *oldname, const char *newname)
 		ereport(ERROR,
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("unacceptable tablespace name \"%s\"", newname),
-		errdetail("The prefix \"pg_\" is reserved for system tablespaces.")));
+				 errdetail("The prefix \"pg_\" is reserved for system tablespaces.")));
 
 	/* Make sure the new name doesn't exist */
 	ScanKeyInit(&entry[0],
@@ -956,8 +968,7 @@ RenameTableSpace(const char *oldname, const char *newname)
 	/* OK, update the entry */
 	namestrcpy(&(newform->spcname), newname);
 
-	simple_heap_update(rel, &newtuple->t_self, newtuple);
-	CatalogUpdateIndexes(rel, newtuple);
+	CatalogTupleUpdate(rel, &newtuple->t_self, newtuple);
 
 	InvokeObjectPostAlterHook(TableSpaceRelationId, tspId, 0);
 
@@ -1029,8 +1040,7 @@ AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt)
 								 repl_null, repl_repl);
 
 	/* Update system catalog. */
-	simple_heap_update(rel, &newtuple->t_self, newtuple);
-	CatalogUpdateIndexes(rel, newtuple);
+	CatalogTupleUpdate(rel, &newtuple->t_self, newtuple);
 
 	InvokeObjectPostAlterHook(TableSpaceRelationId, HeapTupleGetOid(tup), 0);
 
@@ -1500,8 +1510,8 @@ tblspc_redo(XLogReaderState *record)
 			if (!destroy_tablespace_directories(xlrec->ts_id, true))
 				ereport(LOG,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("directories for tablespace %u could not be removed",
-						xlrec->ts_id),
+						 errmsg("directories for tablespace %u could not be removed",
+								xlrec->ts_id),
 						 errhint("You can remove the directories manually if necessary.")));
 		}
 	}

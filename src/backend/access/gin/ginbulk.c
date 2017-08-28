@@ -4,7 +4,7 @@
  *	  routines for fast build of inverted index
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -42,7 +42,7 @@ ginCombineData(RBNode *existing, const RBNode *newdata, void *arg)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("posting list is too long"),
-					 errhint("Reduce maintenance_work_mem")));
+					 errhint("Reduce maintenance_work_mem.")));
 
 		accum->allocatedMemory -= GetMemoryChunkSpace(eo->list);
 		eo->maxcount *= 2;
@@ -116,7 +116,7 @@ ginInitBA(BuildAccumulator *accum)
 							cmpEntryAccumulator,
 							ginCombineData,
 							ginAllocEntryAccumulator,
-							NULL,		/* no freefunc needed */
+							NULL,	/* no freefunc needed */
 							(void *) accum);
 }
 
@@ -127,9 +127,10 @@ ginInitBA(BuildAccumulator *accum)
 static Datum
 getDatumCopy(BuildAccumulator *accum, OffsetNumber attnum, Datum value)
 {
-	Form_pg_attribute att = accum->ginstate->origTupdesc->attrs[attnum - 1];
+	Form_pg_attribute att;
 	Datum		res;
 
+	att = TupleDescAttr(accum->ginstate->origTupdesc, attnum - 1);
 	if (att->attbyval)
 		res = value;
 	else
@@ -255,7 +256,7 @@ qsortCompareItemPointers(const void *a, const void *b)
 void
 ginBeginBAScan(BuildAccumulator *accum)
 {
-	rb_begin_iterate(accum->tree, LeftRightWalk);
+	rb_begin_iterate(accum->tree, LeftRightWalk, &accum->tree_walk);
 }
 
 /*
@@ -271,7 +272,7 @@ ginGetBAEntry(BuildAccumulator *accum,
 	GinEntryAccumulator *entry;
 	ItemPointerData *list;
 
-	entry = (GinEntryAccumulator *) rb_iterate(accum->tree);
+	entry = (GinEntryAccumulator *) rb_iterate(&accum->tree_walk);
 
 	if (entry == NULL)
 		return NULL;			/* no more entries */

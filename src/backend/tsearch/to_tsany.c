@@ -3,7 +3,7 @@
  * to_tsany.c
  *		to_ts* function definitions
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -16,6 +16,22 @@
 #include "tsearch/ts_cache.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
+#include "utils/jsonapi.h"
+
+
+typedef struct MorphOpaque
+{
+	Oid			cfg_id;
+	int			qoperator;		/* query operator */
+} MorphOpaque;
+
+typedef struct TSVectorBuildState
+{
+	ParsedText *prs;
+	Oid			cfgId;
+} TSVectorBuildState;
+
+static void add_to_tsvector(void *_state, char *elem_value, int elem_len);
 
 
 Datum
@@ -33,8 +49,8 @@ compareWORD(const void *a, const void *b)
 	int			res;
 
 	res = tsCompareString(
-			   ((const ParsedWord *) a)->word, ((const ParsedWord *) a)->len,
-			   ((const ParsedWord *) b)->word, ((const ParsedWord *) b)->len,
+						  ((const ParsedWord *) a)->word, ((const ParsedWord *) a)->len,
+						  ((const ParsedWord *) b)->word, ((const ParsedWord *) b)->len,
 						  false);
 
 	if (res == 0)
@@ -133,6 +149,8 @@ uniqueWORD(ParsedWord *a, int32 l)
 
 /*
  * make value of tsvector, given parsed text
+ *
+ * Note: frees prs->words and subsidiary data.
  */
 TSVector
 make_tsvector(ParsedText *prs)
@@ -146,7 +164,11 @@ make_tsvector(ParsedText *prs)
 	char	   *str;
 	int			stroff;
 
-	prs->curwords = uniqueWORD(prs->words, prs->curwords);
+	/* Merge duplicate words */
+	if (prs->curwords > 0)
+		prs->curwords = uniqueWORD(prs->words, prs->curwords);
+
+	/* Determine space needed */
 	for (i = 0; i < prs->curwords; i++)
 	{
 		lenstr += prs->words[i].len;
@@ -201,7 +223,10 @@ make_tsvector(ParsedText *prs)
 			ptr->haspos = 0;
 		ptr++;
 	}
-	pfree(prs->words);
+
+	if (prs->words)
+		pfree(prs->words);
+
 	return in;
 }
 
@@ -209,38 +234,31 @@ Datum
 to_tsvector_byid(PG_FUNCTION_ARGS)
 {
 	Oid			cfgId = PG_GETARG_OID(0);
-	text	   *in = PG_GETARG_TEXT_P(1);
+	text	   *in = PG_GETARG_TEXT_PP(1);
 	ParsedText	prs;
 	TSVector	out;
 
-	prs.lenwords = (VARSIZE(in) - VARHDRSZ) / 6;		/* just estimation of
-														 * word's number */
-	if (prs.lenwords == 0)
+	prs.lenwords = VARSIZE_ANY_EXHDR(in) / 6;	/* just estimation of word's
+												 * number */
+	if (prs.lenwords < 2)
 		prs.lenwords = 2;
 	prs.curwords = 0;
 	prs.pos = 0;
 	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
 
-	parsetext(cfgId, &prs, VARDATA(in), VARSIZE(in) - VARHDRSZ);
+	parsetext(cfgId, &prs, VARDATA_ANY(in), VARSIZE_ANY_EXHDR(in));
+
 	PG_FREE_IF_COPY(in, 1);
 
-	if (prs.curwords)
-		out = make_tsvector(&prs);
-	else
-	{
-		pfree(prs.words);
-		out = palloc(CALCDATASIZE(0, 0));
-		SET_VARSIZE(out, CALCDATASIZE(0, 0));
-		out->size = 0;
-	}
+	out = make_tsvector(&prs);
 
-	PG_RETURN_POINTER(out);
+	PG_RETURN_TSVECTOR(out);
 }
 
 Datum
 to_tsvector(PG_FUNCTION_ARGS)
 {
-	text	   *in = PG_GETARG_TEXT_P(0);
+	text	   *in = PG_GETARG_TEXT_PP(0);
 	Oid			cfgId;
 
 	cfgId = getTSCurrentConfig(true);
@@ -248,6 +266,113 @@ to_tsvector(PG_FUNCTION_ARGS)
 										ObjectIdGetDatum(cfgId),
 										PointerGetDatum(in)));
 }
+
+Datum
+jsonb_to_tsvector_byid(PG_FUNCTION_ARGS)
+{
+	Oid			cfgId = PG_GETARG_OID(0);
+	Jsonb	   *jb = PG_GETARG_JSONB(1);
+	TSVector	result;
+	TSVectorBuildState state;
+	ParsedText	prs;
+
+	prs.words = NULL;
+	prs.curwords = 0;
+	state.prs = &prs;
+	state.cfgId = cfgId;
+
+	iterate_jsonb_string_values(jb, &state, add_to_tsvector);
+
+	PG_FREE_IF_COPY(jb, 1);
+
+	result = make_tsvector(&prs);
+
+	PG_RETURN_TSVECTOR(result);
+}
+
+Datum
+jsonb_to_tsvector(PG_FUNCTION_ARGS)
+{
+	Jsonb	   *jb = PG_GETARG_JSONB(0);
+	Oid			cfgId;
+
+	cfgId = getTSCurrentConfig(true);
+	PG_RETURN_DATUM(DirectFunctionCall2(jsonb_to_tsvector_byid,
+										ObjectIdGetDatum(cfgId),
+										JsonbGetDatum(jb)));
+}
+
+Datum
+json_to_tsvector_byid(PG_FUNCTION_ARGS)
+{
+	Oid			cfgId = PG_GETARG_OID(0);
+	text	   *json = PG_GETARG_TEXT_P(1);
+	TSVector	result;
+	TSVectorBuildState state;
+	ParsedText	prs;
+
+	prs.words = NULL;
+	prs.curwords = 0;
+	state.prs = &prs;
+	state.cfgId = cfgId;
+
+	iterate_json_string_values(json, &state, add_to_tsvector);
+
+	PG_FREE_IF_COPY(json, 1);
+
+	result = make_tsvector(&prs);
+
+	PG_RETURN_TSVECTOR(result);
+}
+
+Datum
+json_to_tsvector(PG_FUNCTION_ARGS)
+{
+	text	   *json = PG_GETARG_TEXT_P(0);
+	Oid			cfgId;
+
+	cfgId = getTSCurrentConfig(true);
+	PG_RETURN_DATUM(DirectFunctionCall2(json_to_tsvector_byid,
+										ObjectIdGetDatum(cfgId),
+										PointerGetDatum(json)));
+}
+
+/*
+ * Parse lexemes in an element of a json(b) value, add to TSVectorBuildState.
+ */
+static void
+add_to_tsvector(void *_state, char *elem_value, int elem_len)
+{
+	TSVectorBuildState *state = (TSVectorBuildState *) _state;
+	ParsedText *prs = state->prs;
+	int32		prevwords;
+
+	if (prs->words == NULL)
+	{
+		/*
+		 * First time through: initialize words array to a reasonable size.
+		 * (parsetext() will realloc it bigger as needed.)
+		 */
+		prs->lenwords = Max(elem_len / 6, 64);
+		prs->words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs->lenwords);
+		prs->curwords = 0;
+		prs->pos = 0;
+	}
+
+	prevwords = prs->curwords;
+
+	parsetext(state->cfgId, prs, elem_value, elem_len);
+
+	/*
+	 * If we extracted any words from this JSON element, advance pos to create
+	 * an artificial break between elements.  This is because we don't want
+	 * phrase searches to think that the last word in this element is adjacent
+	 * to the first word in the next one.
+	 */
+	if (prs->curwords > prevwords)
+		prs->pos += 1;
+}
+
 
 /*
  * to_tsquery
@@ -262,7 +387,7 @@ to_tsvector(PG_FUNCTION_ARGS)
  * to the stack.
  *
  * All words belonging to the same variant are pushed as an ANDed list,
- * and different variants are ORred together.
+ * and different variants are ORed together.
  */
 static void
 pushval_morph(Datum opaque, TSQueryParserState state, char *strval, int lenval, int16 weight, bool prefix)
@@ -270,51 +395,77 @@ pushval_morph(Datum opaque, TSQueryParserState state, char *strval, int lenval, 
 	int32		count = 0;
 	ParsedText	prs;
 	uint32		variant,
-				pos,
+				pos = 0,
 				cntvar = 0,
 				cntpos = 0,
 				cnt = 0;
-	Oid			cfg_id = DatumGetObjectId(opaque);		/* the input is actually
-														 * an Oid, not a pointer */
+	MorphOpaque *data = (MorphOpaque *) DatumGetPointer(opaque);
 
 	prs.lenwords = 4;
 	prs.curwords = 0;
 	prs.pos = 0;
 	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
 
-	parsetext(cfg_id, &prs, strval, lenval);
+	parsetext(data->cfg_id, &prs, strval, lenval);
 
 	if (prs.curwords > 0)
 	{
-
 		while (count < prs.curwords)
 		{
+			/*
+			 * Were any stop words removed? If so, fill empty positions with
+			 * placeholders linked by an appropriate operator.
+			 */
+			if (pos > 0 && pos + 1 < prs.words[count].pos.pos)
+			{
+				while (pos + 1 < prs.words[count].pos.pos)
+				{
+					/* put placeholders for each missing stop word */
+					pushStop(state);
+					if (cntpos)
+						pushOperator(state, data->qoperator, 1);
+					cntpos++;
+					pos++;
+				}
+			}
+
+			/* save current word's position */
 			pos = prs.words[count].pos.pos;
+
+			/* Go through all variants obtained from this token */
 			cntvar = 0;
 			while (count < prs.curwords && pos == prs.words[count].pos.pos)
 			{
 				variant = prs.words[count].nvariant;
 
+				/* Push all words belonging to the same variant */
 				cnt = 0;
-				while (count < prs.curwords && pos == prs.words[count].pos.pos && variant == prs.words[count].nvariant)
+				while (count < prs.curwords &&
+					   pos == prs.words[count].pos.pos &&
+					   variant == prs.words[count].nvariant)
 				{
-
-					pushValue(state, prs.words[count].word, prs.words[count].len, weight,
-							  ((prs.words[count].flags & TSL_PREFIX) || prefix) ? true : false);
+					pushValue(state,
+							  prs.words[count].word,
+							  prs.words[count].len,
+							  weight,
+							  ((prs.words[count].flags & TSL_PREFIX) || prefix));
 					pfree(prs.words[count].word);
 					if (cnt)
-						pushOperator(state, OP_AND);
+						pushOperator(state, OP_AND, 0);
 					cnt++;
 					count++;
 				}
 
 				if (cntvar)
-					pushOperator(state, OP_OR);
+					pushOperator(state, OP_OR, 0);
 				cntvar++;
 			}
 
 			if (cntpos)
-				pushOperator(state, OP_AND);
+			{
+				/* distance may be useful */
+				pushOperator(state, data->qoperator, 1);
+			}
 
 			cntpos++;
 		}
@@ -329,51 +480,25 @@ pushval_morph(Datum opaque, TSQueryParserState state, char *strval, int lenval, 
 Datum
 to_tsquery_byid(PG_FUNCTION_ARGS)
 {
-	Oid			cfgid = PG_GETARG_OID(0);
-	text	   *in = PG_GETARG_TEXT_P(1);
+	text	   *in = PG_GETARG_TEXT_PP(1);
 	TSQuery		query;
-	QueryItem  *res;
-	int32		len;
+	MorphOpaque data;
 
-	query = parse_tsquery(text_to_cstring(in), pushval_morph, ObjectIdGetDatum(cfgid), false);
+	data.cfg_id = PG_GETARG_OID(0);
+	data.qoperator = OP_AND;
 
-	if (query->size == 0)
-		PG_RETURN_TSQUERY(query);
+	query = parse_tsquery(text_to_cstring(in),
+						  pushval_morph,
+						  PointerGetDatum(&data),
+						  false);
 
-	/* clean out any stopword placeholders from the tree */
-	res = clean_fakeval(GETQUERY(query), &len);
-	if (!res)
-	{
-		SET_VARSIZE(query, HDRSIZETQ);
-		query->size = 0;
-		PG_RETURN_POINTER(query);
-	}
-	memcpy((void *) GETQUERY(query), (void *) res, len * sizeof(QueryItem));
-
-	/*
-	 * Removing the stopword placeholders might've resulted in fewer
-	 * QueryItems. If so, move the operands up accordingly.
-	 */
-	if (len != query->size)
-	{
-		char	   *oldoperand = GETOPERAND(query);
-		int32		lenoperand = VARSIZE(query) - (oldoperand - (char *) query);
-
-		Assert(len < query->size);
-
-		query->size = len;
-		memmove((void *) GETOPERAND(query), oldoperand, VARSIZE(query) - (oldoperand - (char *) query));
-		SET_VARSIZE(query, COMPUTESIZE(len, lenoperand));
-	}
-
-	pfree(res);
 	PG_RETURN_TSQUERY(query);
 }
 
 Datum
 to_tsquery(PG_FUNCTION_ARGS)
 {
-	text	   *in = PG_GETARG_TEXT_P(0);
+	text	   *in = PG_GETARG_TEXT_PP(0);
 	Oid			cfgId;
 
 	cfgId = getTSCurrentConfig(true);
@@ -385,55 +510,60 @@ to_tsquery(PG_FUNCTION_ARGS)
 Datum
 plainto_tsquery_byid(PG_FUNCTION_ARGS)
 {
-	Oid			cfgid = PG_GETARG_OID(0);
-	text	   *in = PG_GETARG_TEXT_P(1);
+	text	   *in = PG_GETARG_TEXT_PP(1);
 	TSQuery		query;
-	QueryItem  *res;
-	int32		len;
+	MorphOpaque data;
 
-	query = parse_tsquery(text_to_cstring(in), pushval_morph, ObjectIdGetDatum(cfgid), true);
+	data.cfg_id = PG_GETARG_OID(0);
+	data.qoperator = OP_AND;
 
-	if (query->size == 0)
-		PG_RETURN_TSQUERY(query);
+	query = parse_tsquery(text_to_cstring(in),
+						  pushval_morph,
+						  PointerGetDatum(&data),
+						  true);
 
-	/* clean out any stopword placeholders from the tree */
-	res = clean_fakeval(GETQUERY(query), &len);
-	if (!res)
-	{
-		SET_VARSIZE(query, HDRSIZETQ);
-		query->size = 0;
-		PG_RETURN_POINTER(query);
-	}
-	memcpy((void *) GETQUERY(query), (void *) res, len * sizeof(QueryItem));
-
-	/*
-	 * Removing the stopword placeholders might've resulted in fewer
-	 * QueryItems. If so, move the operands up accordingly.
-	 */
-	if (len != query->size)
-	{
-		char	   *oldoperand = GETOPERAND(query);
-		int32		lenoperand = VARSIZE(query) - (oldoperand - (char *) query);
-
-		Assert(len < query->size);
-
-		query->size = len;
-		memmove((void *) GETOPERAND(query), oldoperand, lenoperand);
-		SET_VARSIZE(query, COMPUTESIZE(len, lenoperand));
-	}
-
-	pfree(res);
 	PG_RETURN_POINTER(query);
 }
 
 Datum
 plainto_tsquery(PG_FUNCTION_ARGS)
 {
-	text	   *in = PG_GETARG_TEXT_P(0);
+	text	   *in = PG_GETARG_TEXT_PP(0);
 	Oid			cfgId;
 
 	cfgId = getTSCurrentConfig(true);
 	PG_RETURN_DATUM(DirectFunctionCall2(plainto_tsquery_byid,
+										ObjectIdGetDatum(cfgId),
+										PointerGetDatum(in)));
+}
+
+
+Datum
+phraseto_tsquery_byid(PG_FUNCTION_ARGS)
+{
+	text	   *in = PG_GETARG_TEXT_PP(1);
+	TSQuery		query;
+	MorphOpaque data;
+
+	data.cfg_id = PG_GETARG_OID(0);
+	data.qoperator = OP_PHRASE;
+
+	query = parse_tsquery(text_to_cstring(in),
+						  pushval_morph,
+						  PointerGetDatum(&data),
+						  true);
+
+	PG_RETURN_TSQUERY(query);
+}
+
+Datum
+phraseto_tsquery(PG_FUNCTION_ARGS)
+{
+	text	   *in = PG_GETARG_TEXT_PP(0);
+	Oid			cfgId;
+
+	cfgId = getTSCurrentConfig(true);
+	PG_RETURN_DATUM(DirectFunctionCall2(phraseto_tsquery_byid,
 										ObjectIdGetDatum(cfgId),
 										PointerGetDatum(in)));
 }

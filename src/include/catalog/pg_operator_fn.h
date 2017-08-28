@@ -4,7 +4,7 @@
 *	 prototypes for functions in catalog/pg_operator.c
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_operator_fn.h
@@ -31,4 +31,6 @@ extern ObjectAddress OperatorCreate(const char *operatorName,
 
 extern ObjectAddress makeOperatorDependencies(HeapTuple tuple, bool isUpdate);
 
-#endif   /* PG_OPERATOR_FN_H */
+extern void OperatorUpd(Oid baseId, Oid commId, Oid negId, bool isDelete);
+
+#endif							/* PG_OPERATOR_FN_H */

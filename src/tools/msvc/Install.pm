@@ -20,12 +20,12 @@ our (@ISA, @EXPORT_OK);
 my $insttype;
 my @client_contribs = ('oid2name', 'pgbench', 'vacuumlo');
 my @client_program_files = (
-	'clusterdb',     'createdb',       'createlang', 'createuser',
-	'dropdb',        'droplang',       'dropuser',   'ecpg',
-	'libecpg',       'libecpg_compat', 'libpgtypes', 'libpq',
-	'pg_basebackup', 'pg_config',      'pg_dump',    'pg_dumpall',
-	'pg_isready',    'pg_receivexlog', 'pg_restore', 'psql',
-	'reindexdb',     'vacuumdb',       @client_contribs);
+	'clusterdb',      'createdb',   'createuser',    'dropdb',
+	'dropuser',       'ecpg',       'libecpg',       'libecpg_compat',
+	'libpgtypes',     'libpq',      'pg_basebackup', 'pg_config',
+	'pg_dump',        'pg_dumpall', 'pg_isready',    'pg_receivewal',
+	'pg_recvlogical', 'pg_restore', 'psql',          'reindexdb',
+	'vacuumdb',       @client_contribs);
 
 sub lcopy
 {
@@ -58,8 +58,8 @@ sub Install
 
 		# suppress warning about harmless redeclaration of $config
 		no warnings 'misc';
-		require "config_default.pl";
-		require "config.pl" if (-f "config.pl");
+		do "config_default.pl";
+		do "config.pl" if (-f "config.pl");
 	}
 
 	chdir("../../..")    if (-f "../../../configure");
@@ -143,7 +143,7 @@ sub Install
 			$target . '/share/tsearch_data/');
 		CopySetOfFiles(
 			'Dictionaries sample files',
-			[ glob("src\\backend\\tsearch\\*_sample.*") ],
+			[ glob("src\\backend\\tsearch\\dicts\\*_sample*") ],
 			$target . '/share/tsearch_data/');
 
 		my $pl_extension_files = [];
@@ -217,7 +217,7 @@ sub CopySolutionOutput
 	my $conf   = shift;
 	my $target = shift;
 	my $rem =
-	  qr{Project\("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}"\) = "([^"]+)"};
+	  qr{Project\("\{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942\}"\) = "([^"]+)"};
 
 	my $sln = read_file("pgsql.sln") || croak "Could not open pgsql.sln\n";
 
@@ -367,7 +367,7 @@ sub GenerateConversionScript
 		$sql .=
 "COMMENT ON CONVERSION pg_catalog.$name IS 'conversion for $se to $de';\n\n";
 	}
-	open($F, ">$target/share/conversion_create.sql")
+	open($F, '>', "$target/share/conversion_create.sql")
 	  || die "Could not write to conversion_create.sql\n";
 	print $F $sql;
 	close($F);
@@ -380,13 +380,27 @@ sub GenerateTimezoneFiles
 	my $conf   = shift;
 	my $mf     = read_file("src/timezone/Makefile");
 	$mf =~ s{\\\r?\n}{}g;
+
 	$mf =~ /^TZDATA\s*:?=\s*(.*)$/m
-	  || die "Could not find TZDATA row in timezone makefile\n";
+	  || die "Could not find TZDATA line in timezone makefile\n";
 	my @tzfiles = split /\s+/, $1;
-	unshift @tzfiles, '';
+
+	$mf =~ /^POSIXRULES\s*:?=\s*(.*)$/m
+	  || die "Could not find POSIXRULES line in timezone makefile\n";
+	my $posixrules = $1;
+	$posixrules =~ s/\s+//g;
+
 	print "Generating timezone files...";
-	system("$conf\\zic\\zic -d \"$target/share/timezone\" "
-		  . join(" src/timezone/data/", @tzfiles));
+
+	my @args =
+	  ("$conf/zic/zic", '-d', "$target/share/timezone", '-p', "$posixrules");
+	foreach (@tzfiles)
+	{
+		my $tzfile = $_;
+		push(@args, "src/timezone/data/$tzfile");
+	}
+
+	system(@args);
 	print "\n";
 }
 
@@ -402,7 +416,7 @@ sub GenerateTsearchFiles
 	$mf =~ /^LANGUAGES\s*=\s*(.*)$/m
 	  || die "Could not find LANGUAGES line in snowball Makefile\n";
 	my @pieces = split /\s+/, $1;
-	open($F, ">$target/share/snowball_create.sql")
+	open($F, '>', "$target/share/snowball_create.sql")
 	  || die "Could not write snowball_create.sql";
 	print $F read_file('src/backend/snowball/snowball_func.sql.in');
 
@@ -582,7 +596,8 @@ sub CopyIncludeFiles
 		'Public headers', $target . '/include/',
 		'src/include/',   'postgres_ext.h',
 		'pg_config.h',    'pg_config_ext.h',
-		'pg_config_os.h', 'pg_config_manual.h');
+		'pg_config_os.h', 'dynloader.h',
+		'pg_config_manual.h');
 	lcopy('src/include/libpq/libpq-fs.h', $target . '/include/libpq/')
 	  || croak 'Could not copy libpq-fs.h';
 
@@ -605,7 +620,8 @@ sub CopyIncludeFiles
 	CopyFiles(
 		'Server headers',
 		$target . '/include/server/',
-		'src/include/', 'pg_config.h', 'pg_config_ext.h', 'pg_config_os.h');
+		'src/include/', 'pg_config.h', 'pg_config_ext.h', 'pg_config_os.h',
+		'dynloader.h');
 	CopyFiles(
 		'Grammar header',
 		$target . '/include/server/parser/',
@@ -632,9 +648,10 @@ sub CopyIncludeFiles
 		next unless (-d "src/include/$d");
 
 		EnsureDirectories("$target/include/server/$d");
-		system(
-qq{xcopy /s /i /q /r /y src\\include\\$d\\*.h "$ctarget\\include\\server\\$d\\"}
-		) && croak("Failed to copy include directory $d\n");
+		my @args = (
+			'xcopy', '/s', '/i', '/q', '/r', '/y', "src\\include\\$d\\*.h",
+			"$ctarget\\include\\server\\$d\\");
+		system(@args) && croak("Failed to copy include directory $d\n");
 	}
 	closedir($D);
 
@@ -687,9 +704,12 @@ sub GenerateNLSFiles
 
 			EnsureDirectories($target, "share/locale/$lang",
 				"share/locale/$lang/LC_MESSAGES");
-			system(
-"\"$nlspath\\bin\\msgfmt\" -o \"$target\\share\\locale\\$lang\\LC_MESSAGES\\$prgm-$majorver.mo\" $_"
-			) && croak("Could not run msgfmt on $dir\\$_");
+			my @args = (
+				"$nlspath\\bin\\msgfmt",
+				'-o',
+"$target\\share\\locale\\$lang\\LC_MESSAGES\\$prgm-$majorver.mo",
+				$_);
+			system(@args) && croak("Could not run msgfmt on $dir\\$_");
 			print ".";
 		}
 	}
@@ -722,7 +742,7 @@ sub read_file
 	my $t = $/;
 
 	undef $/;
-	open($F, $filename) || die "Could not open file $filename\n";
+	open($F, '<', $filename) || die "Could not open file $filename\n";
 	my $txt = <$F>;
 	close($F);
 	$/ = $t;

@@ -116,6 +116,21 @@ select thousand, tenthous from tenk1
 where (thousand, tenthous) >= (997, 5000)
 order by thousand, tenthous;
 
+-- Test case for bug #14010: indexed row comparisons fail with nulls
+create temp table test_table (a text, b text);
+insert into test_table values ('a', 'b');
+insert into test_table select 'a', null from generate_series(1,1000);
+insert into test_table values ('b', 'a');
+create index on test_table (a,b);
+set enable_sort = off;
+
+explain (costs off)
+select a,b from test_table where (a,b) > ('a','a') order by a,b;
+
+select a,b from test_table where (a,b) > ('a','a') order by a,b;
+
+reset enable_sort;
+
 -- Check row comparisons with IN
 select * from int8_tbl i8 where i8 in (row(123,456));  -- fail, type mismatch
 
@@ -271,3 +286,55 @@ create temp table tt1 as select * from int8_tbl limit 2;
 create temp table tt2 () inherits(tt1);
 insert into tt2 values(0,0);
 select row_to_json(r) from (select q2,q1 from tt1 offset 0) r;
+
+-- check no-op rowtype conversions
+create temp table tt3 () inherits(tt2);
+insert into tt3 values(33,44);
+select row_to_json(tt3::tt2::tt1) from tt3;
+
+--
+-- IS [NOT] NULL should not recurse into nested composites (bug #14235)
+--
+
+explain (verbose, costs off)
+select r, r is null as isnull, r is not null as isnotnull
+from (values (1,row(1,2)), (1,row(null,null)), (1,null),
+             (null,row(1,2)), (null,row(null,null)), (null,null) ) r(a,b);
+
+select r, r is null as isnull, r is not null as isnotnull
+from (values (1,row(1,2)), (1,row(null,null)), (1,null),
+             (null,row(1,2)), (null,row(null,null)), (null,null) ) r(a,b);
+
+explain (verbose, costs off)
+with r(a,b) as
+  (values (1,row(1,2)), (1,row(null,null)), (1,null),
+          (null,row(1,2)), (null,row(null,null)), (null,null) )
+select r, r is null as isnull, r is not null as isnotnull from r;
+
+with r(a,b) as
+  (values (1,row(1,2)), (1,row(null,null)), (1,null),
+          (null,row(1,2)), (null,row(null,null)), (null,null) )
+select r, r is null as isnull, r is not null as isnotnull from r;
+
+
+--
+-- Tests for component access / FieldSelect
+--
+CREATE TABLE compositetable(a text, b text) WITH OIDS;
+INSERT INTO compositetable(a, b) VALUES('fa', 'fb');
+
+-- composite type columns can't directly be accessed (error)
+SELECT d.a FROM (SELECT compositetable AS d FROM compositetable) s;
+-- but can be accessed with proper parens
+SELECT (d).a, (d).b FROM (SELECT compositetable AS d FROM compositetable) s;
+-- oids can't be accessed in composite types (error)
+SELECT (d).oid FROM (SELECT compositetable AS d FROM compositetable) s;
+
+-- accessing non-existing column in NULL datum errors out
+SELECT (NULL::compositetable).nonexistant;
+-- existing column in a NULL composite yield NULL
+SELECT (NULL::compositetable).a;
+-- oids can't be accessed in composite types (error)
+SELECT (NULL::compositetable).oid;
+
+DROP TABLE compositetable;

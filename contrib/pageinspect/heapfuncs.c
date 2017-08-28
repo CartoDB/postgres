@@ -15,7 +15,7 @@
  * there's hardly any use case for using these without superuser-rights
  * anyway.
  *
- * Copyright (c) 2007-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2017, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/pageinspect/heapfuncs.c
@@ -24,6 +24,8 @@
  */
 
 #include "postgres.h"
+
+#include "pageinspect.h"
 
 #include "access/htup_details.h"
 #include "funcapi.h"
@@ -130,7 +132,7 @@ heap_page_items(PG_FUNCTION_ARGS)
 		if (raw_page_size < SizeOfPageHeaderData)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				  errmsg("input page too small (%d bytes)", raw_page_size)));
+					 errmsg("input page too small (%d bytes)", raw_page_size)));
 
 		fctx = SRF_FIRSTCALL_INIT();
 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
@@ -192,9 +194,9 @@ heap_page_items(PG_FUNCTION_ARGS)
 			lp_offset == MAXALIGN(lp_offset) &&
 			lp_offset + lp_len <= raw_page_size)
 		{
-			HeapTupleHeader		tuphdr;
-			bytea			   *tuple_data_bytea;
-			int					tuple_data_len;
+			HeapTupleHeader tuphdr;
+			bytea	   *tuple_data_bytea;
+			int			tuple_data_len;
 
 			/* Extract information from the tuple header */
 
@@ -214,7 +216,7 @@ heap_page_items(PG_FUNCTION_ARGS)
 			tuple_data_bytea = (bytea *) palloc(tuple_data_len + VARHDRSZ);
 			SET_VARSIZE(tuple_data_bytea, tuple_data_len + VARHDRSZ);
 			memcpy(VARDATA(tuple_data_bytea), (char *) tuphdr + tuphdr->t_hoff,
-					 tuple_data_len);
+				   tuple_data_len);
 			values[13] = PointerGetDatum(tuple_data_bytea);
 
 			/*
@@ -229,11 +231,12 @@ heap_page_items(PG_FUNCTION_ARGS)
 			{
 				if (tuphdr->t_infomask & HEAP_HASNULL)
 				{
-					int	bits_len =
-						((tuphdr->t_infomask2 & HEAP_NATTS_MASK) / 8 + 1) * 8;
+					int			bits_len;
 
+					bits_len =
+						((tuphdr->t_infomask2 & HEAP_NATTS_MASK) / 8 + 1) * 8;
 					values[11] = CStringGetTextDatum(
-								 bits_to_text(tuphdr->t_bits, bits_len));
+													 bits_to_text(tuphdr->t_bits, bits_len));
 				}
 				else
 					nulls[11] = true;
@@ -278,21 +281,21 @@ heap_page_items(PG_FUNCTION_ARGS)
  *
  * Split raw tuple data taken directly from a page into an array of bytea
  * elements. This routine does a lookup on NULL values and creates array
- * elements accordindly. This is a reimplementation of nocachegetattr()
+ * elements accordingly. This is a reimplementation of nocachegetattr()
  * in heaptuple.c simplified for educational purposes.
  */
 static Datum
 tuple_data_split_internal(Oid relid, char *tupdata,
-				 uint16 tupdata_len, uint16 t_infomask,
-				 uint16 t_infomask2, bits8 *t_bits,
-				 bool do_detoast)
+						  uint16 tupdata_len, uint16 t_infomask,
+						  uint16 t_infomask2, bits8 *t_bits,
+						  bool do_detoast)
 {
-	ArrayBuildState	   *raw_attrs;
-	int 				nattrs;
-	int					i;
-	int					off = 0;
-	Relation			rel;
-	TupleDesc			tupdesc;
+	ArrayBuildState *raw_attrs;
+	int			nattrs;
+	int			i;
+	int			off = 0;
+	Relation	rel;
+	TupleDesc	tupdesc;
 
 	/* Get tuple descriptor from relation OID */
 	rel = relation_open(relid, NoLock);
@@ -309,30 +312,31 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 
 	for (i = 0; i < nattrs; i++)
 	{
-		Form_pg_attribute	attr;
-		bool				is_null;
-		bytea			   *attr_data = NULL;
+		Form_pg_attribute attr;
+		bool		is_null;
+		bytea	   *attr_data = NULL;
 
-		attr = tupdesc->attrs[i];
+		attr = TupleDescAttr(tupdesc, i);
 		is_null = (t_infomask & HEAP_HASNULL) && att_isnull(i, t_bits);
 
 		/*
-		 * Tuple header can specify less attributes than tuple descriptor
-		 * as ALTER TABLE ADD COLUMN without DEFAULT keyword does not
-		 * actually change tuples in pages, so attributes with numbers greater
-		 * than (t_infomask2 & HEAP_NATTS_MASK) should be treated as NULL.
+		 * Tuple header can specify less attributes than tuple descriptor as
+		 * ALTER TABLE ADD COLUMN without DEFAULT keyword does not actually
+		 * change tuples in pages, so attributes with numbers greater than
+		 * (t_infomask2 & HEAP_NATTS_MASK) should be treated as NULL.
 		 */
 		if (i >= (t_infomask2 & HEAP_NATTS_MASK))
 			is_null = true;
 
 		if (!is_null)
 		{
-			int		len;
+			int			len;
 
 			if (attr->attlen == -1)
 			{
-				off = att_align_pointer(off, tupdesc->attrs[i]->attalign, -1,
+				off = att_align_pointer(off, attr->attalign, -1,
 										tupdata + off);
+
 				/*
 				 * As VARSIZE_ANY throws an exception if it can't properly
 				 * detect the type of external storage in macros VARTAG_SIZE,
@@ -342,14 +346,14 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 					!VARATT_IS_EXTERNAL_ONDISK(tupdata + off) &&
 					!VARATT_IS_EXTERNAL_INDIRECT(tupdata + off))
 					ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("first byte of varlena attribute is incorrect for attribute %d", i)));
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("first byte of varlena attribute is incorrect for attribute %d", i)));
 
 				len = VARSIZE_ANY(tupdata + off);
 			}
 			else
 			{
-				off = att_align_nominal(off, tupdesc->attrs[i]->attalign);
+				off = att_align_nominal(off, attr->attalign);
 				len = attr->attlen;
 			}
 
@@ -367,7 +371,7 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 				memcpy(VARDATA(attr_data), tupdata + off, len);
 			}
 
-			off = att_addlength_pointer(off, tupdesc->attrs[i]->attlen,
+			off = att_addlength_pointer(off, attr->attlen,
 										tupdata + off);
 		}
 
@@ -396,14 +400,14 @@ PG_FUNCTION_INFO_V1(tuple_data_split);
 Datum
 tuple_data_split(PG_FUNCTION_ARGS)
 {
-	Oid				relid;
-	bytea		   *raw_data;
-	uint16			t_infomask;
-	uint16			t_infomask2;
-	char		   *t_bits_str;
-	bool			do_detoast = false;
-	bits8		   *t_bits = NULL;
-	Datum			res;
+	Oid			relid;
+	bytea	   *raw_data;
+	uint16		t_infomask;
+	uint16		t_infomask2;
+	char	   *t_bits_str;
+	bool		do_detoast = false;
+	bits8	   *t_bits = NULL;
+	Datum		res;
 
 	relid = PG_GETARG_OID(0);
 	raw_data = PG_ARGISNULL(1) ? NULL : PG_GETARG_BYTEA_P(1);
@@ -429,14 +433,14 @@ tuple_data_split(PG_FUNCTION_ARGS)
 	 */
 	if (t_infomask & HEAP_HASNULL)
 	{
-		int		bits_str_len;
-		int		bits_len;
+		int			bits_str_len;
+		int			bits_len;
 
 		bits_len = (t_infomask2 & HEAP_NATTS_MASK) / 8 + 1;
 		if (!t_bits_str)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("argument of t_bits is null, but it is expected to be null and %i character long",
+					 errmsg("argument of t_bits is null, but it is expected to be null and %d character long",
 							bits_len * 8)));
 
 		bits_str_len = strlen(t_bits_str);
@@ -448,7 +452,7 @@ tuple_data_split(PG_FUNCTION_ARGS)
 		if (bits_len * 8 != bits_str_len)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("unexpected length of t_bits %u, expected %i",
+					 errmsg("unexpected length of t_bits %u, expected %d",
 							bits_str_len, bits_len * 8)));
 
 		/* do the conversion */
@@ -459,7 +463,7 @@ tuple_data_split(PG_FUNCTION_ARGS)
 		if (t_bits_str)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("t_bits string is expected to be NULL, but instead it is %lu bytes length",
+					 errmsg("t_bits string is expected to be NULL, but instead it is %zu bytes length",
 							strlen(t_bits_str))));
 	}
 

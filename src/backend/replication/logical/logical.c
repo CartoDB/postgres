@@ -2,7 +2,7 @@
  * logical.c
  *	   PostgreSQL logical decoding coordination
  *
- * Copyright (c) 2012-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2017, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/logical.c
@@ -62,6 +62,9 @@ static void commit_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 				  XLogRecPtr commit_lsn);
 static void change_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 				  Relation relation, ReorderBufferChange *change);
+static void message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
+				   XLogRecPtr message_lsn, bool transactional,
+				   const char *prefix, Size message_size, const char *message);
 
 static void LoadOutputPlugin(OutputPluginCallbacks *callbacks, char *plugin);
 
@@ -100,7 +103,7 @@ CheckLogicalDecodingRequirements(void)
 	if (RecoveryInProgress())
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			   errmsg("logical decoding cannot be used while in recovery")));
+				 errmsg("logical decoding cannot be used while in recovery")));
 }
 
 /*
@@ -111,9 +114,11 @@ static LogicalDecodingContext *
 StartupDecodingContext(List *output_plugin_options,
 					   XLogRecPtr start_lsn,
 					   TransactionId xmin_horizon,
+					   bool need_full_snapshot,
 					   XLogPageReadCB read_page,
 					   LogicalOutputPluginWriterPrepareWrite prepare_write,
-					   LogicalOutputPluginWriterWrite do_write)
+					   LogicalOutputPluginWriterWrite do_write,
+					   LogicalOutputPluginWriterUpdateProgress update_progress)
 {
 	ReplicationSlot *slot;
 	MemoryContext context,
@@ -124,10 +129,8 @@ StartupDecodingContext(List *output_plugin_options,
 	slot = MyReplicationSlot;
 
 	context = AllocSetContextCreate(CurrentMemoryContext,
-									"Logical Decoding Context",
-									ALLOCSET_DEFAULT_MINSIZE,
-									ALLOCSET_DEFAULT_INITSIZE,
-									ALLOCSET_DEFAULT_MAXSIZE);
+									"Logical decoding context",
+									ALLOCSET_DEFAULT_SIZES);
 	old_context = MemoryContextSwitchTo(context);
 	ctx = palloc0(sizeof(LogicalDecodingContext));
 
@@ -170,7 +173,8 @@ StartupDecodingContext(List *output_plugin_options,
 
 	ctx->reorder = ReorderBufferAllocate();
 	ctx->snapshot_builder =
-		AllocateSnapshotBuilder(ctx->reorder, xmin_horizon, start_lsn);
+		AllocateSnapshotBuilder(ctx->reorder, xmin_horizon, start_lsn,
+								need_full_snapshot);
 
 	ctx->reorder->private_data = ctx;
 
@@ -178,10 +182,12 @@ StartupDecodingContext(List *output_plugin_options,
 	ctx->reorder->begin = begin_cb_wrapper;
 	ctx->reorder->apply_change = change_cb_wrapper;
 	ctx->reorder->commit = commit_cb_wrapper;
+	ctx->reorder->message = message_cb_wrapper;
 
 	ctx->out = makeStringInfo();
 	ctx->prepare_write = prepare_write;
 	ctx->write = do_write;
+	ctx->update_progress = update_progress;
 
 	ctx->output_plugin_options = output_plugin_options;
 
@@ -195,8 +201,9 @@ StartupDecodingContext(List *output_plugin_options,
  *
  * plugin contains the name of the output plugin
  * output_plugin_options contains options passed to the output plugin
- * read_page, prepare_write, do_write are callbacks that have to be filled to
- *		perform the use-case dependent, actual, work.
+ * read_page, prepare_write, do_write, update_progress
+ *		callbacks that have to be filled to perform the use-case dependent,
+ *		actual, work.
  *
  * Needs to be called while in a memory context that's at least as long lived
  * as the decoding context because further memory contexts will be created
@@ -208,9 +215,11 @@ StartupDecodingContext(List *output_plugin_options,
 LogicalDecodingContext *
 CreateInitDecodingContext(char *plugin,
 						  List *output_plugin_options,
+						  bool need_full_snapshot,
 						  XLogPageReadCB read_page,
 						  LogicalOutputPluginWriterPrepareWrite prepare_write,
-						  LogicalOutputPluginWriterWrite do_write)
+						  LogicalOutputPluginWriterWrite do_write,
+						  LogicalOutputPluginWriterUpdateProgress update_progress)
 {
 	TransactionId xmin_horizon = InvalidTransactionId;
 	ReplicationSlot *slot;
@@ -231,13 +240,13 @@ CreateInitDecodingContext(char *plugin,
 	if (SlotIsPhysical(slot))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-		errmsg("cannot use physical replication slot for logical decoding")));
+				 errmsg("cannot use physical replication slot for logical decoding")));
 
 	if (slot->data.database != MyDatabaseId)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-		   errmsg("replication slot \"%s\" was not created in this database",
-				  NameStr(slot->data.name))));
+				 errmsg("replication slot \"%s\" was not created in this database",
+						NameStr(slot->data.name))));
 
 	if (IsTransactionState() &&
 		GetTopTransactionIdIfAny() != InvalidTransactionId)
@@ -265,28 +274,37 @@ CreateInitDecodingContext(char *plugin,
 	 * the slot machinery about the new limit. Once that's done the
 	 * ProcArrayLock can be released as the slot machinery now is
 	 * protecting against vacuum.
+	 *
+	 * Note that, temporarily, the data, not just the catalog, xmin has to be
+	 * reserved if a data snapshot is to be exported.  Otherwise the initial
+	 * data snapshot created here is not guaranteed to be valid. After that
+	 * the data xmin doesn't need to be managed anymore and the global xmin
+	 * should be recomputed. As we are fine with losing the pegged data xmin
+	 * after crash - no chance a snapshot would get exported anymore - we can
+	 * get away with just setting the slot's
+	 * effective_xmin. ReplicationSlotRelease will reset it again.
+	 *
 	 * ----
 	 */
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
-	slot->effective_catalog_xmin = GetOldestSafeDecodingTransactionId();
-	slot->data.catalog_xmin = slot->effective_catalog_xmin;
+	xmin_horizon = GetOldestSafeDecodingTransactionId(!need_full_snapshot);
+
+	slot->effective_catalog_xmin = xmin_horizon;
+	slot->data.catalog_xmin = xmin_horizon;
+	if (need_full_snapshot)
+		slot->effective_xmin = xmin_horizon;
 
 	ReplicationSlotsComputeRequiredXmin(true);
 
 	LWLockRelease(ProcArrayLock);
 
-	/*
-	 * tell the snapshot builder to only assemble snapshot once reaching the a
-	 * running_xact's record with the respective xmin.
-	 */
-	xmin_horizon = slot->data.catalog_xmin;
-
 	ReplicationSlotMarkDirty();
 	ReplicationSlotSave();
 
 	ctx = StartupDecodingContext(NIL, InvalidXLogRecPtr, xmin_horizon,
-								 read_page, prepare_write, do_write);
+								 need_full_snapshot, read_page, prepare_write,
+								 do_write, update_progress);
 
 	/* call output plugin initialization callback */
 	old_context = MemoryContextSwitchTo(ctx->context);
@@ -301,10 +319,18 @@ CreateInitDecodingContext(char *plugin,
  * Create a new decoding context, for a logical slot that has previously been
  * used already.
  *
- * start_lsn contains the LSN of the last received data or InvalidXLogRecPtr
- * output_plugin_options contains options passed to the output plugin
- * read_page, prepare_write, do_write are callbacks that have to be filled to
- *		perform the use-case dependent, actual, work.
+ * start_lsn
+ *		The LSN at which to start decoding.  If InvalidXLogRecPtr, restart
+ *		from the slot's confirmed_flush; otherwise, start from the specified
+ *		location (but move it forwards to confirmed_flush if it's older than
+ *		that, see below).
+ *
+ * output_plugin_options
+ *		contains options passed to the output plugin.
+ *
+ * read_page, prepare_write, do_write, update_progress
+ *		callbacks that have to be filled to perform the use-case dependent,
+ *		actual work.
  *
  * Needs to be called while in a memory context that's at least as long lived
  * as the decoding context because further memory contexts will be created
@@ -318,7 +344,8 @@ CreateDecodingContext(XLogRecPtr start_lsn,
 					  List *output_plugin_options,
 					  XLogPageReadCB read_page,
 					  LogicalOutputPluginWriterPrepareWrite prepare_write,
-					  LogicalOutputPluginWriterWrite do_write)
+					  LogicalOutputPluginWriterWrite do_write,
+					  LogicalOutputPluginWriterUpdateProgress update_progress)
 {
 	LogicalDecodingContext *ctx;
 	ReplicationSlot *slot;
@@ -340,8 +367,8 @@ CreateDecodingContext(XLogRecPtr start_lsn,
 	if (slot->data.database != MyDatabaseId)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-		  (errmsg("replication slot \"%s\" was not created in this database",
-				  NameStr(slot->data.name)))));
+				 (errmsg("replication slot \"%s\" was not created in this database",
+						 NameStr(slot->data.name)))));
 
 	if (start_lsn == InvalidXLogRecPtr)
 	{
@@ -367,8 +394,9 @@ CreateDecodingContext(XLogRecPtr start_lsn,
 	}
 
 	ctx = StartupDecodingContext(output_plugin_options,
-								 start_lsn, InvalidTransactionId,
-								 read_page, prepare_write, do_write);
+								 start_lsn, InvalidTransactionId, false,
+								 read_page, prepare_write, do_write,
+								 update_progress);
 
 	/* call output plugin initialization callback */
 	old_context = MemoryContextSwitchTo(ctx->context);
@@ -423,7 +451,7 @@ DecodingContextFindStartpoint(LogicalDecodingContext *ctx)
 		if (err)
 			elog(ERROR, "%s", err);
 		if (!record)
-			elog(ERROR, "no record found");		/* shouldn't happen */
+			elog(ERROR, "no record found"); /* shouldn't happen */
 
 		startptr = InvalidXLogRecPtr;
 
@@ -479,6 +507,18 @@ OutputPluginWrite(struct LogicalDecodingContext *ctx, bool last_write)
 
 	ctx->write(ctx, ctx->write_location, ctx->write_xid, last_write);
 	ctx->prepared_write = false;
+}
+
+/*
+ * Update progress tracking (if supported).
+ */
+void
+OutputPluginUpdateProgress(struct LogicalDecodingContext *ctx)
+{
+	if (!ctx->update_progress)
+		return;
+
+	ctx->update_progress(ctx, ctx->write_location, ctx->write_xid);
 }
 
 /*
@@ -621,7 +661,7 @@ commit_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 	/* Push callback + info on the error context stack */
 	state.ctx = ctx;
 	state.callback_name = "commit";
-	state.report_location = txn->final_lsn;		/* beginning of commit record */
+	state.report_location = txn->final_lsn; /* beginning of commit record */
 	errcallback.callback = output_plugin_error_callback;
 	errcallback.arg = (void *) &state;
 	errcallback.previous = error_context_stack;
@@ -702,12 +742,46 @@ filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id)
 	return ret;
 }
 
+static void
+message_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
+				   XLogRecPtr message_lsn, bool transactional,
+				   const char *prefix, Size message_size, const char *message)
+{
+	LogicalDecodingContext *ctx = cache->private_data;
+	LogicalErrorCallbackState state;
+	ErrorContextCallback errcallback;
+
+	if (ctx->callbacks.message_cb == NULL)
+		return;
+
+	/* Push callback + info on the error context stack */
+	state.ctx = ctx;
+	state.callback_name = "message";
+	state.report_location = message_lsn;
+	errcallback.callback = output_plugin_error_callback;
+	errcallback.arg = (void *) &state;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	/* set output state */
+	ctx->accept_writes = true;
+	ctx->write_xid = txn != NULL ? txn->xid : InvalidTransactionId;
+	ctx->write_location = message_lsn;
+
+	/* do the actual work: call callback */
+	ctx->callbacks.message_cb(ctx, txn, message_lsn, transactional, prefix,
+							  message_size, message);
+
+	/* Pop the error context stack */
+	error_context_stack = errcallback.previous;
+}
+
 /*
  * Set the required catalog xmin horizon for historic snapshots in the current
  * replication slot.
  *
  * Note that in the most cases, we won't be able to immediately use the xmin
- * to increase the xmin horizon, we need to wait till the client has confirmed
+ * to increase the xmin horizon: we need to wait till the client has confirmed
  * receiving current_lsn with LogicalConfirmReceivedLocation().
  */
 void
@@ -834,7 +908,7 @@ LogicalIncreaseRestartDecodingForSlot(XLogRecPtr current_lsn, XLogRecPtr restart
 }
 
 /*
- * Handle a consumer's conformation having received all changes up to lsn.
+ * Handle a consumer's confirmation having received all changes up to lsn.
  */
 void
 LogicalConfirmReceivedLocation(XLogRecPtr lsn)
@@ -852,7 +926,7 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 
 		MyReplicationSlot->data.confirmed_flush = lsn;
 
-		/* if were past the location required for bumping xmin, do so */
+		/* if we're past the location required for bumping xmin, do so */
 		if (MyReplicationSlot->candidate_xmin_lsn != InvalidXLogRecPtr &&
 			MyReplicationSlot->candidate_xmin_lsn <= lsn)
 		{
@@ -888,7 +962,7 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 
 		SpinLockRelease(&MyReplicationSlot->mutex);
 
-		/* first write new xmin to disk, so we know whats up after a crash */
+		/* first write new xmin to disk, so we know what's up after a crash */
 		if (updated_xmin || updated_restart)
 		{
 			ReplicationSlotMarkDirty();

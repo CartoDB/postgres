@@ -9,7 +9,7 @@
  * proper FooMain() routine for the incarnation.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,10 +26,15 @@
 #include <sys/param.h>
 #endif
 
+#if defined(_M_AMD64) && _MSC_VER == 1800
+#include <math.h>
+#include <versionhelpers.h>
+#endif
+
 #include "bootstrap/bootstrap.h"
 #include "common/username.h"
+#include "port/atomics.h"
 #include "postmaster/postmaster.h"
-#include "storage/barrier.h"
 #include "storage/s_lock.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
@@ -164,7 +169,7 @@ main(int argc, char *argv[])
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("postgres (PostgreSQL) " PG_VERSION);
+			fputs(PG_BACKEND_VERSIONSTR, stdout);
 			exit(0);
 		}
 
@@ -174,7 +179,7 @@ main(int argc, char *argv[])
 		 * read-only activities.  The -C case is important because pg_ctl may
 		 * try to invoke it while still holding administrator privileges on
 		 * Windows.  Note that while -C can normally be in any argv position,
-		 * if you wanna bypass the root check you gotta put it first.  This
+		 * if you want to bypass the root check you must put it first.  This
 		 * reduces the risk that we might misinterpret some other mode's -C
 		 * switch as being the postmaster/postgres one.
 		 */
@@ -212,7 +217,7 @@ main(int argc, char *argv[])
 #endif
 
 	if (argc > 1 && strcmp(argv[1], "--boot") == 0)
-		AuxiliaryProcessMain(argc, argv);		/* does not return */
+		AuxiliaryProcessMain(argc, argv);	/* does not return */
 	else if (argc > 1 && strcmp(argv[1], "--describe-config") == 0)
 		GucInfoMain();			/* does not return */
 	else if (argc > 1 && strcmp(argv[1], "--single") == 0)
@@ -220,7 +225,7 @@ main(int argc, char *argv[])
 					 NULL,		/* no dbname */
 					 strdup(get_user_name_or_exit(progname)));	/* does not return */
 	else
-		PostmasterMain(argc, argv);		/* does not return */
+		PostmasterMain(argc, argv); /* does not return */
 	abort();					/* should not get here */
 }
 
@@ -263,8 +268,25 @@ startup_hacks(const char *progname)
 
 		/* In case of general protection fault, don't show GUI popup box */
 		SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+
+#if defined(_M_AMD64) && _MSC_VER == 1800
+
+		/*----------
+		 * Avoid crashing in certain floating-point operations if we were
+		 * compiled for x64 with MS Visual Studio 2013 and are running on
+		 * Windows prior to 7/2008R2 SP1 on an AVX2-capable CPU.
+		 *
+		 * Ref: https://connect.microsoft.com/VisualStudio/feedback/details/811093/visual-studio-2013-rtm-c-x64-code-generation-bug-for-avx2-instructions
+		 *----------
+		 */
+		if (!IsWindows7SP1OrGreater())
+		{
+			_set_FMA3_enable(0);
+		}
+#endif							/* defined(_M_AMD64) && _MSC_VER == 1800 */
+
 	}
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 
 	/*
 	 * Initialize dummy_spinlock, in case we are on a platform where we have
@@ -353,7 +375,7 @@ help(const char *progname)
 	printf(_("  -x NUM             internal use\n"));
 
 	printf(_("\nPlease read the documentation for the complete list of run-time\n"
-	 "configuration settings and how to set them on the command line or in\n"
+			 "configuration settings and how to set them on the command line or in\n"
 			 "the configuration file.\n\n"
 			 "Report bugs to <pgsql-bugs@postgresql.org>.\n"));
 }
@@ -368,8 +390,8 @@ check_root(const char *progname)
 	{
 		write_stderr("\"root\" execution of the PostgreSQL server is not permitted.\n"
 					 "The server must be started under an unprivileged user ID to prevent\n"
-		  "possible system security compromise.  See the documentation for\n"
-				  "more information on how to properly start the server.\n");
+					 "possible system security compromise.  See the documentation for\n"
+					 "more information on how to properly start the server.\n");
 		exit(1);
 	}
 
@@ -393,9 +415,9 @@ check_root(const char *progname)
 		write_stderr("Execution of PostgreSQL by a user with administrative permissions is not\n"
 					 "permitted.\n"
 					 "The server must be started under an unprivileged user ID to prevent\n"
-		 "possible system security compromises.  See the documentation for\n"
-				  "more information on how to properly start the server.\n");
+					 "possible system security compromises.  See the documentation for\n"
+					 "more information on how to properly start the server.\n");
 		exit(1);
 	}
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 }

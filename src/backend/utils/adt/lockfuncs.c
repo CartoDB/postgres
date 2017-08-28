@@ -3,7 +3,7 @@
  * lockfuncs.c
  *		Functions for SQL access to various lock-manager capabilities.
  *
- * Copyright (c) 2002-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2017, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/backend/utils/adt/lockfuncs.c
@@ -18,11 +18,12 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/predicate_internals.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 
 
 /* This must match enum LockTagType! */
-static const char *const LockTagTypeNames[] = {
+const char *const LockTagTypeNames[] = {
 	"relation",
 	"extend",
 	"page",
@@ -99,7 +100,7 @@ pg_lock_status(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* build tupdesc for result tuples */
-		/* this had better match pg_locks view in system_views.sql */
+		/* this had better match function's declaration in pg_proc.h */
 		tupdesc = CreateTemplateTupleDesc(NUM_LOCK_STATUS_COLUMNS, false);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "locktype",
 						   TEXTOID, -1, 0);
@@ -395,6 +396,247 @@ pg_lock_status(PG_FUNCTION_ARGS)
 
 
 /*
+ * pg_blocking_pids - produce an array of the PIDs blocking given PID
+ *
+ * The reported PIDs are those that hold a lock conflicting with blocked_pid's
+ * current request (hard block), or are requesting such a lock and are ahead
+ * of blocked_pid in the lock's wait queue (soft block).
+ *
+ * In parallel-query cases, we report all PIDs blocking any member of the
+ * given PID's lock group, and the reported PIDs are those of the blocking
+ * PIDs' lock group leaders.  This allows callers to compare the result to
+ * lists of clients' pg_backend_pid() results even during a parallel query.
+ *
+ * Parallel query makes it possible for there to be duplicate PIDs in the
+ * result (either because multiple waiters are blocked by same PID, or
+ * because multiple blockers have same group leader PID).  We do not bother
+ * to eliminate such duplicates from the result.
+ *
+ * We need not consider predicate locks here, since those don't block anything.
+ */
+Datum
+pg_blocking_pids(PG_FUNCTION_ARGS)
+{
+	int			blocked_pid = PG_GETARG_INT32(0);
+	Datum	   *arrayelems;
+	int			narrayelems;
+	BlockedProcsData *lockData; /* state data from lmgr */
+	int			i,
+				j;
+
+	/* Collect a snapshot of lock manager state */
+	lockData = GetBlockerStatusData(blocked_pid);
+
+	/* We can't need more output entries than there are reported PROCLOCKs */
+	arrayelems = (Datum *) palloc(lockData->nlocks * sizeof(Datum));
+	narrayelems = 0;
+
+	/* For each blocked proc in the lock group ... */
+	for (i = 0; i < lockData->nprocs; i++)
+	{
+		BlockedProcData *bproc = &lockData->procs[i];
+		LockInstanceData *instances = &lockData->locks[bproc->first_lock];
+		int		   *preceding_waiters = &lockData->waiter_pids[bproc->first_waiter];
+		LockInstanceData *blocked_instance;
+		LockMethod	lockMethodTable;
+		int			conflictMask;
+
+		/*
+		 * Locate the blocked proc's own entry in the LockInstanceData array.
+		 * There should be exactly one matching entry.
+		 */
+		blocked_instance = NULL;
+		for (j = 0; j < bproc->num_locks; j++)
+		{
+			LockInstanceData *instance = &(instances[j]);
+
+			if (instance->pid == bproc->pid)
+			{
+				Assert(blocked_instance == NULL);
+				blocked_instance = instance;
+			}
+		}
+		Assert(blocked_instance != NULL);
+
+		lockMethodTable = GetLockTagsMethodTable(&(blocked_instance->locktag));
+		conflictMask = lockMethodTable->conflictTab[blocked_instance->waitLockMode];
+
+		/* Now scan the PROCLOCK data for conflicting procs */
+		for (j = 0; j < bproc->num_locks; j++)
+		{
+			LockInstanceData *instance = &(instances[j]);
+
+			/* A proc never blocks itself, so ignore that entry */
+			if (instance == blocked_instance)
+				continue;
+			/* Members of same lock group never block each other, either */
+			if (instance->leaderPid == blocked_instance->leaderPid)
+				continue;
+
+			if (conflictMask & instance->holdMask)
+			{
+				/* hard block: blocked by lock already held by this entry */
+			}
+			else if (instance->waitLockMode != NoLock &&
+					 (conflictMask & LOCKBIT_ON(instance->waitLockMode)))
+			{
+				/* conflict in lock requests; who's in front in wait queue? */
+				bool		ahead = false;
+				int			k;
+
+				for (k = 0; k < bproc->num_waiters; k++)
+				{
+					if (preceding_waiters[k] == instance->pid)
+					{
+						/* soft block: this entry is ahead of blocked proc */
+						ahead = true;
+						break;
+					}
+				}
+				if (!ahead)
+					continue;	/* not blocked by this entry */
+			}
+			else
+			{
+				/* not blocked by this entry */
+				continue;
+			}
+
+			/* blocked by this entry, so emit a record */
+			arrayelems[narrayelems++] = Int32GetDatum(instance->leaderPid);
+		}
+	}
+
+	/* Assert we didn't overrun arrayelems[] */
+	Assert(narrayelems <= lockData->nlocks);
+
+	/* Construct array, using hardwired knowledge about int4 type */
+	PG_RETURN_ARRAYTYPE_P(construct_array(arrayelems, narrayelems,
+										  INT4OID,
+										  sizeof(int32), true, 'i'));
+}
+
+
+/*
+ * pg_safe_snapshot_blocking_pids - produce an array of the PIDs blocking
+ * given PID from getting a safe snapshot
+ *
+ * XXX this does not consider parallel-query cases; not clear how big a
+ * problem that is in practice
+ */
+Datum
+pg_safe_snapshot_blocking_pids(PG_FUNCTION_ARGS)
+{
+	int			blocked_pid = PG_GETARG_INT32(0);
+	int		   *blockers;
+	int			num_blockers;
+	Datum	   *blocker_datums;
+
+	/* A buffer big enough for any possible blocker list without truncation */
+	blockers = (int *) palloc(MaxBackends * sizeof(int));
+
+	/* Collect a snapshot of processes waited for by GetSafeSnapshot */
+	num_blockers =
+		GetSafeSnapshotBlockingPids(blocked_pid, blockers, MaxBackends);
+
+	/* Convert int array to Datum array */
+	if (num_blockers > 0)
+	{
+		int			i;
+
+		blocker_datums = (Datum *) palloc(num_blockers * sizeof(Datum));
+		for (i = 0; i < num_blockers; ++i)
+			blocker_datums[i] = Int32GetDatum(blockers[i]);
+	}
+	else
+		blocker_datums = NULL;
+
+	/* Construct array, using hardwired knowledge about int4 type */
+	PG_RETURN_ARRAYTYPE_P(construct_array(blocker_datums, num_blockers,
+										  INT4OID,
+										  sizeof(int32), true, 'i'));
+}
+
+
+/*
+ * pg_isolation_test_session_is_blocked - support function for isolationtester
+ *
+ * Check if specified PID is blocked by any of the PIDs listed in the second
+ * argument.  Currently, this looks for blocking caused by waiting for
+ * heavyweight locks or safe snapshots.  We ignore blockage caused by PIDs
+ * not directly under the isolationtester's control, eg autovacuum.
+ *
+ * This is an undocumented function intended for use by the isolation tester,
+ * and may change in future releases as required for testing purposes.
+ */
+Datum
+pg_isolation_test_session_is_blocked(PG_FUNCTION_ARGS)
+{
+	int			blocked_pid = PG_GETARG_INT32(0);
+	ArrayType  *interesting_pids_a = PG_GETARG_ARRAYTYPE_P(1);
+	ArrayType  *blocking_pids_a;
+	int32	   *interesting_pids;
+	int32	   *blocking_pids;
+	int			num_interesting_pids;
+	int			num_blocking_pids;
+	int			dummy;
+	int			i,
+				j;
+
+	/* Validate the passed-in array */
+	Assert(ARR_ELEMTYPE(interesting_pids_a) == INT4OID);
+	if (array_contains_nulls(interesting_pids_a))
+		elog(ERROR, "array must not contain nulls");
+	interesting_pids = (int32 *) ARR_DATA_PTR(interesting_pids_a);
+	num_interesting_pids = ArrayGetNItems(ARR_NDIM(interesting_pids_a),
+										  ARR_DIMS(interesting_pids_a));
+
+	/*
+	 * Get the PIDs of all sessions blocking the given session's attempt to
+	 * acquire heavyweight locks.
+	 */
+	blocking_pids_a =
+		DatumGetArrayTypeP(DirectFunctionCall1(pg_blocking_pids, blocked_pid));
+
+	Assert(ARR_ELEMTYPE(blocking_pids_a) == INT4OID);
+	Assert(!array_contains_nulls(blocking_pids_a));
+	blocking_pids = (int32 *) ARR_DATA_PTR(blocking_pids_a);
+	num_blocking_pids = ArrayGetNItems(ARR_NDIM(blocking_pids_a),
+									   ARR_DIMS(blocking_pids_a));
+
+	/*
+	 * Check if any of these are in the list of interesting PIDs, that being
+	 * the sessions that the isolation tester is running.  We don't use
+	 * "arrayoverlaps" here, because it would lead to cache lookups and one of
+	 * our goals is to run quickly under CLOBBER_CACHE_ALWAYS.  We expect
+	 * blocking_pids to be usually empty and otherwise a very small number in
+	 * isolation tester cases, so make that the outer loop of a naive search
+	 * for a match.
+	 */
+	for (i = 0; i < num_blocking_pids; i++)
+		for (j = 0; j < num_interesting_pids; j++)
+		{
+			if (blocking_pids[i] == interesting_pids[j])
+				PG_RETURN_BOOL(true);
+		}
+
+	/*
+	 * Check if blocked_pid is waiting for a safe snapshot.  We could in
+	 * theory check the resulting array of blocker PIDs against the
+	 * interesting PIDs whitelist, but since there is no danger of autovacuum
+	 * blocking GetSafeSnapshot there seems to be no point in expending cycles
+	 * on allocating a buffer and searching for overlap; so it's presently
+	 * sufficient for the isolation tester's purposes to use a single element
+	 * buffer and check if the number of safe snapshot blockers is non-zero.
+	 */
+	if (GetSafeSnapshotBlockingPids(blocked_pid, &dummy, 1) > 0)
+		PG_RETURN_BOOL(true);
+
+	PG_RETURN_BOOL(false);
+}
+
+
+/*
  * Functions for manipulating advisory locks
  *
  * We make use of the locktag fields as follows:
@@ -419,7 +661,7 @@ PreventAdvisoryLocksInParallelMode(void)
 	if (IsInParallelMode())
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-		   errmsg("cannot use advisory locks during a parallel operation")));
+				 errmsg("cannot use advisory locks during a parallel operation")));
 }
 
 /*

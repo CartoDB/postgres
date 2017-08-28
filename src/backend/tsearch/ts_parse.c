@@ -3,7 +3,7 @@
  * ts_parse.c
  *		main parse functions for tsearch
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -179,7 +179,7 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 	if (ld->curDictId == InvalidOid)
 	{
 		/*
-		 * usial mode: dictionary wants only one word, but we should keep in
+		 * usual mode: dictionary wants only one word, but we should keep in
 		 * mind that we should go through all stack
 		 */
 
@@ -205,11 +205,11 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 				ld->dictState.isend = ld->dictState.getnext = false;
 				ld->dictState.private_state = NULL;
 				res = (TSLexeme *) DatumGetPointer(FunctionCall4(
-															 &(dict->lexize),
-											 PointerGetDatum(dict->dictData),
-												 PointerGetDatum(curValLemm),
-												Int32GetDatum(curValLenLemm),
-											  PointerGetDatum(&ld->dictState)
+																 &(dict->lexize),
+																 PointerGetDatum(dict->dictData),
+																 PointerGetDatum(curValLemm),
+																 Int32GetDatum(curValLenLemm),
+																 PointerGetDatum(&ld->dictState)
 																 ));
 
 				if (ld->dictState.getnext)
@@ -272,7 +272,7 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 
 				/*
 				 * We should be sure that current type of lexeme is recognized
-				 * by our dictinonary: we just check is it exist in list of
+				 * by our dictionary: we just check is it exist in list of
 				 * dictionaries ?
 				 */
 				for (i = 0; i < map->len && !dictExists; i++)
@@ -295,10 +295,10 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 
 			res = (TSLexeme *) DatumGetPointer(FunctionCall4(
 															 &(dict->lexize),
-											 PointerGetDatum(dict->dictData),
-											   PointerGetDatum(curVal->lemm),
-											  Int32GetDatum(curVal->lenlemm),
-											  PointerGetDatum(&ld->dictState)
+															 PointerGetDatum(dict->dictData),
+															 PointerGetDatum(curVal->lemm),
+															 Int32GetDatum(curVal->lenlemm),
+															 PointerGetDatum(&ld->dictState)
 															 ));
 
 			if (ld->dictState.getnext)
@@ -454,7 +454,7 @@ hladdword(HeadlineParsedText *prs, char *buf, int buflen, int type)
 }
 
 static void
-hlfinditem(HeadlineParsedText *prs, TSQuery query, char *buf, int buflen)
+hlfinditem(HeadlineParsedText *prs, TSQuery query, int32 pos, char *buf, int buflen)
 {
 	int			i;
 	QueryItem  *item = GETQUERY(query);
@@ -467,6 +467,7 @@ hlfinditem(HeadlineParsedText *prs, TSQuery query, char *buf, int buflen)
 	}
 
 	word = &(prs->words[prs->curwords - 1]);
+	word->pos = LIMITPOS(pos);
 	for (i = 0; i < query->size; i++)
 	{
 		if (item->type == QI_VAL &&
@@ -492,17 +493,20 @@ addHLParsedLex(HeadlineParsedText *prs, TSQuery query, ParsedLex *lexs, TSLexeme
 {
 	ParsedLex  *tmplexs;
 	TSLexeme   *ptr;
+	int32		savedpos;
 
 	while (lexs)
 	{
-
 		if (lexs->type > 0)
 			hladdword(prs, lexs->lemm, lexs->lenlemm, lexs->type);
 
 		ptr = norms;
+		savedpos = prs->vectorpos;
 		while (ptr && ptr->lexeme)
 		{
-			hlfinditem(prs, query, ptr->lexeme, strlen(ptr->lexeme));
+			if (ptr->flags & TSL_ADDPOS)
+				savedpos++;
+			hlfinditem(prs, query, savedpos, ptr->lexeme, strlen(ptr->lexeme));
 			ptr++;
 		}
 
@@ -516,6 +520,8 @@ addHLParsedLex(HeadlineParsedText *prs, TSQuery query, ParsedLex *lexs, TSLexeme
 		ptr = norms;
 		while (ptr->lexeme)
 		{
+			if (ptr->flags & TSL_ADDPOS)
+				prs->vectorpos++;
 			pfree(ptr->lexeme);
 			ptr++;
 		}
@@ -575,7 +581,10 @@ hlparsetext(Oid cfgId, HeadlineParsedText *prs, TSQuery query, char *buf, int bu
 		do
 		{
 			if ((norms = LexizeExec(&ldata, &lexs)) != NULL)
+			{
+				prs->vectorpos++;
 				addHLParsedLex(prs, query, lexs, norms);
+			}
 			else
 				addHLParsedLex(prs, query, lexs, NULL);
 		} while (norms);
@@ -618,7 +627,7 @@ generateHeadline(HeadlineParsedText *prs)
 				/* start of a new fragment */
 				infrag = 1;
 				numfragments++;
-				/* add a fragment delimitor if this is after the first one */
+				/* add a fragment delimiter if this is after the first one */
 				if (numfragments > 1)
 				{
 					memcpy(ptr, prs->fragdelim, prs->fragdelimlen);

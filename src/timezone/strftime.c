@@ -1,18 +1,38 @@
+/* Convert a broken-down timestamp to a string. */
+
 /*
- * Copyright (c) 1989 The Regents of the University of California.
+ * Copyright 1989 The Regents of the University of California.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms are permitted
- * provided that the above copyright notice and this paragraph are
- * duplicated in all such forms and that any documentation,
- * advertising materials, and other materials related to such
- * distribution and use acknowledge that the software was developed
- * by the University of California, Berkeley. The name of the
- * University may not be used to endorse or promote products derived
- * from this software without specific prior written permission.
- * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *	  notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *	  notice, this list of conditions and the following disclaimer in the
+ *	  documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the University nor the names of its contributors
+ *	  may be used to endorse or promote products derived from this software
+ *	  without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+/*
+ * Based on the UCB version with the copyright notice appearing above.
+ *
+ * This is ANSIish only when "multibyte character == plain character".
  *
  * IDENTIFICATION
  *	  src/timezone/strftime.c
@@ -21,10 +41,8 @@
 #include "postgres.h"
 
 #include <fcntl.h>
-#include <locale.h>
 
 #include "private.h"
-#include "tzfile.h"
 
 
 struct lc_time_T
@@ -92,8 +110,7 @@ static char *_add(const char *, char *, const char *);
 static char *_conv(int, const char *, char *, const char *);
 static char *_fmt(const char *, const struct pg_tm *, char *,
 	 const char *, int *);
-static char *_yconv(const int, const int, const int, const int,
-	   char *, const char *const);
+static char *_yconv(int, int, bool, bool, char *, const char *);
 
 #define IN_NONE 0
 #define IN_SOME 1
@@ -103,13 +120,13 @@ static char *_yconv(const int, const int, const int, const int,
 
 size_t
 pg_strftime(char *s, size_t maxsize, const char *format,
-			const struct pg_tm * t)
+			const struct pg_tm *t)
 {
 	char	   *p;
 	int			warn;
 
 	warn = IN_NONE;
-	p = _fmt(((format == NULL) ? "%c" : format), t, s, s + maxsize, &warn);
+	p = _fmt(format, t, s, s + maxsize, &warn);
 	if (p == s + maxsize)
 		return 0;
 	*p = '\0';
@@ -117,7 +134,7 @@ pg_strftime(char *s, size_t maxsize, const char *format,
 }
 
 static char *
-_fmt(const char *format, const struct pg_tm * t, char *pt, const char *ptlim,
+_fmt(const char *format, const struct pg_tm *t, char *pt, const char *ptlim,
 	 int *warnp)
 {
 	for (; *format; ++format)
@@ -162,8 +179,8 @@ _fmt(const char *format, const struct pg_tm * t, char *pt, const char *ptlim,
 					 * ...whereas now POSIX 1003.2 calls for something
 					 * completely different. (ado, 1993-05-24)
 					 */
-					pt = _yconv(t->tm_year, TM_YEAR_BASE, 1, 0,
-								pt, ptlim);
+					pt = _yconv(t->tm_year, TM_YEAR_BASE,
+								true, false, pt, ptlim);
 					continue;
 				case 'c':
 					{
@@ -224,11 +241,11 @@ _fmt(const char *format, const struct pg_tm * t, char *pt, const char *ptlim,
 				case 'K':
 
 					/*
-					 * * After all this time, still unclaimed!
+					 * After all this time, still unclaimed!
 					 */
 					pt = _add("kitchen sink", pt, ptlim);
 					continue;
-#endif   /* defined KITCHEN_SINK */
+#endif							/* defined KITCHEN_SINK */
 				case 'l':
 
 					/*
@@ -296,7 +313,7 @@ _fmt(const char *format, const struct pg_tm * t, char *pt, const char *ptlim,
  * (01-53)."
  * (ado, 1993-05-24)
  *
- * From "http://www.ft.uni-erlangen.de/~mskuhn/iso-time.html" by Markus Kuhn:
+ * From <http://www.ft.uni-erlangen.de/~mskuhn/iso-time.html> by Markus Kuhn:
  * "Week 01 of a year is per definition the first week which has the
  * Thursday in this year, which is equivalent to the week which contains
  * the fourth day of January. In other words, the first week of a new year
@@ -367,11 +384,13 @@ _fmt(const char *format, const struct pg_tm * t, char *pt, const char *ptlim,
 						else if (*format == 'g')
 						{
 							*warnp = IN_ALL;
-							pt = _yconv(year, base, 0, 1,
+							pt = _yconv(year, base,
+										false, true,
 										pt, ptlim);
 						}
 						else
-							pt = _yconv(year, base, 1, 1,
+							pt = _yconv(year, base,
+										true, true,
 										pt, ptlim);
 					}
 					continue;
@@ -409,11 +428,13 @@ _fmt(const char *format, const struct pg_tm * t, char *pt, const char *ptlim,
 					continue;
 				case 'y':
 					*warnp = IN_ALL;
-					pt = _yconv(t->tm_year, TM_YEAR_BASE, 0, 1,
+					pt = _yconv(t->tm_year, TM_YEAR_BASE,
+								false, true,
 								pt, ptlim);
 					continue;
 				case 'Y':
-					pt = _yconv(t->tm_year, TM_YEAR_BASE, 1, 1,
+					pt = _yconv(t->tm_year, TM_YEAR_BASE,
+								true, true,
 								pt, ptlim);
 					continue;
 				case 'Z':
@@ -427,13 +448,20 @@ _fmt(const char *format, const struct pg_tm * t, char *pt, const char *ptlim,
 					continue;
 				case 'z':
 					{
-						int			diff;
+						long		diff;
 						char const *sign;
+						bool		negative;
 
 						if (t->tm_isdst < 0)
 							continue;
 						diff = t->tm_gmtoff;
-						if (diff < 0)
+						negative = diff < 0;
+						if (diff == 0)
+						{
+							if (t->tm_zone != NULL)
+								negative = t->tm_zone[0] == '-';
+						}
+						if (negative)
 						{
 							sign = "-";
 							diff = -diff;
@@ -441,9 +469,10 @@ _fmt(const char *format, const struct pg_tm * t, char *pt, const char *ptlim,
 						else
 							sign = "+";
 						pt = _add(sign, pt, ptlim);
-						diff /= 60;
-						pt = _conv((diff / 60) * 100 + diff % 60,
-								   "%04d", pt, ptlim);
+						diff /= SECSPERMIN;
+						diff = (diff / MINSPERHOUR) * 100 +
+							(diff % MINSPERHOUR);
+						pt = _conv(diff, "%04d", pt, ptlim);
 					}
 					continue;
 				case '+':
@@ -473,7 +502,7 @@ _conv(int n, const char *format, char *pt, const char *ptlim)
 {
 	char		buf[INT_STRLEN_MAXIMUM(int) +1];
 
-	(void) sprintf(buf, format, n);
+	sprintf(buf, format, n);
 	return _add(buf, pt, ptlim);
 }
 
@@ -493,13 +522,13 @@ _add(const char *str, char *pt, const char *ptlim)
  * with more only if necessary.
  */
 static char *
-_yconv(const int a, const int b, const int convert_top,
-	   const int convert_yy, char *pt, const char *const ptlim)
+_yconv(int a, int b, bool convert_top, bool convert_yy,
+	   char *pt, const char *ptlim)
 {
 	int			lead;
 	int			trail;
 
-#define DIVISOR		  100
+#define DIVISOR 100
 	trail = a % DIVISOR + b % DIVISOR;
 	lead = a / DIVISOR + b / DIVISOR + trail / DIVISOR;
 	trail %= DIVISOR;

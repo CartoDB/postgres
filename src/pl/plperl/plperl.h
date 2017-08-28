@@ -5,7 +5,7 @@
  *
  * This should be included _AFTER_ postgres.h and system include files
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1995, Regents of the University of California
  *
  * src/pl/plperl/plperl.h
@@ -24,7 +24,7 @@
 #ifdef isnan
 #undef isnan
 #endif
-#endif
+#endif							/* WIN32 */
 
 /*
  * Supply a value of PERL_UNUSED_DECL that will satisfy gcc - the one
@@ -43,10 +43,22 @@
 #endif
 
 
-/* required for perl API */
+/*
+ * Get the basic Perl API.  We use PERL_NO_GET_CONTEXT mode so that our code
+ * can compile against MULTIPLICITY Perl builds without including XSUB.h.
+ */
+#define PERL_NO_GET_CONTEXT
 #include "EXTERN.h"
 #include "perl.h"
+
+/*
+ * We want to include XSUB.h only within .xs files, because on some platforms
+ * it undesirably redefines a lot of libc functions.  But it must appear
+ * before ppport.h, so use a #define flag to control inclusion here.
+ */
+#ifdef PG_NEED_PERL_XSUB_H
 #include "XSUB.h"
+#endif
 
 /* put back our snprintf and vsnprintf */
 #ifdef USE_REPL_SNPRINTF
@@ -62,8 +74,8 @@
 #else
 #define vsnprintf		pg_vsnprintf
 #define snprintf		pg_snprintf
-#endif   /* __GNUC__ */
-#endif   /* USE_REPL_SNPRINTF */
+#endif							/* __GNUC__ */
+#endif							/* USE_REPL_SNPRINTF */
 
 /* perl version and platform portability */
 #define NEED_eval_pv
@@ -88,6 +100,13 @@
 #define GvCV_set(gv, cv)		(GvCV(gv) = cv)
 #endif
 
+/* Perl 5.19.4 changed array indices from I32 to SSize_t */
+#if PERL_BCDVERSION >= 0x5019004
+#define AV_SIZE_MAX SSize_t_MAX
+#else
+#define AV_SIZE_MAX I32_MAX
+#endif
+
 /* declare routines from plperl.c for access by .xs files */
 HV		   *plperl_spi_exec(char *, int);
 void		plperl_return_next(SV *);
@@ -99,5 +118,6 @@ SV		   *plperl_spi_query_prepared(char *, int, SV **);
 void		plperl_spi_freeplan(char *);
 void		plperl_spi_cursor_close(char *);
 char	   *plperl_sv_to_literal(SV *, char *);
+void		plperl_util_elog(int level, SV *msg);
 
-#endif   /* PL_PERL_H */
+#endif							/* PL_PERL_H */

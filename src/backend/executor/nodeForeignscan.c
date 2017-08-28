@@ -3,7 +3,7 @@
  * nodeForeignscan.c
  *	  Routines to support scans of foreign tables
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -48,7 +48,10 @@ ForeignNext(ForeignScanState *node)
 
 	/* Call the Iterate function in short-lived context */
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
-	slot = node->fdwroutine->IterateForeignScan(node);
+	if (plan->operation != CMD_SELECT)
+		slot = node->fdwroutine->IterateDirectModify(node);
+	else
+		slot = node->fdwroutine->IterateForeignScan(node);
 	MemoryContextSwitchTo(oldcontext);
 
 	/*
@@ -98,7 +101,7 @@ ForeignRecheck(ForeignScanState *node, TupleTableSlot *slot)
 		!fdwroutine->RecheckForeignScan(node, slot))
 		return false;
 
-	return ExecQual(node->fdw_recheck_quals, econtext, false);
+	return ExecQual(node->fdw_recheck_quals, econtext);
 }
 
 /* ----------------------------------------------------------------
@@ -110,10 +113,12 @@ ForeignRecheck(ForeignScanState *node, TupleTableSlot *slot)
  *		access method functions.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *
-ExecForeignScan(ForeignScanState *node)
+static TupleTableSlot *
+ExecForeignScan(PlanState *pstate)
 {
-	return ExecScan((ScanState *) node,
+	ForeignScanState *node = castNode(ForeignScanState, pstate);
+
+	return ExecScan(&node->ss,
 					(ExecScanAccessMtd) ForeignNext,
 					(ExecScanRecheckMtd) ForeignRecheck);
 }
@@ -141,6 +146,7 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	scanstate = makeNode(ForeignScanState);
 	scanstate->ss.ps.plan = (Plan *) node;
 	scanstate->ss.ps.state = estate;
+	scanstate->ss.ps.ExecProcNode = ExecForeignScan;
 
 	/*
 	 * Miscellaneous initialization
@@ -149,20 +155,13 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	 */
 	ExecAssignExprContext(estate, &scanstate->ss.ps);
 
-	scanstate->ss.ps.ps_TupFromTlist = false;
-
 	/*
 	 * initialize child expressions
 	 */
-	scanstate->ss.ps.targetlist = (List *)
-		ExecInitExpr((Expr *) node->scan.plan.targetlist,
-					 (PlanState *) scanstate);
-	scanstate->ss.ps.qual = (List *)
-		ExecInitExpr((Expr *) node->scan.plan.qual,
-					 (PlanState *) scanstate);
-	scanstate->fdw_recheck_quals = (List *)
-		ExecInitExpr((Expr *) node->fdw_recheck_quals,
-					 (PlanState *) scanstate);
+	scanstate->ss.ps.qual =
+		ExecInitQual(node->scan.plan.qual, (PlanState *) scanstate);
+	scanstate->fdw_recheck_quals =
+		ExecInitQual(node->fdw_recheck_quals, (PlanState *) scanstate);
 
 	/*
 	 * tuple table initialization
@@ -226,7 +225,10 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	/*
 	 * Tell the FDW to initialize the scan.
 	 */
-	fdwroutine->BeginForeignScan(scanstate, eflags);
+	if (node->operation != CMD_SELECT)
+		fdwroutine->BeginDirectModify(scanstate, eflags);
+	else
+		fdwroutine->BeginForeignScan(scanstate, eflags);
 
 	return scanstate;
 }
@@ -240,8 +242,13 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 void
 ExecEndForeignScan(ForeignScanState *node)
 {
+	ForeignScan *plan = (ForeignScan *) node->ss.ps.plan;
+
 	/* Let the FDW shut down */
-	node->fdwroutine->EndForeignScan(node);
+	if (plan->operation != CMD_SELECT)
+		node->fdwroutine->EndDirectModify(node);
+	else
+		node->fdwroutine->EndForeignScan(node);
 
 	/* Shut down any outer plan. */
 	if (outerPlanState(node))
@@ -274,11 +281,89 @@ ExecReScanForeignScan(ForeignScanState *node)
 
 	/*
 	 * If chgParam of subnode is not null then plan will be re-scanned by
-	 * first ExecProcNode.  outerPlan may also be NULL, in which case there
-	 * is nothing to rescan at all.
+	 * first ExecProcNode.  outerPlan may also be NULL, in which case there is
+	 * nothing to rescan at all.
 	 */
 	if (outerPlan != NULL && outerPlan->chgParam == NULL)
 		ExecReScan(outerPlan);
 
 	ExecScanReScan(&node->ss);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecForeignScanEstimate
+ *
+ *		Informs size of the parallel coordination information, if any
+ * ----------------------------------------------------------------
+ */
+void
+ExecForeignScanEstimate(ForeignScanState *node, ParallelContext *pcxt)
+{
+	FdwRoutine *fdwroutine = node->fdwroutine;
+
+	if (fdwroutine->EstimateDSMForeignScan)
+	{
+		node->pscan_len = fdwroutine->EstimateDSMForeignScan(node, pcxt);
+		shm_toc_estimate_chunk(&pcxt->estimator, node->pscan_len);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+	}
+}
+
+/* ----------------------------------------------------------------
+ *		ExecForeignScanInitializeDSM
+ *
+ *		Initialize the parallel coordination information
+ * ----------------------------------------------------------------
+ */
+void
+ExecForeignScanInitializeDSM(ForeignScanState *node, ParallelContext *pcxt)
+{
+	FdwRoutine *fdwroutine = node->fdwroutine;
+
+	if (fdwroutine->InitializeDSMForeignScan)
+	{
+		int			plan_node_id = node->ss.ps.plan->plan_node_id;
+		void	   *coordinate;
+
+		coordinate = shm_toc_allocate(pcxt->toc, node->pscan_len);
+		fdwroutine->InitializeDSMForeignScan(node, pcxt, coordinate);
+		shm_toc_insert(pcxt->toc, plan_node_id, coordinate);
+	}
+}
+
+/* ----------------------------------------------------------------
+ *		ExecForeignScanInitializeDSM
+ *
+ *		Initialization according to the parallel coordination information
+ * ----------------------------------------------------------------
+ */
+void
+ExecForeignScanInitializeWorker(ForeignScanState *node, shm_toc *toc)
+{
+	FdwRoutine *fdwroutine = node->fdwroutine;
+
+	if (fdwroutine->InitializeWorkerForeignScan)
+	{
+		int			plan_node_id = node->ss.ps.plan->plan_node_id;
+		void	   *coordinate;
+
+		coordinate = shm_toc_lookup(toc, plan_node_id, false);
+		fdwroutine->InitializeWorkerForeignScan(node, toc, coordinate);
+	}
+}
+
+/* ----------------------------------------------------------------
+ *		ExecShutdownForeignScan
+ *
+ *		Gives FDW chance to stop asynchronous resource consumption
+ *		and release any resources still held.
+ * ----------------------------------------------------------------
+ */
+void
+ExecShutdownForeignScan(ForeignScanState *node)
+{
+	FdwRoutine *fdwroutine = node->fdwroutine;
+
+	if (fdwroutine->ShutdownForeignScan)
+		fdwroutine->ShutdownForeignScan(node);
 }

@@ -4,7 +4,7 @@
  *	  POSTGRES heap tuple header definitions.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/htup_details.h
@@ -165,7 +165,7 @@ struct HeapTupleHeaderData
 	/* MORE DATA FOLLOWS AT END OF STRUCT */
 };
 
-/* typedef appears in tupbasics.h */
+/* typedef appears in htup.h */
 
 #define SizeofHeapTupleHeader offsetof(HeapTupleHeaderData, t_bits)
 
@@ -216,6 +216,31 @@ struct HeapTupleHeaderData
 #define HEAP_XMAX_IS_LOCKED_ONLY(infomask) \
 	(((infomask) & HEAP_XMAX_LOCK_ONLY) || \
 	 (((infomask) & (HEAP_XMAX_IS_MULTI | HEAP_LOCK_MASK)) == HEAP_XMAX_EXCL_LOCK))
+
+/*
+ * A tuple that has HEAP_XMAX_IS_MULTI and HEAP_XMAX_LOCK_ONLY but neither of
+ * XMAX_EXCL_LOCK and XMAX_KEYSHR_LOCK must come from a tuple that was
+ * share-locked in 9.2 or earlier and then pg_upgrade'd.
+ *
+ * In 9.2 and prior, HEAP_XMAX_IS_MULTI was only set when there were multiple
+ * FOR SHARE lockers of that tuple.  That set HEAP_XMAX_LOCK_ONLY (with a
+ * different name back then) but neither of HEAP_XMAX_EXCL_LOCK and
+ * HEAP_XMAX_KEYSHR_LOCK.  That combination is no longer possible in 9.3 and
+ * up, so if we see that combination we know for certain that the tuple was
+ * locked in an earlier release; since all such lockers are gone (they cannot
+ * survive through pg_upgrade), such tuples can safely be considered not
+ * locked.
+ *
+ * We must not resolve such multixacts locally, because the result would be
+ * bogus, regardless of where they stand with respect to the current valid
+ * multixact range.
+ */
+#define HEAP_LOCKED_UPGRADED(infomask) \
+( \
+	 ((infomask) & HEAP_XMAX_IS_MULTI) != 0 && \
+	 ((infomask) & HEAP_XMAX_LOCK_ONLY) != 0 && \
+	 (((infomask) & (HEAP_XMAX_EXCL_LOCK | HEAP_XMAX_KEYSHR_LOCK)) == 0) \
+)
 
 /*
  * Use these to test whether a particular lock is applied to a tuple
@@ -292,7 +317,7 @@ struct HeapTupleHeaderData
 
 #define HeapTupleHeaderXminCommitted(tup) \
 ( \
-	(tup)->t_infomask & HEAP_XMIN_COMMITTED \
+	((tup)->t_infomask & HEAP_XMIN_COMMITTED) != 0 \
 )
 
 #define HeapTupleHeaderXminInvalid(tup) \
@@ -397,7 +422,7 @@ do { \
 
 #define HeapTupleHeaderIsSpeculative(tup) \
 ( \
-	(tup)->t_ctid.ip_posid == SpecTokenOffsetNumber \
+	(ItemPointerGetOffsetNumberNoCheck(&(tup)->t_ctid) == SpecTokenOffsetNumber) \
 )
 
 #define HeapTupleHeaderGetSpeculativeToken(tup) \
@@ -476,7 +501,7 @@ do { \
 
 #define HeapTupleHeaderIsHeapOnly(tup) \
 ( \
-  (tup)->t_infomask2 & HEAP_ONLY_TUPLE \
+  ((tup)->t_infomask2 & HEAP_ONLY_TUPLE) != 0 \
 )
 
 #define HeapTupleHeaderSetHeapOnly(tup) \
@@ -491,7 +516,7 @@ do { \
 
 #define HeapTupleHeaderHasMatch(tup) \
 ( \
-  (tup)->t_infomask2 & HEAP_TUPLE_HAS_MATCH \
+  ((tup)->t_infomask2 & HEAP_TUPLE_HAS_MATCH) != 0 \
 )
 
 #define HeapTupleHeaderSetMatch(tup) \
@@ -697,11 +722,11 @@ struct MinimalTupleData
 	(*(isnull) = false),											\
 	HeapTupleNoNulls(tup) ?											\
 	(																\
-		(tupleDesc)->attrs[(attnum)-1]->attcacheoff >= 0 ?			\
+		TupleDescAttr((tupleDesc), (attnum)-1)->attcacheoff >= 0 ?	\
 		(															\
-			fetchatt((tupleDesc)->attrs[(attnum)-1],				\
+			fetchatt(TupleDescAttr((tupleDesc), (attnum)-1),		\
 				(char *) (tup)->t_data + (tup)->t_data->t_hoff +	\
-					(tupleDesc)->attrs[(attnum)-1]->attcacheoff)	\
+				TupleDescAttr((tupleDesc), (attnum)-1)->attcacheoff)\
 		)															\
 		:															\
 			nocachegetattr((tup), (attnum), (tupleDesc))			\
@@ -723,7 +748,7 @@ struct MinimalTupleData
 
 extern Datum fastgetattr(HeapTuple tup, int attnum, TupleDesc tupleDesc,
 			bool *isnull);
-#endif   /* defined(DISABLE_COMPLEX_MACRO) */
+#endif							/* defined(DISABLE_COMPLEX_MACRO) */
 
 
 /* ----------------
@@ -780,6 +805,12 @@ extern HeapTuple heap_modify_tuple(HeapTuple tuple,
 				  Datum *replValues,
 				  bool *replIsnull,
 				  bool *doReplace);
+extern HeapTuple heap_modify_tuple_by_cols(HeapTuple tuple,
+						  TupleDesc tupleDesc,
+						  int nCols,
+						  int *replCols,
+						  Datum *replValues,
+						  bool *replIsnull);
 extern void heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 				  Datum *values, bool *isnull);
 extern void heap_freetuple(HeapTuple htup);
@@ -790,4 +821,4 @@ extern MinimalTuple heap_copy_minimal_tuple(MinimalTuple mtup);
 extern HeapTuple heap_tuple_from_minimal_tuple(MinimalTuple mtup);
 extern MinimalTuple minimal_tuple_from_heap_tuple(HeapTuple htup);
 
-#endif   /* HTUP_DETAILS_H */
+#endif							/* HTUP_DETAILS_H */

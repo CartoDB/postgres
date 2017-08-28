@@ -37,6 +37,20 @@ return None
 '
 	LANGUAGE plpythonu;
 
+CREATE FUNCTION spi_prepared_plan_test_two(a text) RETURNS text
+	AS
+'if "myplan" not in SD:
+	q = "SELECT count(*) FROM users WHERE lname = $1"
+	SD["myplan"] = plpy.prepare(q, [ "text" ])
+try:
+	rv = SD["myplan"].execute([a])
+	return "there are " + str(rv[0]["count"]) + " " + str(a) + "s"
+except Exception, ex:
+	plpy.error(str(ex))
+return None
+'
+	LANGUAGE plpythonu;
+
 CREATE FUNCTION spi_prepared_plan_test_nested(a text) RETURNS text
 	AS
 'if "myplan" not in SD:
@@ -52,9 +66,6 @@ return None
 '
 	LANGUAGE plpythonu;
 
-
-
-
 CREATE FUNCTION join_sequences(s sequences) RETURNS text
 	AS
 'if not s["multipart"]:
@@ -68,19 +79,22 @@ return seq
 '
 	LANGUAGE plpythonu;
 
+CREATE FUNCTION spi_recursive_sum(a int) RETURNS int
+	AS
+'r = 0
+if a > 1:
+    r = plpy.execute("SELECT spi_recursive_sum(%d) as a" % (a-1))[0]["a"]
+return a + r
+'
+	LANGUAGE plpythonu;
 
-
-
-
+--
 -- spi and nested calls
 --
 select nested_call_one('pass this along');
 select spi_prepared_plan_test_one('doe');
-select spi_prepared_plan_test_one('smith');
+select spi_prepared_plan_test_two('smith');
 select spi_prepared_plan_test_nested('smith');
-
-
-
 
 SELECT join_sequences(sequences) FROM sequences;
 SELECT join_sequences(sequences) FROM sequences
@@ -88,6 +102,7 @@ SELECT join_sequences(sequences) FROM sequences
 SELECT join_sequences(sequences) FROM sequences
 	WHERE join_sequences(sequences) ~* '^B';
 
+SELECT spi_recursive_sum(10);
 
 --
 -- plan and result objects
@@ -134,8 +149,8 @@ SELECT result_len_test($$UPDATE foo3 SET b= '' WHERE a = 2$$);
 
 CREATE FUNCTION result_subscript_test() RETURNS void
 AS $$
-result = plpy.execute("SELECT 1 AS c UNION SELECT 2 "
-                      "UNION SELECT 3 UNION SELECT 4")
+result = plpy.execute("SELECT 1 AS c UNION ALL SELECT 2 "
+                      "UNION ALL SELECT 3 UNION ALL SELECT 4")
 
 plpy.info(result[1]['c'])
 plpy.info(result[-1]['c'])
@@ -274,7 +289,7 @@ plan = plpy.prepare(
     ["text"])
 for row in plpy.cursor(plan, ["w"]):
     yield row['fname']
-for row in plpy.cursor(plan, ["j"]):
+for row in plan.cursor(["j"]):
     yield row['fname']
 $$ LANGUAGE plpythonu;
 

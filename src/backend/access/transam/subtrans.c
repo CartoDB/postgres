@@ -3,15 +3,15 @@
  * subtrans.c
  *		PostgreSQL subtransaction-log manager
  *
- * The pg_subtrans manager is a pg_clog-like manager that stores the parent
+ * The pg_subtrans manager is a pg_xact-like manager that stores the parent
  * transaction Id for each transaction.  It is a fundamental part of the
  * nested transactions implementation.  A main transaction has a parent
  * of InvalidTransactionId, and each subtransaction has its immediate parent.
  * The tree can easily be walked from child to parent, but not in the
  * opposite direction.
  *
- * This code is based on clog.c, but the robustness requirements
- * are completely different from pg_clog, because we only need to remember
+ * This code is based on xact.c, but the robustness requirements
+ * are completely different from pg_xact, because we only need to remember
  * pg_subtrans information for currently-open transactions.  Thus, there is
  * no need to preserve data over a crash and restart.
  *
@@ -19,7 +19,7 @@
  * data across crashes.  During database startup, we simply force the
  * currently-active page of SUBTRANS to zeroes.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/subtrans.c
@@ -44,7 +44,8 @@
  * 0xFFFFFFFF/SUBTRANS_XACTS_PER_PAGE, and segment numbering at
  * 0xFFFFFFFF/SUBTRANS_XACTS_PER_PAGE/SLRU_PAGES_PER_SEGMENT.  We need take no
  * explicit notice of that fact in this module, except when comparing segment
- * and page numbers in TruncateSUBTRANS (see SubTransPagePrecedes).
+ * and page numbers in TruncateSUBTRANS (see SubTransPagePrecedes) and zeroing
+ * them in StartupSUBTRANS.
  */
 
 /* We need four bytes per xact */
@@ -68,11 +69,9 @@ static bool SubTransPagePrecedes(int page1, int page2);
 
 /*
  * Record the parent of a subtransaction in the subtrans log.
- *
- * In some cases we may need to overwrite an existing value.
  */
 void
-SubTransSetParent(TransactionId xid, TransactionId parent, bool overwriteOK)
+SubTransSetParent(TransactionId xid, TransactionId parent)
 {
 	int			pageno = TransactionIdToPage(xid);
 	int			entryno = TransactionIdToEntry(xid);
@@ -80,6 +79,7 @@ SubTransSetParent(TransactionId xid, TransactionId parent, bool overwriteOK)
 	TransactionId *ptr;
 
 	Assert(TransactionIdIsValid(parent));
+	Assert(TransactionIdFollows(xid, parent));
 
 	LWLockAcquire(SubtransControlLock, LW_EXCLUSIVE);
 
@@ -87,13 +87,17 @@ SubTransSetParent(TransactionId xid, TransactionId parent, bool overwriteOK)
 	ptr = (TransactionId *) SubTransCtl->shared->page_buffer[slotno];
 	ptr += entryno;
 
-	/* Current state should be 0 */
-	Assert(*ptr == InvalidTransactionId ||
-		   (*ptr == parent && overwriteOK));
-
-	*ptr = parent;
-
-	SubTransCtl->shared->page_dirty[slotno] = true;
+	/*
+	 * It's possible we'll try to set the parent xid multiple times but we
+	 * shouldn't ever be changing the xid from one valid xid to another valid
+	 * xid, which would corrupt the data structure.
+	 */
+	if (*ptr != parent)
+	{
+		Assert(*ptr == InvalidTransactionId);
+		*ptr = parent;
+		SubTransCtl->shared->page_dirty[slotno] = true;
+	}
 
 	LWLockRelease(SubtransControlLock);
 }
@@ -157,6 +161,15 @@ SubTransGetTopmostTransaction(TransactionId xid)
 		if (TransactionIdPrecedes(parentXid, TransactionXmin))
 			break;
 		parentXid = SubTransGetParent(parentXid);
+
+		/*
+		 * By convention the parent xid gets allocated first, so should always
+		 * precede the child xid. Anything else points to a corrupted data
+		 * structure that could lead to an infinite loop, so exit.
+		 */
+		if (!TransactionIdPrecedes(parentXid, previousXid))
+			elog(ERROR, "pg_subtrans contains invalid entry: xid %u points to parent xid %u",
+				 previousXid, parentXid);
 	}
 
 	Assert(TransactionIdIsValid(previousXid));
@@ -179,7 +192,8 @@ SUBTRANSShmemInit(void)
 {
 	SubTransCtl->PagePrecedes = SubTransPagePrecedes;
 	SimpleLruInit(SubTransCtl, "subtrans", NUM_SUBTRANS_BUFFERS, 0,
-				  SubtransControlLock, "pg_subtrans");
+				  SubtransControlLock, "pg_subtrans",
+				  LWTRANCHE_SUBTRANS_BUFFERS);
 	/* Override default assumption that writes should be fsync'd */
 	SubTransCtl->do_fsync = false;
 }
@@ -253,6 +267,9 @@ StartupSUBTRANS(TransactionId oldestActiveXID)
 	{
 		(void) ZeroSUBTRANSPage(startPage);
 		startPage++;
+		/* must account for wraparound */
+		if (startPage > TransactionIdToPage(MaxTransactionId))
+			startPage = 0;
 	}
 	(void) ZeroSUBTRANSPage(startPage);
 

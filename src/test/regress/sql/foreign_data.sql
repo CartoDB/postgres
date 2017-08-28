@@ -5,20 +5,20 @@
 -- Clean up in case a prior regression run failed
 
 -- Suppress NOTICE messages when roles don't exist
-SET client_min_messages TO 'error';
+SET client_min_messages TO 'warning';
 
-DROP ROLE IF EXISTS foreign_data_user, regress_test_role, regress_test_role2, regress_test_role_super, regress_test_indirect, unpriviled_role;
+DROP ROLE IF EXISTS regress_foreign_data_user, regress_test_role, regress_test_role2, regress_test_role_super, regress_test_indirect, regress_unprivileged_role;
 
 RESET client_min_messages;
 
-CREATE ROLE foreign_data_user LOGIN SUPERUSER;
-SET SESSION AUTHORIZATION 'foreign_data_user';
+CREATE ROLE regress_foreign_data_user LOGIN SUPERUSER;
+SET SESSION AUTHORIZATION 'regress_foreign_data_user';
 
 CREATE ROLE regress_test_role;
 CREATE ROLE regress_test_role2;
 CREATE ROLE regress_test_role_super SUPERUSER;
 CREATE ROLE regress_test_indirect;
-CREATE ROLE unprivileged_role;
+CREATE ROLE regress_unprivileged_role;
 
 CREATE FOREIGN DATA WRAPPER dummy;
 COMMENT ON FOREIGN DATA WRAPPER dummy IS 'useless';
@@ -104,6 +104,8 @@ CREATE FOREIGN DATA WRAPPER foo;
 CREATE SERVER s1 FOREIGN DATA WRAPPER foo;
 COMMENT ON SERVER s1 IS 'foreign server';
 CREATE USER MAPPING FOR current_user SERVER s1;
+CREATE USER MAPPING FOR current_user SERVER s1;				-- ERROR
+CREATE USER MAPPING IF NOT EXISTS FOR current_user SERVER s1; -- NOTICE
 \dew+
 \des+
 \deu+
@@ -121,6 +123,7 @@ CREATE SERVER s1 FOREIGN DATA WRAPPER foo;                  -- ERROR
 CREATE FOREIGN DATA WRAPPER foo OPTIONS ("test wrapper" 'true');
 CREATE SERVER s1 FOREIGN DATA WRAPPER foo;
 CREATE SERVER s1 FOREIGN DATA WRAPPER foo;                  -- ERROR
+CREATE SERVER IF NOT EXISTS s1 FOREIGN DATA WRAPPER foo;	-- No ERROR, just NOTICE
 CREATE SERVER s2 FOREIGN DATA WRAPPER foo OPTIONS (host 'a', dbname 'b');
 CREATE SERVER s3 TYPE 'oracle' FOREIGN DATA WRAPPER foo;
 CREATE SERVER s4 TYPE 'oracle' FOREIGN DATA WRAPPER foo OPTIONS (host 'a', dbname 'b');
@@ -438,15 +441,15 @@ ALTER USER MAPPING FOR regress_test_role SERVER s6 OPTIONS (DROP username);
 ALTER FOREIGN DATA WRAPPER foo VALIDATOR postgresql_fdw_validator;
 
 -- Privileges
-SET ROLE unprivileged_role;
+SET ROLE regress_unprivileged_role;
 CREATE FOREIGN DATA WRAPPER foobar;                             -- ERROR
 ALTER FOREIGN DATA WRAPPER foo OPTIONS (gotcha 'true');         -- ERROR
-ALTER FOREIGN DATA WRAPPER foo OWNER TO unprivileged_role;      -- ERROR
+ALTER FOREIGN DATA WRAPPER foo OWNER TO regress_unprivileged_role; -- ERROR
 DROP FOREIGN DATA WRAPPER foo;                                  -- ERROR
 GRANT USAGE ON FOREIGN DATA WRAPPER foo TO regress_test_role;   -- ERROR
 CREATE SERVER s9 FOREIGN DATA WRAPPER foo;                      -- ERROR
 ALTER SERVER s4 VERSION '0.5';                                  -- ERROR
-ALTER SERVER s4 OWNER TO unprivileged_role;                     -- ERROR
+ALTER SERVER s4 OWNER TO regress_unprivileged_role;             -- ERROR
 DROP SERVER s4;                                                 -- ERROR
 GRANT USAGE ON FOREIGN SERVER s4 TO regress_test_role;          -- ERROR
 CREATE USER MAPPING FOR public SERVER s4;                       -- ERROR
@@ -454,9 +457,9 @@ ALTER USER MAPPING FOR regress_test_role SERVER s6 OPTIONS (gotcha 'true'); -- E
 DROP USER MAPPING FOR regress_test_role SERVER s6;              -- ERROR
 RESET ROLE;
 
-GRANT USAGE ON FOREIGN DATA WRAPPER postgresql TO unprivileged_role;
-GRANT USAGE ON FOREIGN DATA WRAPPER foo TO unprivileged_role WITH GRANT OPTION;
-SET ROLE unprivileged_role;
+GRANT USAGE ON FOREIGN DATA WRAPPER postgresql TO regress_unprivileged_role;
+GRANT USAGE ON FOREIGN DATA WRAPPER foo TO regress_unprivileged_role WITH GRANT OPTION;
+SET ROLE regress_unprivileged_role;
 CREATE FOREIGN DATA WRAPPER foobar;                             -- ERROR
 ALTER FOREIGN DATA WRAPPER foo OPTIONS (gotcha 'true');         -- ERROR
 DROP FOREIGN DATA WRAPPER foo;                                  -- ERROR
@@ -473,24 +476,44 @@ ALTER USER MAPPING FOR regress_test_role SERVER s6 OPTIONS (gotcha 'true'); -- E
 DROP USER MAPPING FOR regress_test_role SERVER s6;              -- ERROR
 RESET ROLE;
 
-REVOKE USAGE ON FOREIGN DATA WRAPPER foo FROM unprivileged_role; -- ERROR
-REVOKE USAGE ON FOREIGN DATA WRAPPER foo FROM unprivileged_role CASCADE;
-SET ROLE unprivileged_role;
+REVOKE USAGE ON FOREIGN DATA WRAPPER foo FROM regress_unprivileged_role; -- ERROR
+REVOKE USAGE ON FOREIGN DATA WRAPPER foo FROM regress_unprivileged_role CASCADE;
+SET ROLE regress_unprivileged_role;
 GRANT USAGE ON FOREIGN DATA WRAPPER foo TO regress_test_role;   -- ERROR
 CREATE SERVER s10 FOREIGN DATA WRAPPER foo;                     -- ERROR
 ALTER SERVER s9 VERSION '1.1';
 GRANT USAGE ON FOREIGN SERVER s9 TO regress_test_role;
 CREATE USER MAPPING FOR current_user SERVER s9;
+-- We use terse mode to avoid ordering issues in cascade detail output.
+\set VERBOSITY terse
 DROP SERVER s9 CASCADE;
+\set VERBOSITY default
 RESET ROLE;
 CREATE SERVER s9 FOREIGN DATA WRAPPER foo;
-GRANT USAGE ON FOREIGN SERVER s9 TO unprivileged_role;
-SET ROLE unprivileged_role;
+GRANT USAGE ON FOREIGN SERVER s9 TO regress_unprivileged_role;
+SET ROLE regress_unprivileged_role;
 ALTER SERVER s9 VERSION '1.2';                                  -- ERROR
 GRANT USAGE ON FOREIGN SERVER s9 TO regress_test_role;          -- WARNING
 CREATE USER MAPPING FOR current_user SERVER s9;
 DROP SERVER s9 CASCADE;                                         -- ERROR
+
+-- Check visibility of user mapping data
+SET ROLE regress_test_role;
+CREATE SERVER s10 FOREIGN DATA WRAPPER foo;
+CREATE USER MAPPING FOR public SERVER s10 OPTIONS (user 'secret');
+CREATE USER MAPPING FOR regress_unprivileged_role SERVER s10 OPTIONS (user 'secret');
+-- owner of server can see some option fields
+\deu+
 RESET ROLE;
+-- superuser can see all option fields
+\deu+
+-- unprivileged user cannot see any option field
+SET ROLE regress_unprivileged_role;
+\deu+
+RESET ROLE;
+\set VERBOSITY terse
+DROP SERVER s10 CASCADE;
+\set VERBOSITY default
 
 -- Triggers
 CREATE FUNCTION dummy_trigger() RETURNS TRIGGER AS $$
@@ -506,6 +529,12 @@ EXECUTE PROCEDURE dummy_trigger();
 
 CREATE TRIGGER trigtest_after_stmt AFTER INSERT OR UPDATE OR DELETE
 ON foreign_schema.foreign_table_1
+FOR EACH STATEMENT
+EXECUTE PROCEDURE dummy_trigger();
+
+CREATE TRIGGER trigtest_after_stmt_tt AFTER INSERT OR UPDATE OR DELETE -- ERROR
+ON foreign_schema.foreign_table_1
+REFERENCING NEW TABLE AS new_table
 FOR EACH STATEMENT
 EXECUTE PROCEDURE dummy_trigger();
 
@@ -614,8 +643,10 @@ SELECT relname, conname, contype, conislocal, coninhcount, connoinherit
 -- child does not inherit NO INHERIT constraints
 \d+ pt1
 \d+ ft2
+\set VERBOSITY terse
 DROP FOREIGN TABLE ft2; -- ERROR
 DROP FOREIGN TABLE ft2 CASCADE;
+\set VERBOSITY default
 CREATE FOREIGN TABLE ft2 (
 	c1 integer NOT NULL,
 	c2 text,
@@ -684,27 +715,96 @@ REASSIGN OWNED BY regress_test_role TO regress_test_role2;
 DROP OWNED BY regress_test_role2;
 DROP OWNED BY regress_test_role2 CASCADE;
 
+-- Foreign partition DDL stuff
+CREATE TABLE pt2 (
+	c1 integer NOT NULL,
+	c2 text,
+	c3 date
+) PARTITION BY LIST (c1);
+CREATE FOREIGN TABLE pt2_1 PARTITION OF pt2 FOR VALUES IN (1)
+  SERVER s0 OPTIONS (delimiter ',', quote '"', "be quoted" 'value');
+\d+ pt2
+\d+ pt2_1
+
+-- partition cannot have additional columns
+DROP FOREIGN TABLE pt2_1;
+CREATE FOREIGN TABLE pt2_1 (
+	c1 integer NOT NULL,
+	c2 text,
+	c3 date,
+	c4 char
+) SERVER s0 OPTIONS (delimiter ',', quote '"', "be quoted" 'value');
+\d+ pt2_1
+ALTER TABLE pt2 ATTACH PARTITION pt2_1 FOR VALUES IN (1);       -- ERROR
+
+DROP FOREIGN TABLE pt2_1;
+\d+ pt2
+CREATE FOREIGN TABLE pt2_1 (
+	c1 integer NOT NULL,
+	c2 text,
+	c3 date
+) SERVER s0 OPTIONS (delimiter ',', quote '"', "be quoted" 'value');
+\d+ pt2_1
+-- no attach partition validation occurs for foreign tables
+ALTER TABLE pt2 ATTACH PARTITION pt2_1 FOR VALUES IN (1);
+\d+ pt2
+\d+ pt2_1
+
+-- cannot add column to a partition
+ALTER TABLE pt2_1 ADD c4 char;
+
+-- ok to have a partition's own constraints though
+ALTER TABLE pt2_1 ALTER c3 SET NOT NULL;
+ALTER TABLE pt2_1 ADD CONSTRAINT p21chk CHECK (c2 <> '');
+\d+ pt2
+\d+ pt2_1
+
+-- cannot drop inherited NOT NULL constraint from a partition
+ALTER TABLE pt2_1 ALTER c1 DROP NOT NULL;
+
+-- partition must have parent's constraints
+ALTER TABLE pt2 DETACH PARTITION pt2_1;
+ALTER TABLE pt2 ALTER c2 SET NOT NULL;
+\d+ pt2
+\d+ pt2_1
+ALTER TABLE pt2 ATTACH PARTITION pt2_1 FOR VALUES IN (1);       -- ERROR
+ALTER FOREIGN TABLE pt2_1 ALTER c2 SET NOT NULL;
+ALTER TABLE pt2 ATTACH PARTITION pt2_1 FOR VALUES IN (1);
+
+ALTER TABLE pt2 DETACH PARTITION pt2_1;
+ALTER TABLE pt2 ADD CONSTRAINT pt2chk1 CHECK (c1 > 0);
+\d+ pt2
+\d+ pt2_1
+ALTER TABLE pt2 ATTACH PARTITION pt2_1 FOR VALUES IN (1);       -- ERROR
+ALTER FOREIGN TABLE pt2_1 ADD CONSTRAINT pt2chk1 CHECK (c1 > 0);
+ALTER TABLE pt2 ATTACH PARTITION pt2_1 FOR VALUES IN (1);
+
+-- TRUNCATE doesn't work on foreign tables, either directly or recursively
+TRUNCATE pt2_1;  -- ERROR
+TRUNCATE pt2;  -- ERROR
+
+DROP FOREIGN TABLE pt2_1;
+DROP TABLE pt2;
+
 -- Cleanup
 DROP SCHEMA foreign_schema CASCADE;
 DROP ROLE regress_test_role;                                -- ERROR
 DROP SERVER t1 CASCADE;
 DROP USER MAPPING FOR regress_test_role SERVER s6;
--- This test causes some order dependent cascade detail output,
--- so switch to terse mode for it.
 \set VERBOSITY terse
 DROP FOREIGN DATA WRAPPER foo CASCADE;
-\set VERBOSITY default
 DROP SERVER s8 CASCADE;
+\set VERBOSITY default
 DROP ROLE regress_test_indirect;
 DROP ROLE regress_test_role;
-DROP ROLE unprivileged_role;                                -- ERROR
-REVOKE ALL ON FOREIGN DATA WRAPPER postgresql FROM unprivileged_role;
-DROP ROLE unprivileged_role;
+DROP ROLE regress_unprivileged_role;                        -- ERROR
+REVOKE ALL ON FOREIGN DATA WRAPPER postgresql FROM regress_unprivileged_role;
+DROP ROLE regress_unprivileged_role;
 DROP ROLE regress_test_role2;
 DROP FOREIGN DATA WRAPPER postgresql CASCADE;
 DROP FOREIGN DATA WRAPPER dummy CASCADE;
 \c
-DROP ROLE foreign_data_user;
+DROP ROLE regress_foreign_data_user;
 
 -- At this point we should have no wrappers, no servers, and no mappings.
 SELECT fdwname, fdwhandler, fdwvalidator, fdwoptions FROM pg_foreign_data_wrapper;

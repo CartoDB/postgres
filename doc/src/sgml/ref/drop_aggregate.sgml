@@ -21,7 +21,7 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-DROP AGGREGATE [ IF EXISTS ] <replaceable>name</replaceable> ( <replaceable>aggregate_signature</replaceable> ) [ CASCADE | RESTRICT ]
+DROP AGGREGATE [ IF EXISTS ] <replaceable>name</replaceable> ( <replaceable>aggregate_signature</replaceable> ) [, ...] [ CASCADE | RESTRICT ]
 
 <phrase>where <replaceable>aggregate_signature</replaceable> is:</phrase>
 
@@ -107,7 +107,10 @@ DROP AGGREGATE [ IF EXISTS ] <replaceable>name</replaceable> ( <replaceable>aggr
     <term><literal>CASCADE</literal></term>
     <listitem>
      <para>
-      Automatically drop objects that depend on the aggregate function.
+      Automatically drop objects that depend on the aggregate function
+      (such as views using it),
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend">).
      </para>
     </listitem>
    </varlistentry>
@@ -152,7 +155,13 @@ DROP AGGREGATE myavg(integer);
 DROP AGGREGATE myrank(VARIADIC "any" ORDER BY VARIADIC "any");
 </programlisting>
   </para>
- </refsect1>
+
+  <para>
+   To remove multiple aggregate functions in one command:
+<programlisting>
+DROP AGGREGATE myavg(integer), myavg(bigint);
+</programlisting></para>
+</refsect1>
 
  <refsect1>
   <title>Compatibility</title>

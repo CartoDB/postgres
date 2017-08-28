@@ -1,7 +1,7 @@
--- make sure the prerequisite libraries are loaded
-DO '1' LANGUAGE plpythonu;
-SELECT NULL::hstore;
+/* contrib/hstore_plpython/hstore_plpythonu--1.0.sql */
 
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
+\echo Use "CREATE EXTENSION hstore_plpythonu" to load this file. \quit
 
 CREATE FUNCTION hstore_to_plpython(val internal) RETURNS internal
 LANGUAGE C STRICT IMMUTABLE

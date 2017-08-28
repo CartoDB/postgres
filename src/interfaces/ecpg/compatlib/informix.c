@@ -205,8 +205,8 @@ deccvasc(char *cp, int len, decimal *np)
 	if (risnull(CSTRINGTYPE, cp))
 		return 0;
 
-	str = ecpg_strndup(cp, len);/* decimal_in always converts the complete
-								 * string */
+	str = ecpg_strndup(cp, len);	/* decimal_in always converts the complete
+									 * string */
 	if (!str)
 		ret = ECPG_INFORMIX_NUM_UNDERFLOW;
 	else
@@ -666,7 +666,7 @@ dttofmtasc(timestamp * ts, char *output, int str_len, char *fmtstr)
 int
 intoasc(interval * i, char *str)
 {
-	char *tmp;
+	char	   *tmp;
 
 	errno = 0;
 	tmp = PGTYPESinterval_to_asc(i);
@@ -692,7 +692,7 @@ static struct
 	int			remaining;
 	char		sign;
 	char	   *val_string;
-}	value;
+}			value;
 
 /**
  * initialize the struct, which holds the different forms
@@ -1032,6 +1032,7 @@ void
 ECPG_informix_reset_sqlca(void)
 {
 	struct sqlca_t *sqlca = ECPGget_sqlca();
+
 	if (sqlca == NULL)
 		return;
 

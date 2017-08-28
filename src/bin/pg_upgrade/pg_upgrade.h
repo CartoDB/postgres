@@ -1,7 +1,7 @@
 /*
  *	pg_upgrade.h
  *
- *	Copyright (c) 2010-2016, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2017, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/pg_upgrade.h
  */
 
@@ -94,20 +94,23 @@ extern char *output_files[];
 #define ECHO_BLANK	"."
 #endif
 
-#define CLUSTER_NAME(cluster)	((cluster) == &old_cluster ? "old" : \
-								 (cluster) == &new_cluster ? "new" : "none")
 
-#define atooid(x)  ((Oid) strtoul((x), NULL, 10))
-
-/* OID system catalog preservation added during PG 9.0 development */
-#define TABLE_SPACE_SUBDIRS_CAT_VER 201001111
-/* postmaster/postgres -b (binary_upgrade) flag added during PG 9.1 development */
+/*
+ * postmaster/postgres -b (binary_upgrade) flag added during PG 9.1
+ * development
+ */
 #define BINARY_UPGRADE_SERVER_FLAG_CAT_VER 201104251
+
 /*
  *	Visibility map changed with this 9.2 commit,
  *	8f9fe6edce358f7904e0db119416b4d1080a83aa; pick later catalog version.
  */
 #define VISIBILITY_MAP_CRASHSAFE_CAT_VER 201107031
+
+/*
+ * The format of visibility map is changed with this 9.6 commit,
+ */
+#define VISIBILITY_MAP_FROZEN_BIT_CAT_VER 201603011
 
 /*
  * pg_multixact format changed in 9.3 commit 0ac5ad5134f2769ccbaefec73844f85,
@@ -128,20 +131,22 @@ extern char *output_files[];
  */
 #define JSONB_FORMAT_CHANGE_CAT_VER 201409291
 
+
 /*
  * Each relation is represented by a relinfo structure.
  */
 typedef struct
 {
-	/* Can't use NAMEDATALEN;  not guaranteed to fit on client */
+	/* Can't use NAMEDATALEN; not guaranteed to be same on client */
 	char	   *nspname;		/* namespace name */
 	char	   *relname;		/* relation name */
-	Oid			reloid;			/* relation oid */
+	Oid			reloid;			/* relation OID */
 	Oid			relfilenode;	/* relation relfile node */
-	/* relation tablespace path, or "" for the cluster default */
-	char	   *tablespace;
-	bool		nsp_alloc;
-	bool		tblsp_alloc;
+	Oid			indtable;		/* if index, OID of its table, else 0 */
+	Oid			toastheap;		/* if toast table, OID of base table, else 0 */
+	char	   *tablespace;		/* tablespace path; "" for cluster default */
+	bool		nsp_alloc;		/* should nspname be freed? */
+	bool		tblsp_alloc;	/* should tablespace be freed? */
 } RelInfo;
 
 typedef struct
@@ -180,8 +185,8 @@ typedef struct
 {
 	Oid			db_oid;			/* oid of the database */
 	char	   *db_name;		/* database name */
-	char		db_tablespace[MAXPGPATH];		/* database default tablespace
-												 * path */
+	char		db_tablespace[MAXPGPATH];	/* database default tablespace
+											 * path */
 	char	   *db_collate;
 	char	   *db_ctype;
 	int			db_encoding;
@@ -269,8 +274,7 @@ typedef struct
 	uint32		major_version;	/* PG_VERSION of cluster */
 	char		major_version_str[64];	/* string PG_VERSION of cluster */
 	uint32		bin_version;	/* version returned from pg_ctl */
-	Oid			pg_database_oid;	/* OID of pg_database relation */
-	const char *tablespace_suffix;		/* directory specification */
+	const char *tablespace_suffix;	/* directory specification */
 } ClusterInfo;
 
 
@@ -330,7 +334,7 @@ void		output_check_banner(bool live_check);
 void		check_and_dump_old_cluster(bool live_check);
 void		check_new_cluster(void);
 void		report_clusters_compatible(void);
-void		issue_warnings(void);
+void		issue_warnings_and_set_wal_level(void);
 void output_completion_banner(char *analyze_script_file_name,
 						 char *deletion_script_file_name);
 void		check_cluster_versions(void);
@@ -349,7 +353,6 @@ void		disable_old_cluster(void);
 /* dump.c */
 
 void		generate_old_dump(void);
-void		optionally_create_toast_tables(void);
 
 
 /* exec.c */
@@ -364,41 +367,12 @@ bool		pid_lock_file_exists(const char *datadir);
 
 /* file.c */
 
-#ifdef PAGE_CONVERSION
-typedef const char *(*pluginStartup) (uint16 migratorVersion,
-								uint16 *pluginVersion, uint16 newPageVersion,
-								   uint16 oldPageVersion, void **pluginData);
-typedef const char *(*pluginConvertFile) (void *pluginData,
-								   const char *dstName, const char *srcName);
-typedef const char *(*pluginConvertPage) (void *pluginData,
-								   const char *dstPage, const char *srcPage);
-typedef const char *(*pluginShutdown) (void *pluginData);
-
-typedef struct
-{
-	uint16		oldPageVersion; /* Page layout version of the old cluster		*/
-	uint16		newPageVersion; /* Page layout version of the new cluster		*/
-	uint16		pluginVersion;	/* API version of converter plugin */
-	void	   *pluginData;		/* Plugin data (set by plugin) */
-	pluginStartup startup;		/* Pointer to plugin's startup function */
-	pluginConvertFile convertFile;		/* Pointer to plugin's file converter
-										 * function */
-	pluginConvertPage convertPage;		/* Pointer to plugin's page converter
-										 * function */
-	pluginShutdown shutdown;	/* Pointer to plugin's shutdown function */
-} pageCnvCtx;
-
-const pageCnvCtx *setupPageConverter(void);
-#else
-/* dummy */
-typedef void *pageCnvCtx;
-#endif
-
-const char *copyAndUpdateFile(pageCnvCtx *pageConverter, const char *src,
-				  const char *dst, bool force);
-const char *linkAndUpdateFile(pageCnvCtx *pageConverter, const char *src,
-				  const char *dst);
-
+void copyFile(const char *src, const char *dst,
+		 const char *schemaName, const char *relName);
+void linkFile(const char *src, const char *dst,
+		 const char *schemaName, const char *relName);
+void rewriteVisibilityMap(const char *fromfile, const char *tofile,
+					 const char *schemaName, const char *relName);
 void		check_hard_link(void);
 FILE	   *fopen_priv(const char *path, const char *mode);
 
@@ -424,11 +398,10 @@ void		get_sock_dir(ClusterInfo *cluster, bool live_check);
 
 /* relfilenode.c */
 
-void		get_pg_database_relfilenode(ClusterInfo *cluster);
 void transfer_all_new_tablespaces(DbInfoArr *old_db_arr,
-				  DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata);
+							 DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata);
 void transfer_all_new_dbs(DbInfoArr *old_db_arr,
-				   DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata,
+					 DbInfoArr *new_db_arr, char *old_pgdata, char *new_pgdata,
 					 char *old_tablespace);
 
 /* tablespace.c */
@@ -460,7 +433,6 @@ void		pg_fatal(const char *fmt,...) pg_attribute_printf(1, 2) pg_attribute_noret
 void		end_progress_output(void);
 void		prep_status(const char *fmt,...) pg_attribute_printf(1, 2);
 void		check_ok(void);
-const char *getErrorText(void);
 unsigned int str2uint(const char *str);
 void		pg_putenv(const char *var, const char *val);
 
@@ -470,6 +442,9 @@ void		pg_putenv(const char *var, const char *val);
 void new_9_0_populate_pg_largeobject_metadata(ClusterInfo *cluster,
 										 bool check_mode);
 void		old_9_3_check_for_line_data_type_usage(ClusterInfo *cluster);
+void		old_9_6_check_for_unknown_data_type_usage(ClusterInfo *cluster);
+void old_9_6_invalidate_hash_indexes(ClusterInfo *cluster,
+								bool check_mode);
 
 /* parallel.c */
 void parallel_exec_prog(const char *log_file, const char *opt_log_file,

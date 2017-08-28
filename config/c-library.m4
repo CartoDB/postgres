@@ -42,7 +42,8 @@ if test "$ac_cv_member_struct_tm_tm_zone" = yes; then
 fi
 AC_CACHE_CHECK(for tzname, ac_cv_var_tzname,
 [AC_LINK_IFELSE([AC_LANG_PROGRAM(
-[[#include <time.h>
+[[#include <stdlib.h>
+#include <time.h>
 #ifndef tzname /* For SGI.  */
 extern char *tzname[]; /* RS6000 and others reject char **tzname.  */
 #endif
@@ -110,8 +111,12 @@ fi
 AC_DEFUN([PGAC_UNION_SEMUN],
 [AC_CHECK_TYPES([union semun], [], [],
 [#include <sys/types.h>
+#ifdef HAVE_SYS_IPC_H
 #include <sys/ipc.h>
-#include <sys/sem.h>])])# PGAC_UNION_SEMUN
+#endif
+#ifdef HAVE_SYS_SEM_H
+#include <sys/sem.h>
+#endif])])# PGAC_UNION_SEMUN
 
 
 # PGAC_STRUCT_SOCKADDR_UN
@@ -134,9 +139,7 @@ AC_DEFUN([PGAC_STRUCT_SOCKADDR_UN],
 AC_DEFUN([PGAC_STRUCT_SOCKADDR_STORAGE],
 [AC_CHECK_TYPES([struct sockaddr_storage], [], [],
 [#include <sys/types.h>
-#ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
-#endif
 ])])# PGAC_STRUCT_SOCKADDR_STORAGE
 
 # PGAC_STRUCT_SOCKADDR_STORAGE_MEMBERS
@@ -153,9 +156,7 @@ AC_DEFUN([PGAC_STRUCT_SOCKADDR_STORAGE_MEMBERS],
 		   struct sockaddr_storage.__ss_len,
 		   struct sockaddr.sa_len], [], [],
 [#include <sys/types.h>
-#ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
-#endif
 ])])# PGAC_STRUCT_SOCKADDR_STORAGE_MEMBERS
 
 
@@ -184,6 +185,7 @@ AC_DEFUN([PGAC_FUNC_SNPRINTF_LONG_LONG_INT_MODIFIER],
 AC_CACHE_VAL(pgac_cv_snprintf_long_long_int_modifier,
 [for pgac_modifier in 'll' 'q' 'I64'; do
 AC_RUN_IFELSE([AC_LANG_SOURCE([[#include <stdio.h>
+#include <string.h>
 typedef long long int ac_int64;
 #define INT64_FORMAT "%${pgac_modifier}d"
 
@@ -204,8 +206,10 @@ int does_int64_snprintf_work()
     return 0;			/* either multiply or snprintf is busted */
   return 1;
 }
+
+int
 main() {
-  exit(! does_int64_snprintf_work());
+  return (! does_int64_snprintf_work());
 }]])],
 [pgac_cv_snprintf_long_long_int_modifier=$pgac_modifier; break],
 [],
@@ -292,8 +296,8 @@ AC_MSG_RESULT([$pgac_cv_snprintf_size_t_support])
 
 # PGAC_TYPE_LOCALE_T
 # ------------------
-# Check for the locale_t type and find the right header file.  Mac OS
-# X needs xlocale.h; standard is locale.h, but glibc also has an
+# Check for the locale_t type and find the right header file.  macOS
+# needs xlocale.h; standard is locale.h, but glibc also has an
 # xlocale.h file that we should not use.
 #
 AC_DEFUN([PGAC_TYPE_LOCALE_T],
@@ -316,4 +320,34 @@ fi
 if test "$pgac_cv_type_locale_t" = 'yes (in xlocale.h)'; then
   AC_DEFINE(LOCALE_T_IN_XLOCALE, 1,
             [Define to 1 if `locale_t' requires <xlocale.h>.])
-fi])])# PGAC_HEADER_XLOCALE
+fi])# PGAC_TYPE_LOCALE_T
+
+
+# PGAC_FUNC_WCSTOMBS_L
+# --------------------
+# Try to find a declaration for wcstombs_l().  It might be in stdlib.h
+# (following the POSIX requirement for wcstombs()), or in locale.h, or in
+# xlocale.h.  If it's in the latter, define WCSTOMBS_L_IN_XLOCALE.
+#
+AC_DEFUN([PGAC_FUNC_WCSTOMBS_L],
+[AC_CACHE_CHECK([for wcstombs_l declaration], pgac_cv_func_wcstombs_l,
+[AC_COMPILE_IFELSE([AC_LANG_PROGRAM(
+[#include <stdlib.h>
+#include <locale.h>],
+[#ifndef wcstombs_l
+(void) wcstombs_l;
+#endif])],
+[pgac_cv_func_wcstombs_l='yes'],
+[AC_COMPILE_IFELSE([AC_LANG_PROGRAM(
+[#include <stdlib.h>
+#include <locale.h>
+#include <xlocale.h>],
+[#ifndef wcstombs_l
+(void) wcstombs_l;
+#endif])],
+[pgac_cv_func_wcstombs_l='yes (in xlocale.h)'],
+[pgac_cv_func_wcstombs_l='no'])])])
+if test "$pgac_cv_func_wcstombs_l" = 'yes (in xlocale.h)'; then
+  AC_DEFINE(WCSTOMBS_L_IN_XLOCALE, 1,
+            [Define to 1 if `wcstombs_l' requires <xlocale.h>.])
+fi])# PGAC_FUNC_WCSTOMBS_L

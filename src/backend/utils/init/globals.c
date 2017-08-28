@@ -3,7 +3,7 @@
  * globals.c
  *	  global variable declarations
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,6 +30,8 @@ volatile bool InterruptPending = false;
 volatile bool QueryCancelPending = false;
 volatile bool ProcDiePending = false;
 volatile bool ClientConnectionLost = false;
+volatile bool IdleInTransactionSessionTimeoutPending = false;
+volatile sig_atomic_t ConfigReloadPending = false;
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 QueryCancelHoldoffCount = 0;
 volatile uint32 CritSectionCount = 0;
@@ -37,7 +39,7 @@ volatile uint32 CritSectionCount = 0;
 int			MyProcPid;
 pg_time_t	MyStartTime;
 struct Port *MyProcPort;
-long		MyCancelKey;
+int32		MyCancelKey;
 int			MyPMChildSlot;
 
 /*
@@ -60,15 +62,17 @@ char	   *DataDir = NULL;
 char		OutputFileName[MAXPGPATH];	/* debugging output file */
 
 char		my_exec_path[MAXPGPATH];	/* full path to my executable */
-char		pkglib_path[MAXPGPATH];		/* full path to lib directory */
+char		pkglib_path[MAXPGPATH]; /* full path to lib directory */
 
 #ifdef EXEC_BACKEND
-char		postgres_exec_path[MAXPGPATH];		/* full path to backend */
+char		postgres_exec_path[MAXPGPATH];	/* full path to backend */
 
 /* note: currently this is not valid in backend processes */
 #endif
 
 BackendId	MyBackendId = InvalidBackendId;
+
+BackendId	ParallelMasterBackendId = InvalidBackendId;
 
 Oid			MyDatabaseId = InvalidOid;
 
@@ -108,6 +112,7 @@ bool		enableFsync = true;
 bool		allowSystemTableMods = false;
 int			work_mem = 1024;
 int			maintenance_work_mem = 16384;
+int			replacement_sort_tuples = 150000;
 
 /*
  * Primary determinants of sizes of shared-memory structures.
@@ -118,9 +123,10 @@ int			maintenance_work_mem = 16384;
 int			NBuffers = 1000;
 int			MaxConnections = 90;
 int			max_worker_processes = 8;
+int			max_parallel_workers = 8;
 int			MaxBackends = 0;
 
-int			VacuumCostPageHit = 1;		/* GUC parameters for vacuum */
+int			VacuumCostPageHit = 1;	/* GUC parameters for vacuum */
 int			VacuumCostPageMiss = 10;
 int			VacuumCostPageDirty = 20;
 int			VacuumCostLimit = 200;
@@ -130,5 +136,5 @@ int			VacuumPageHit = 0;
 int			VacuumPageMiss = 0;
 int			VacuumPageDirty = 0;
 
-int			VacuumCostBalance = 0;		/* working state for vacuum */
+int			VacuumCostBalance = 0;	/* working state for vacuum */
 bool		VacuumCostActive = false;

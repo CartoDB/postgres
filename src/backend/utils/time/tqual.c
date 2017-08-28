@@ -13,9 +13,9 @@
  * NOTE: When using a non-MVCC snapshot, we must check
  * TransactionIdIsInProgress (which looks in the PGXACT array)
  * before TransactionIdDidCommit/TransactionIdDidAbort (which look in
- * pg_clog).  Otherwise we have a race condition: we might decide that a
+ * pg_xact).  Otherwise we have a race condition: we might decide that a
  * just-committed transaction crashed, because none of the tests succeed.
- * xact.c is careful to record commit/abort in pg_clog before it unsets
+ * xact.c is careful to record commit/abort in pg_xact before it unsets
  * MyPgXact->xid in the PGXACT array.  That fixes that problem, but it
  * also means there is a window where TransactionIdIsInProgress and
  * TransactionIdDidCommit will both return true.  If we check only
@@ -29,7 +29,7 @@
  *
  * When using an MVCC snapshot, we rely on XidInMVCCSnapshot rather than
  * TransactionIdIsInProgress, but the logic is otherwise the same: do not
- * check pg_clog until after deciding that the xact is no longer in progress.
+ * check pg_xact until after deciding that the xact is no longer in progress.
  *
  *
  * Summary of visibility functions:
@@ -50,7 +50,7 @@
  *	 HeapTupleSatisfiesAny()
  *		  all tuples are visible
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -78,7 +78,6 @@
 /* Static variables representing various special snapshot semantics */
 SnapshotData SnapshotSelfData = {HeapTupleSatisfiesSelf};
 SnapshotData SnapshotAnyData = {HeapTupleSatisfiesAny};
-SnapshotData SnapshotToastData = {HeapTupleSatisfiesToast};
 
 /* local functions */
 static bool XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot);
@@ -89,12 +88,13 @@ static bool XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot);
  * Set commit/abort hint bits on a tuple, if appropriate at this time.
  *
  * It is only safe to set a transaction-committed hint bit if we know the
- * transaction's commit record has been flushed to disk, or if the table is
- * temporary or unlogged and will be obliterated by a crash anyway.  We
- * cannot change the LSN of the page here because we may hold only a share
- * lock on the buffer, so we can't use the LSN to interlock this; we have to
- * just refrain from setting the hint bit until some future re-examination
- * of the tuple.
+ * transaction's commit record is guaranteed to be flushed to disk before the
+ * buffer, or if the table is temporary or unlogged and will be obliterated by
+ * a crash anyway.  We cannot change the LSN of the page here, because we may
+ * hold only a share lock on the buffer, so we can only use the LSN to
+ * interlock this if the buffer's LSN already is newer than the commit LSN;
+ * otherwise we have to just refrain from setting the hint bit until some
+ * future re-examination of the tuple.
  *
  * We can always set hint bits when marking a transaction aborted.  (Some
  * code in heapam.c relies on that!)
@@ -122,8 +122,12 @@ SetHintBits(HeapTupleHeader tuple, Buffer buffer,
 		/* NB: xid must be known committed here! */
 		XLogRecPtr	commitLSN = TransactionIdGetCommitLSN(xid);
 
-		if (XLogNeedsFlush(commitLSN) && BufferIsPermanent(buffer))
-			return;				/* not flushed yet, so don't set hint */
+		if (BufferIsPermanent(buffer) && XLogNeedsFlush(commitLSN) &&
+			BufferGetLSNAtomic(buffer) < commitLSN)
+		{
+			/* not flushed and no LSN interlock, so don't set hint */
+			return;
+		}
 	}
 
 	tuple->t_infomask |= infomask;
@@ -414,8 +418,8 @@ HeapTupleSatisfiesToast(HeapTuple htup, Snapshot snapshot,
 
 		/*
 		 * An invalid Xmin can be left behind by a speculative insertion that
-		 * is cancelled by super-deleting the tuple.  We shouldn't see any of
-		 * those in TOAST tables, but better safe than sorry.
+		 * is canceled by super-deleting the tuple.  This also applies to
+		 * TOAST tuples created during speculative insertion.
 		 */
 		else if (!TransactionIdIsValid(HeapTupleHeaderGetXmin(tuple)))
 			return false;
@@ -508,7 +512,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 		else if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tuple)))
 		{
 			if (HeapTupleHeaderGetCmin(tuple) >= curcid)
-				return HeapTupleInvisible;		/* inserted after scan started */
+				return HeapTupleInvisible;	/* inserted after scan started */
 
 			if (tuple->t_infomask & HEAP_XMAX_INVALID)	/* xid invalid */
 				return HeapTupleMayBeUpdated;
@@ -567,8 +571,8 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 						return HeapTupleSelfUpdated;	/* updated after scan
 														 * started */
 					else
-						return HeapTupleInvisible;		/* updated before scan
-														 * started */
+						return HeapTupleInvisible;	/* updated before scan
+													 * started */
 				}
 			}
 
@@ -583,7 +587,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 			if (HeapTupleHeaderGetCmax(tuple) >= curcid)
 				return HeapTupleSelfUpdated;	/* updated after scan started */
 			else
-				return HeapTupleInvisible;		/* updated before scan started */
+				return HeapTupleInvisible;	/* updated before scan started */
 		}
 		else if (TransactionIdIsInProgress(HeapTupleHeaderGetRawXmin(tuple)))
 			return HeapTupleInvisible;
@@ -615,15 +619,12 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 	{
 		TransactionId xmax;
 
+		if (HEAP_LOCKED_UPGRADED(tuple->t_infomask))
+			return HeapTupleMayBeUpdated;
+
 		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 		{
-			/*
-			 * If it's only locked but neither EXCL_LOCK nor KEYSHR_LOCK is
-			 * set, it cannot possibly be running.  Otherwise need to check.
-			 */
-			if ((tuple->t_infomask & (HEAP_XMAX_EXCL_LOCK |
-									  HEAP_XMAX_KEYSHR_LOCK)) &&
-				MultiXactIdIsRunning(HeapTupleHeaderGetRawXmax(tuple), true))
+			if (MultiXactIdIsRunning(HeapTupleHeaderGetRawXmax(tuple), true))
 				return HeapTupleBeingUpdated;
 
 			SetHintBits(tuple, buffer, HEAP_XMAX_INVALID, InvalidTransactionId);
@@ -645,7 +646,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 			if (HeapTupleHeaderGetCmax(tuple) >= curcid)
 				return HeapTupleSelfUpdated;	/* updated after scan started */
 			else
-				return HeapTupleInvisible;		/* updated before scan started */
+				return HeapTupleInvisible;	/* updated before scan started */
 		}
 
 		if (MultiXactIdIsRunning(HeapTupleHeaderGetRawXmax(tuple), false))
@@ -681,7 +682,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 			return HeapTupleBeingUpdated;
 		if (HeapTupleHeaderGetCmax(tuple) >= curcid)
-			return HeapTupleSelfUpdated;		/* updated after scan started */
+			return HeapTupleSelfUpdated;	/* updated after scan started */
 		else
 			return HeapTupleInvisible;	/* updated before scan started */
 	}
@@ -1037,7 +1038,7 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 				else if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
 					return true;	/* updated after scan started */
 				else
-					return false;		/* updated before scan started */
+					return false;	/* updated before scan started */
 			}
 
 			if (!TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmax(tuple)))
@@ -1274,26 +1275,21 @@ HeapTupleSatisfiesVacuum(HeapTuple htup, TransactionId OldestXmin,
 		 * "Deleting" xact really only locked it, so the tuple is live in any
 		 * case.  However, we should make sure that either XMAX_COMMITTED or
 		 * XMAX_INVALID gets set once the xact is gone, to reduce the costs of
-		 * examining the tuple for future xacts.  Also, marking dead
-		 * MultiXacts as invalid here provides defense against MultiXactId
-		 * wraparound (see also comments in heap_freeze_tuple()).
+		 * examining the tuple for future xacts.
 		 */
 		if (!(tuple->t_infomask & HEAP_XMAX_COMMITTED))
 		{
 			if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)
 			{
 				/*
-				 * If it's only locked but neither EXCL_LOCK nor KEYSHR_LOCK
-				 * are set, it cannot possibly be running; otherwise have to
-				 * check.
+				 * If it's a pre-pg_upgrade tuple, the multixact cannot
+				 * possibly be running; otherwise have to check.
 				 */
-				if ((tuple->t_infomask & (HEAP_XMAX_EXCL_LOCK |
-										  HEAP_XMAX_KEYSHR_LOCK)) &&
+				if (!HEAP_LOCKED_UPGRADED(tuple->t_infomask) &&
 					MultiXactIdIsRunning(HeapTupleHeaderGetRawXmax(tuple),
 										 true))
 					return HEAPTUPLE_LIVE;
 				SetHintBits(tuple, buffer, HEAP_XMAX_INVALID, InvalidTransactionId);
-
 			}
 			else
 			{
@@ -1629,7 +1625,7 @@ HeapTupleHeaderIsOnlyLocked(HeapTupleHeader tuple)
 }
 
 /*
- * check whether the transaciont id 'xid' is in the pre-sorted array 'xip'.
+ * check whether the transaction id 'xid' is in the pre-sorted array 'xip'.
  */
 static bool
 TransactionIdInArray(TransactionId xid, TransactionId *xip, Size num)

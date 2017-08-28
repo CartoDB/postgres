@@ -4,7 +4,7 @@
  *	  BTree-specific page management code for the Postgres btree access
  *	  method.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,6 +23,7 @@
 #include "postgres.h"
 
 #include "access/nbtree.h"
+#include "access/nbtxlog.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -512,9 +513,9 @@ _bt_checkpage(Relation rel, Buffer buf)
 	if (PageIsNew(page))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-			 errmsg("index \"%s\" contains unexpected zero page at block %u",
-					RelationGetRelationName(rel),
-					BufferGetBlockNumber(buf)),
+				 errmsg("index \"%s\" contains unexpected zero page at block %u",
+						RelationGetRelationName(rel),
+						BufferGetBlockNumber(buf)),
 				 errhint("Please REINDEX it.")));
 
 	/*
@@ -1066,7 +1067,7 @@ _bt_lock_branch_parent(Relation rel, BlockNumber child, BTStack stack,
 			}
 
 			return _bt_lock_branch_parent(rel, parent, stack->bts_parent,
-										topparent, topoff, target, rightsib);
+										  topparent, topoff, target, rightsib);
 		}
 		else
 		{
@@ -1149,8 +1150,8 @@ _bt_pagedel(Relation rel, Buffer buf)
 			if (P_ISHALFDEAD(opaque))
 				ereport(LOG,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
-					errmsg("index \"%s\" contains a half-dead internal page",
-						   RelationGetRelationName(rel)),
+						 errmsg("index \"%s\" contains a half-dead internal page",
+								RelationGetRelationName(rel)),
 						 errhint("This can be caused by an interrupted VACUUM in version 9.3 or older, before upgrade. Please REINDEX it.")));
 			_bt_relbuf(rel, buf);
 			return ndeleted;
@@ -1255,7 +1256,7 @@ _bt_pagedel(Relation rel, Buffer buf)
 				itup_scankey = _bt_mkscankey(rel, targetkey);
 				/* find the leftmost leaf page containing this key */
 				stack = _bt_search(rel, rel->rd_rel->relnatts, itup_scankey,
-								   false, &lbuf, BT_READ);
+								   false, &lbuf, BT_READ, NULL);
 				/* don't need a pin on the page */
 				_bt_relbuf(rel, lbuf);
 
@@ -1284,7 +1285,7 @@ _bt_pagedel(Relation rel, Buffer buf)
 		{
 			if (!_bt_unlink_halfdead_page(rel, buf, &rightsib_empty))
 			{
-				_bt_relbuf(rel, buf);
+				/* _bt_unlink_halfdead_page already released buffer */
 				return ndeleted;
 			}
 			ndeleted++;
@@ -1501,6 +1502,11 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
  * Returns 'false' if the page could not be unlinked (shouldn't happen).
  * If the (new) right sibling of the page is empty, *rightsib_empty is set
  * to true.
+ *
+ * Must hold pin and lock on leafbuf at entry (read or write doesn't matter).
+ * On success exit, we'll be holding pin and write lock.  On failure exit,
+ * we'll release both pin and lock before returning (we define it that way
+ * to avoid having to reacquire a lock we already released).
  */
 static bool
 _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
@@ -1543,11 +1549,13 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	/*
 	 * If the leaf page still has a parent pointing to it (or a chain of
 	 * parents), we don't unlink the leaf page yet, but the topmost remaining
-	 * parent in the branch.
+	 * parent in the branch.  Set 'target' and 'buf' to reference the page
+	 * actually being unlinked.
 	 */
 	if (ItemPointerIsValid(leafhikey))
 	{
 		target = ItemPointerGetBlockNumber(leafhikey);
+		Assert(target != leafblkno);
 
 		/* fetch the block number of the topmost parent's left sibling */
 		buf = _bt_getbuf(rel, target, BT_READ);
@@ -1567,7 +1575,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 		target = leafblkno;
 
 		buf = leafbuf;
-		leftsib = opaque->btpo_prev;
+		leftsib = leafleftsib;
 		targetlevel = 0;
 	}
 
@@ -1598,8 +1606,20 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 			_bt_relbuf(rel, lbuf);
 			if (leftsib == P_NONE)
 			{
-				elog(LOG, "no left sibling (concurrent deletion?) in \"%s\"",
+				elog(LOG, "no left sibling (concurrent deletion?) of block %u in \"%s\"",
+					 target,
 					 RelationGetRelationName(rel));
+				if (target != leafblkno)
+				{
+					/* we have only a pin on target, but pin+lock on leafbuf */
+					ReleaseBuffer(buf);
+					_bt_relbuf(rel, leafbuf);
+				}
+				else
+				{
+					/* we have only a pin on leafbuf */
+					ReleaseBuffer(leafbuf);
+				}
 				return false;
 			}
 			lbuf = _bt_getbuf(rel, leftsib, BT_WRITE);

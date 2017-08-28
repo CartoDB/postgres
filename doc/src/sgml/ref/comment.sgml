@@ -23,6 +23,7 @@ PostgreSQL documentation
 <synopsis>
 COMMENT ON
 {
+  ACCESS METHOD <replaceable class="PARAMETER">object_name</replaceable> |
   AGGREGATE <replaceable class="PARAMETER">aggregate_name</replaceable> ( <replaceable>aggregate_signature</replaceable> ) |
   CAST (<replaceable>source_type</replaceable> AS <replaceable>target_type</replaceable>) |
   COLLATION <replaceable class="PARAMETER">object_name</replaceable> |
@@ -36,7 +37,7 @@ COMMENT ON
   EVENT TRIGGER <replaceable class="PARAMETER">object_name</replaceable> |
   FOREIGN DATA WRAPPER <replaceable class="PARAMETER">object_name</replaceable> |
   FOREIGN TABLE <replaceable class="PARAMETER">object_name</replaceable> |
-  FUNCTION <replaceable class="PARAMETER">function_name</replaceable> ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">argtype</replaceable> [, ...] ] ) |
+  FUNCTION <replaceable class="PARAMETER">function_name</replaceable> [ ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">argtype</replaceable> [, ...] ] ) ] |
   INDEX <replaceable class="PARAMETER">object_name</replaceable> |
   LARGE OBJECT <replaceable class="PARAMETER">large_object_oid</replaceable> |
   MATERIALIZED VIEW <replaceable class="PARAMETER">object_name</replaceable> |
@@ -45,11 +46,14 @@ COMMENT ON
   OPERATOR FAMILY <replaceable class="PARAMETER">object_name</replaceable> USING <replaceable class="parameter">index_method</replaceable> |
   POLICY <replaceable class="PARAMETER">policy_name</replaceable> ON <replaceable class="PARAMETER">table_name</replaceable> |
   [ PROCEDURAL ] LANGUAGE <replaceable class="PARAMETER">object_name</replaceable> |
+  PUBLICATION <replaceable class="PARAMETER">object_name</replaceable> |
   ROLE <replaceable class="PARAMETER">object_name</replaceable> |
   RULE <replaceable class="PARAMETER">rule_name</replaceable> ON <replaceable class="PARAMETER">table_name</replaceable> |
   SCHEMA <replaceable class="PARAMETER">object_name</replaceable> |
   SEQUENCE <replaceable class="PARAMETER">object_name</replaceable> |
   SERVER <replaceable class="PARAMETER">object_name</replaceable> |
+  STATISTICS <replaceable class="PARAMETER">object_name</replaceable> |
+  SUBSCRIPTION <replaceable class="PARAMETER">object_name</replaceable> |
   TABLE <replaceable class="PARAMETER">object_name</replaceable> |
   TABLESPACE <replaceable class="PARAMETER">object_name</replaceable> |
   TEXT SEARCH CONFIGURATION <replaceable class="PARAMETER">object_name</replaceable> |
@@ -89,6 +93,8 @@ COMMENT ON
    Roles don't have owners, so the rule for <literal>COMMENT ON ROLE</> is
    that you must be superuser to comment on a superuser role, or have the
    <literal>CREATEROLE</> privilege to comment on non-superuser roles.
+   Likewise, access methods don't have owners either; you must be superuser
+   to comment on an access method.
    Of course, a superuser can comment on anything.
   </para>
 
@@ -122,8 +128,8 @@ COMMENT ON
       The name of the object to be commented.  Names of tables,
       aggregates, collations, conversions, domains, foreign tables, functions,
       indexes, operators, operator classes, operator families, sequences,
-      text search objects, types, and views can be schema-qualified.
-      When commenting on a column,
+      statistics, text search objects, types, and views can be
+      schema-qualified. When commenting on a column,
       <replaceable class="parameter">relation_name</replaceable> must refer
       to a table, view, composite type, or foreign table.
      </para>
@@ -135,9 +141,9 @@ COMMENT ON
     <term><replaceable class="parameter">domain_name</replaceable></term>
     <listitem>
      <para>
-      When creating a comment on a constraint, a table, a domain or
+      When creating a comment on a constraint, a trigger, a rule or
       a policy these parameters specify the name of the table or domain on
-      which the constraint is defined.
+      which that object is defined.
      </para>
     </listitem>
    </varlistentry>
@@ -296,6 +302,7 @@ COMMENT ON TABLE mytable IS NULL;
    Some more examples:
 
 <programlisting>
+COMMENT ON ACCESS METHOD rtree IS 'R-Tree access method';
 COMMENT ON AGGREGATE my_aggregate (double precision) IS 'Computes sample variance';
 COMMENT ON CAST (text AS int4) IS 'Allow casts from text to int4';
 COMMENT ON COLLATION "fr_CA" IS 'Canadian French';
@@ -323,6 +330,7 @@ COMMENT ON RULE my_rule ON my_table IS 'Logs updates of employee records';
 COMMENT ON SCHEMA my_schema IS 'Departmental data';
 COMMENT ON SEQUENCE my_sequence IS 'Used to generate primary keys';
 COMMENT ON SERVER myserver IS 'my foreign server';
+COMMENT ON STATISTICS my_statistics IS 'Improves planner row estimations';
 COMMENT ON TABLE my_schema.my_table IS 'Employee Information';
 COMMENT ON TABLESPACE my_tablespace IS 'Tablespace for indexes';
 COMMENT ON TEXT SEARCH CONFIGURATION my_config IS 'Special word filtering';

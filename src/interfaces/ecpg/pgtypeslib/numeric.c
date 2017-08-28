@@ -263,8 +263,7 @@ set_var_from_str(char *str, char **ptr, numeric *dest)
 			return -1;
 		}
 		(*ptr) = endptr;
-		if (exponent > NUMERIC_MAX_PRECISION ||
-			exponent < -NUMERIC_MAX_PRECISION)
+		if (exponent >= INT_MAX / 2 || exponent <= -(INT_MAX / 2))
 		{
 			errno = PGTYPES_NUM_BAD_NUMERIC;
 			return -1;
@@ -1369,11 +1368,11 @@ PGTYPESnumeric_cmp(numeric *var1, numeric *var2)
 {
 	/* use cmp_abs function to calculate the result */
 
-	/* both are positive: normal comparation with cmp_abs */
+	/* both are positive: normal comparison with cmp_abs */
 	if (var1->sign == NUMERIC_POS && var2->sign == NUMERIC_POS)
 		return cmp_abs(var1, var2);
 
-	/* both are negative: return the inverse of the normal comparation */
+	/* both are negative: return the inverse of the normal comparison */
 	if (var1->sign == NUMERIC_NEG && var2->sign == NUMERIC_NEG)
 	{
 		/*

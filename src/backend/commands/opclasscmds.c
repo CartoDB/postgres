@@ -4,7 +4,7 @@
  *
  *	  Routines for opclass (and opfamily) manipulation commands
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,6 +26,7 @@
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/opfam_internal.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_namespace.h"
@@ -277,20 +278,22 @@ CreateOpFamily(char *amname, char *opfname, Oid namespaceoid, Oid amoid)
 
 	tup = heap_form_tuple(rel->rd_att, values, nulls);
 
-	opfamilyoid = simple_heap_insert(rel, tup);
-
-	CatalogUpdateIndexes(rel, tup);
+	opfamilyoid = CatalogTupleInsert(rel, tup);
 
 	heap_freetuple(tup);
 
 	/*
-	 * Create dependencies for the opfamily proper.  Note: we do not create a
-	 * dependency link to the AM, because we don't currently support DROP
-	 * ACCESS METHOD.
+	 * Create dependencies for the opfamily proper.
 	 */
 	myself.classId = OperatorFamilyRelationId;
 	myself.objectId = opfamilyoid;
 	myself.objectSubId = 0;
+
+	/* dependency on access method */
+	referenced.classId = AccessMethodRelationId;
+	referenced.objectId = amoid;
+	referenced.objectSubId = 0;
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);
 
 	/* dependency on namespace */
 	referenced.classId = NamespaceRelationId;
@@ -334,7 +337,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 	ListCell   *l;
 	Relation	rel;
 	HeapTuple	tup;
-	Form_pg_am	pg_am;
+	IndexAmRoutine *amroutine;
 	Datum		values[Natts_pg_opclass];
 	bool		nulls[Natts_pg_opclass];
 	AclResult	aclresult;
@@ -361,17 +364,17 @@ DefineOpClass(CreateOpClassStmt *stmt)
 						stmt->amname)));
 
 	amoid = HeapTupleGetOid(tup);
-	pg_am = (Form_pg_am) GETSTRUCT(tup);
-	maxOpNumber = pg_am->amstrategies;
+	amroutine = GetIndexAmRoutineByAmId(amoid, false);
+	ReleaseSysCache(tup);
+
+	maxOpNumber = amroutine->amstrategies;
 	/* if amstrategies is zero, just enforce that op numbers fit in int16 */
 	if (maxOpNumber <= 0)
 		maxOpNumber = SHRT_MAX;
-	maxProcNumber = pg_am->amsupport;
-	amstorage = pg_am->amstorage;
+	maxProcNumber = amroutine->amsupport;
+	amstorage = amroutine->amstorage;
 
 	/* XXX Should we make any privilege check against the AM? */
-
-	ReleaseSysCache(tup);
 
 	/*
 	 * The question of appropriate permissions for CREATE OPERATOR CLASS is
@@ -457,13 +460,12 @@ DefineOpClass(CreateOpClassStmt *stmt)
 	 */
 	foreach(l, stmt->items)
 	{
-		CreateOpClassItem *item = lfirst(l);
+		CreateOpClassItem *item = lfirst_node(CreateOpClassItem, l);
 		Oid			operOid;
 		Oid			funcOid;
 		Oid			sortfamilyOid;
 		OpFamilyMember *member;
 
-		Assert(IsA(item, CreateOpClassItem));
 		switch (item->itemtype)
 		{
 			case OPCLASS_ITEM_OPERATOR:
@@ -473,19 +475,12 @@ DefineOpClass(CreateOpClassStmt *stmt)
 							 errmsg("invalid operator number %d,"
 									" must be between 1 and %d",
 									item->number, maxOpNumber)));
-				if (item->args != NIL)
-				{
-					TypeName   *typeName1 = (TypeName *) linitial(item->args);
-					TypeName   *typeName2 = (TypeName *) lsecond(item->args);
-
-					operOid = LookupOperNameTypeNames(NULL, item->name,
-													  typeName1, typeName2,
-													  false, -1);
-				}
+				if (item->name->objargs != NIL)
+					operOid = LookupOperWithArgs(item->name, false);
 				else
 				{
 					/* Default to binary op on input datatype */
-					operOid = LookupOperName(NULL, item->name,
+					operOid = LookupOperName(NULL, item->name->objname,
 											 typeoid, typeoid,
 											 false, -1);
 				}
@@ -524,8 +519,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 							 errmsg("invalid procedure number %d,"
 									" must be between 1 and %d",
 									item->number, maxProcNumber)));
-				funcOid = LookupFuncNameTypeNames(item->name, item->args,
-												  false);
+				funcOid = LookupFuncWithArgs(item->name, false);
 #ifdef NOT_USED
 				/* XXX this is unnecessary given the superuser check above */
 				/* Caller must own function */
@@ -551,7 +545,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 				if (OidIsValid(storageoid))
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						   errmsg("storage type specified more than once")));
+							 errmsg("storage type specified more than once")));
 				storageoid = typenameTypeId(NULL, item->storedtype);
 
 #ifdef NOT_USED
@@ -625,8 +619,8 @@ DefineOpClass(CreateOpClassStmt *stmt)
 						 errmsg("could not make operator class \"%s\" be default for type %s",
 								opcname,
 								TypeNameToString(stmt->datatype)),
-				   errdetail("Operator class \"%s\" already is the default.",
-							 NameStr(opclass->opcname))));
+						 errdetail("Operator class \"%s\" already is the default.",
+								   NameStr(opclass->opcname))));
 		}
 
 		systable_endscan(scan);
@@ -650,9 +644,7 @@ DefineOpClass(CreateOpClassStmt *stmt)
 
 	tup = heap_form_tuple(rel->rd_att, values, nulls);
 
-	opclassoid = simple_heap_insert(rel, tup);
-
-	CatalogUpdateIndexes(rel, tup);
+	opclassoid = CatalogTupleInsert(rel, tup);
 
 	heap_freetuple(tup);
 
@@ -669,9 +661,8 @@ DefineOpClass(CreateOpClassStmt *stmt)
 	EventTriggerCollectCreateOpClass(stmt, opclassoid, operators, procedures);
 
 	/*
-	 * Create dependencies for the opclass proper.  Note: we do not create a
-	 * dependency link to the AM, because we don't currently support DROP
-	 * ACCESS METHOD.
+	 * Create dependencies for the opclass proper.  Note: we do not need a
+	 * dependency link to the AM, because that exists through the opfamily.
 	 */
 	myself.classId = OperatorClassRelationId;
 	myself.objectId = opclassoid;
@@ -742,7 +733,7 @@ DefineOpFamily(CreateOpFamilyStmt *stmt)
 					   get_namespace_name(namespaceoid));
 
 	/* Get access method OID, throwing an error if it doesn't exist. */
-	amoid = get_am_oid(stmt->amname, false);
+	amoid = get_index_am_oid(stmt->amname, false);
 
 	/* XXX Should we make any privilege check against the AM? */
 
@@ -776,7 +767,7 @@ AlterOpFamily(AlterOpFamilyStmt *stmt)
 	int			maxOpNumber,	/* amstrategies value */
 				maxProcNumber;	/* amsupport value */
 	HeapTuple	tup;
-	Form_pg_am	pg_am;
+	IndexAmRoutine *amroutine;
 
 	/* Get necessary info about access method */
 	tup = SearchSysCache1(AMNAME, CStringGetDatum(stmt->amname));
@@ -787,16 +778,16 @@ AlterOpFamily(AlterOpFamilyStmt *stmt)
 						stmt->amname)));
 
 	amoid = HeapTupleGetOid(tup);
-	pg_am = (Form_pg_am) GETSTRUCT(tup);
-	maxOpNumber = pg_am->amstrategies;
+	amroutine = GetIndexAmRoutineByAmId(amoid, false);
+	ReleaseSysCache(tup);
+
+	maxOpNumber = amroutine->amstrategies;
 	/* if amstrategies is zero, just enforce that op numbers fit in int16 */
 	if (maxOpNumber <= 0)
 		maxOpNumber = SHRT_MAX;
-	maxProcNumber = pg_am->amsupport;
+	maxProcNumber = amroutine->amsupport;
 
 	/* XXX Should we make any privilege check against the AM? */
-
-	ReleaseSysCache(tup);
 
 	/* Look up the opfamily */
 	opfamilyoid = get_opfamily_oid(amoid, stmt->opfamilyname, false);
@@ -843,13 +834,12 @@ AlterOpFamilyAdd(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 	 */
 	foreach(l, items)
 	{
-		CreateOpClassItem *item = lfirst(l);
+		CreateOpClassItem *item = lfirst_node(CreateOpClassItem, l);
 		Oid			operOid;
 		Oid			funcOid;
 		Oid			sortfamilyOid;
 		OpFamilyMember *member;
 
-		Assert(IsA(item, CreateOpClassItem));
 		switch (item->itemtype)
 		{
 			case OPCLASS_ITEM_OPERATOR:
@@ -859,21 +849,14 @@ AlterOpFamilyAdd(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 							 errmsg("invalid operator number %d,"
 									" must be between 1 and %d",
 									item->number, maxOpNumber)));
-				if (item->args != NIL)
-				{
-					TypeName   *typeName1 = (TypeName *) linitial(item->args);
-					TypeName   *typeName2 = (TypeName *) lsecond(item->args);
-
-					operOid = LookupOperNameTypeNames(NULL, item->name,
-													  typeName1, typeName2,
-													  false, -1);
-				}
+				if (item->name->objargs != NIL)
+					operOid = LookupOperWithArgs(item->name, false);
 				else
 				{
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("operator argument types must be specified in ALTER OPERATOR FAMILY")));
-					operOid = InvalidOid;		/* keep compiler quiet */
+					operOid = InvalidOid;	/* keep compiler quiet */
 				}
 
 				if (item->order_family)
@@ -910,8 +893,7 @@ AlterOpFamilyAdd(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 							 errmsg("invalid procedure number %d,"
 									" must be between 1 and %d",
 									item->number, maxProcNumber)));
-				funcOid = LookupFuncNameTypeNames(item->name, item->args,
-												  false);
+				funcOid = LookupFuncWithArgs(item->name, false);
 #ifdef NOT_USED
 				/* XXX this is unnecessary given the superuser check above */
 				/* Caller must own function */
@@ -977,12 +959,11 @@ AlterOpFamilyDrop(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 	 */
 	foreach(l, items)
 	{
-		CreateOpClassItem *item = lfirst(l);
+		CreateOpClassItem *item = lfirst_node(CreateOpClassItem, l);
 		Oid			lefttype,
 					righttype;
 		OpFamilyMember *member;
 
-		Assert(IsA(item, CreateOpClassItem));
 		switch (item->itemtype)
 		{
 			case OPCLASS_ITEM_OPERATOR:
@@ -992,7 +973,7 @@ AlterOpFamilyDrop(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 							 errmsg("invalid operator number %d,"
 									" must be between 1 and %d",
 									item->number, maxOpNumber)));
-				processTypesSpec(item->args, &lefttype, &righttype);
+				processTypesSpec(item->class_args, &lefttype, &righttype);
 				/* Save the info */
 				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->number = item->number;
@@ -1007,7 +988,7 @@ AlterOpFamilyDrop(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 							 errmsg("invalid procedure number %d,"
 									" must be between 1 and %d",
 									item->number, maxProcNumber)));
-				processTypesSpec(item->args, &lefttype, &righttype);
+				processTypesSpec(item->class_args, &lefttype, &righttype);
 				/* Save the info */
 				member = (OpFamilyMember *) palloc0(sizeof(OpFamilyMember));
 				member->number = item->number;
@@ -1099,21 +1080,13 @@ assignOperTypes(OpFamilyMember *member, Oid amoid, Oid typeoid)
 		 * the family has been created but not yet populated with the required
 		 * operators.)
 		 */
-		HeapTuple	amtup;
-		Form_pg_am	pg_am;
+		IndexAmRoutine *amroutine = GetIndexAmRoutineByAmId(amoid, false);
 
-		amtup = SearchSysCache1(AMOID, ObjectIdGetDatum(amoid));
-		if (amtup == NULL)
-			elog(ERROR, "cache lookup failed for access method %u", amoid);
-		pg_am = (Form_pg_am) GETSTRUCT(amtup);
-
-		if (!pg_am->amcanorderbyop)
+		if (!amroutine->amcanorderbyop)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-			errmsg("access method \"%s\" does not support ordering operators",
-				   NameStr(pg_am->amname))));
-
-		ReleaseSysCache(amtup);
+					 errmsg("access method \"%s\" does not support ordering operators",
+							get_am_name(amoid))));
 	}
 	else
 	{
@@ -1169,7 +1142,7 @@ assignProcTypes(OpFamilyMember *member, Oid amoid, Oid typeoid)
 			if (procform->prorettype != INT4OID)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("btree comparison procedures must return integer")));
+						 errmsg("btree comparison procedures must return integer")));
 
 			/*
 			 * If lefttype/righttype isn't specified, use the proc's input
@@ -1190,7 +1163,7 @@ assignProcTypes(OpFamilyMember *member, Oid amoid, Oid typeoid)
 			if (procform->prorettype != VOIDOID)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				  errmsg("btree sort support procedures must return void")));
+						 errmsg("btree sort support procedures must return void")));
 
 			/*
 			 * Can't infer lefttype/righttype from proc, so use default rule
@@ -1334,9 +1307,7 @@ storeOperators(List *opfamilyname, Oid amoid,
 
 		tup = heap_form_tuple(rel->rd_att, values, nulls);
 
-		entryoid = simple_heap_insert(rel, tup);
-
-		CatalogUpdateIndexes(rel, tup);
+		entryoid = CatalogTupleInsert(rel, tup);
 
 		heap_freetuple(tup);
 
@@ -1445,9 +1416,7 @@ storeProcedures(List *opfamilyname, Oid amoid,
 
 		tup = heap_form_tuple(rel->rd_att, values, nulls);
 
-		entryoid = simple_heap_insert(rel, tup);
-
-		CatalogUpdateIndexes(rel, tup);
+		entryoid = CatalogTupleInsert(rel, tup);
 
 		heap_freetuple(tup);
 
@@ -1586,7 +1555,7 @@ RemoveOpFamilyById(Oid opfamilyOid)
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for opfamily %u", opfamilyOid);
 
-	simple_heap_delete(rel, &tup->t_self);
+	CatalogTupleDelete(rel, &tup->t_self);
 
 	ReleaseSysCache(tup);
 
@@ -1605,7 +1574,7 @@ RemoveOpClassById(Oid opclassOid)
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for opclass %u", opclassOid);
 
-	simple_heap_delete(rel, &tup->t_self);
+	CatalogTupleDelete(rel, &tup->t_self);
 
 	ReleaseSysCache(tup);
 
@@ -1635,7 +1604,7 @@ RemoveAmOpEntryById(Oid entryOid)
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "could not find tuple for amop entry %u", entryOid);
 
-	simple_heap_delete(rel, &tup->t_self);
+	CatalogTupleDelete(rel, &tup->t_self);
 
 	systable_endscan(scan);
 	heap_close(rel, RowExclusiveLock);
@@ -1664,25 +1633,10 @@ RemoveAmProcEntryById(Oid entryOid)
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "could not find tuple for amproc entry %u", entryOid);
 
-	simple_heap_delete(rel, &tup->t_self);
+	CatalogTupleDelete(rel, &tup->t_self);
 
 	systable_endscan(scan);
 	heap_close(rel, RowExclusiveLock);
-}
-
-char *
-get_am_name(Oid amOid)
-{
-	HeapTuple	tup;
-	char	   *result = NULL;
-
-	tup = SearchSysCache1(AMOID, ObjectIdGetDatum(amOid));
-	if (HeapTupleIsValid(tup))
-	{
-		result = pstrdup(NameStr(((Form_pg_am) GETSTRUCT(tup))->amname));
-		ReleaseSysCache(tup);
-	}
-	return result;
 }
 
 /*
@@ -1729,23 +1683,4 @@ IsThereOpFamilyInNamespace(const char *opfname, Oid opfmethod,
 						opfname,
 						get_am_name(opfmethod),
 						get_namespace_name(opfnamespace))));
-}
-
-/*
- * get_am_oid - given an access method name, look up the OID
- *
- * If missing_ok is false, throw an error if access method not found.  If
- * true, just return InvalidOid.
- */
-Oid
-get_am_oid(const char *amname, bool missing_ok)
-{
-	Oid			oid;
-
-	oid = GetSysCacheOid1(AMNAME, CStringGetDatum(amname));
-	if (!OidIsValid(oid) && !missing_ok)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("access method \"%s\" does not exist", amname)));
-	return oid;
 }

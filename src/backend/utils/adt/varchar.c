@@ -3,7 +3,7 @@
  * varchar.c
  *	  Functions for the built-in types char(n) and varchar(n).
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,10 +17,12 @@
 
 #include "access/hash.h"
 #include "access/tuptoaster.h"
+#include "catalog/pg_collation.h"
 #include "libpq/pqformat.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/varlena.h"
 #include "mb/pg_wchar.h"
 
 
@@ -465,8 +467,8 @@ varchar_input(const char *s, size_t len, int32 atttypmod)
 			if (s[j] != ' ')
 				ereport(ERROR,
 						(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
-					  errmsg("value too long for type character varying(%d)",
-							 (int) maxlen)));
+						 errmsg("value too long for type character varying(%d)",
+								(int) maxlen)));
 		}
 
 		len = mbmaxlen;
@@ -552,11 +554,10 @@ varcharsend(PG_FUNCTION_ARGS)
 Datum
 varchar_transform(PG_FUNCTION_ARGS)
 {
-	FuncExpr   *expr = (FuncExpr *) PG_GETARG_POINTER(0);
+	FuncExpr   *expr = castNode(FuncExpr, PG_GETARG_POINTER(0));
 	Node	   *ret = NULL;
 	Node	   *typmod;
 
-	Assert(IsA(expr, FuncExpr));
 	Assert(list_length(expr->args) >= 2);
 
 	typmod = (Node *) lsecond(expr->args);
@@ -619,8 +620,8 @@ varchar(PG_FUNCTION_ARGS)
 			if (s_data[i] != ' ')
 				ereport(ERROR,
 						(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
-					  errmsg("value too long for type character varying(%d)",
-							 maxlen)));
+						 errmsg("value too long for type character varying(%d)",
+								maxlen)));
 	}
 
 	PG_RETURN_VARCHAR_P((VarChar *) cstring_to_text_with_len(s_data,
@@ -649,14 +650,21 @@ varchartypmodout(PG_FUNCTION_ARGS)
  *****************************************************************************/
 
 /* "True" length (not counting trailing blanks) of a BpChar */
-static int
+static inline int
 bcTruelen(BpChar *arg)
 {
-	char	   *s = VARDATA_ANY(arg);
-	int			i;
-	int			len;
+	return bpchartruelen(VARDATA_ANY(arg), VARSIZE_ANY_EXHDR(arg));
+}
 
-	len = VARSIZE_ANY_EXHDR(arg);
+int
+bpchartruelen(char *s, int len)
+{
+	int			i;
+
+	/*
+	 * Note that we rely on the assumption that ' ' is a singleton unit on
+	 * every supported multibyte server encoding.
+	 */
 	for (i = len - 1; i >= 0; i--)
 	{
 		if (s[i] != ' ')
@@ -859,6 +867,23 @@ bpcharcmp(PG_FUNCTION_ARGS)
 }
 
 Datum
+bpchar_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+	Oid			collid = ssup->ssup_collation;
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(ssup->ssup_cxt);
+
+	/* Use generic string SortSupport */
+	varstr_sortsupport(ssup, collid, true);
+
+	MemoryContextSwitchTo(oldcontext);
+
+	PG_RETURN_VOID();
+}
+
+Datum
 bpchar_larger(PG_FUNCTION_ARGS)
 {
 	BpChar	   *arg1 = PG_GETARG_BPCHAR_PP(0);
@@ -926,8 +951,9 @@ hashbpchar(PG_FUNCTION_ARGS)
 /*
  * The following operators support character-by-character comparison
  * of bpchar datums, to allow building indexes suitable for LIKE clauses.
- * Note that the regular bpchareq/bpcharne comparison operators are assumed
- * to be compatible with these!
+ * Note that the regular bpchareq/bpcharne comparison operators, and
+ * regular support functions 1 and 2 with "C" collation are assumed to be
+ * compatible with these!
  */
 
 static int
@@ -1029,4 +1055,21 @@ btbpchar_pattern_cmp(PG_FUNCTION_ARGS)
 	PG_FREE_IF_COPY(arg2, 1);
 
 	PG_RETURN_INT32(result);
+}
+
+
+Datum
+btbpchar_pattern_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(ssup->ssup_cxt);
+
+	/* Use generic string SortSupport, forcing "C" collation */
+	varstr_sortsupport(ssup, C_COLLATION_OID, true);
+
+	MemoryContextSwitchTo(oldcontext);
+
+	PG_RETURN_VOID();
 }

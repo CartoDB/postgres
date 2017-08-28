@@ -100,9 +100,9 @@ gtrgm_compress(PG_FUNCTION_ARGS)
 	if (entry->leafkey)
 	{							/* trgm */
 		TRGM	   *res;
-		text	   *val = DatumGetTextP(entry->key);
+		text	   *val = DatumGetTextPP(entry->key);
 
-		res = generate_trgm(VARDATA(val), VARSIZE(val) - VARHDRSZ);
+		res = generate_trgm(VARDATA_ANY(val), VARSIZE_ANY_EXHDR(val));
 		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
 		gistentryinit(*retval, PointerGetDatum(res),
 					  entry->rel, entry->page,
@@ -142,7 +142,7 @@ gtrgm_decompress(PG_FUNCTION_ARGS)
 	GISTENTRY  *retval;
 	text	   *key;
 
-	key = DatumGetTextP(entry->key);
+	key = DatumGetTextPP(entry->key);
 
 	if (key != (text *) DatumGetPointer(entry->key))
 	{
@@ -191,6 +191,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 	bool		res;
 	Size		querysize = VARSIZE(query);
 	gtrgm_consistent_cache *cache;
+	double		nlimit;
 
 	/*
 	 * We keep the extracted trigrams in cache, because trigram extraction is
@@ -199,11 +200,12 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 	 * depends on strategy.
 	 *
 	 * The cached structure is a single palloc chunk containing the
-	 * gtrgm_consistent_cache header, then the input query (starting at a
-	 * MAXALIGN boundary), then the TRGM value (also starting at a MAXALIGN
-	 * boundary).  However we don't try to include the regex graph (if any) in
-	 * that struct.  (XXX currently, this approach can leak regex graphs
-	 * across index rescans.  Not clear if that's worth fixing.)
+	 * gtrgm_consistent_cache header, then the input query (4-byte length
+	 * word, uncompressed, starting at a MAXALIGN boundary), then the TRGM
+	 * value (also starting at a MAXALIGN boundary).  However we don't try to
+	 * include the regex graph (if any) in that struct.  (XXX currently, this
+	 * approach can leak regex graphs across index rescans.  Not clear if
+	 * that's worth fixing.)
 	 */
 	cache = (gtrgm_consistent_cache *) fcinfo->flinfo->fn_extra;
 	if (cache == NULL ||
@@ -218,6 +220,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 		switch (strategy)
 		{
 			case SimilarityStrategyNumber:
+			case WordSimilarityStrategyNumber:
 				qtrg = generate_trgm(VARDATA(query),
 									 querysize - VARHDRSZ);
 				break;
@@ -286,15 +289,17 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 	switch (strategy)
 	{
 		case SimilarityStrategyNumber:
-			/* Similarity search is exact */
-			*recheck = false;
+		case WordSimilarityStrategyNumber:
+			/* Similarity search is exact. Word similarity search is inexact */
+			*recheck = (strategy == WordSimilarityStrategyNumber);
+			nlimit = (strategy == SimilarityStrategyNumber) ?
+				similarity_threshold : word_similarity_threshold;
 
 			if (GIST_LEAF(entry))
 			{					/* all leafs contains orig trgm */
-				float4		tmpsml = cnt_sml(key, qtrg);
+				double		tmpsml = cnt_sml(qtrg, key, *recheck);
 
-				/* strange bug at freebsd 5.2.1 and gcc 3.3.3 */
-				res = (*(int *) &tmpsml == *(int *) &trgm_limit || tmpsml > trgm_limit) ? true : false;
+				res = (tmpsml >= nlimit);
 			}
 			else if (ISALLTRUE(key))
 			{					/* non-leaf contains signature */
@@ -308,7 +313,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 				if (len == 0)
 					res = false;
 				else
-					res = (((((float8) count) / ((float8) len))) >= trgm_limit) ? true : false;
+					res = (((((float8) count) / ((float8) len))) >= nlimit);
 			}
 			break;
 		case ILikeStrategyNumber:
@@ -426,6 +431,7 @@ gtrgm_distance(PG_FUNCTION_ARGS)
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
 
 	/* Oid		subtype = PG_GETARG_OID(3); */
+	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	TRGM	   *key = (TRGM *) DatumGetPointer(entry->key);
 	TRGM	   *qtrg;
 	float8		res;
@@ -461,9 +467,19 @@ gtrgm_distance(PG_FUNCTION_ARGS)
 	switch (strategy)
 	{
 		case DistanceStrategyNumber:
+		case WordDistanceStrategyNumber:
+			*recheck = strategy == WordDistanceStrategyNumber;
 			if (GIST_LEAF(entry))
 			{					/* all leafs contains orig trgm */
-				res = 1.0 - cnt_sml(key, qtrg);
+
+				/*
+				 * Prevent gcc optimizing the sml variable using volatile
+				 * keyword. Otherwise res can differ from the
+				 * word_similarity_dist_op() function.
+				 */
+				float4 volatile sml = cnt_sml(qtrg, key, *recheck);
+
+				res = 1.0 - sml;
 			}
 			else if (ISALLTRUE(key))
 			{					/* all leafs contains orig trgm */

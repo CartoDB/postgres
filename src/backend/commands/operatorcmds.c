@@ -4,7 +4,7 @@
  *
  *	  Routines for operator manipulation commands
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -70,16 +70,16 @@ DefineOperator(List *names, List *parameters)
 	char	   *oprName;
 	Oid			oprNamespace;
 	AclResult	aclresult;
-	bool		canMerge = false;		/* operator merges */
+	bool		canMerge = false;	/* operator merges */
 	bool		canHash = false;	/* operator hashes */
-	List	   *functionName = NIL;		/* function for operator */
-	TypeName   *typeName1 = NULL;		/* first type name */
-	TypeName   *typeName2 = NULL;		/* second type name */
+	List	   *functionName = NIL; /* function for operator */
+	TypeName   *typeName1 = NULL;	/* first type name */
+	TypeName   *typeName2 = NULL;	/* second type name */
 	Oid			typeId1 = InvalidOid;	/* types converted to OID */
 	Oid			typeId2 = InvalidOid;
 	Oid			rettype;
 	List	   *commutatorName = NIL;	/* optional commutator operator name */
-	List	   *negatorName = NIL;		/* optional negator operator name */
+	List	   *negatorName = NIL;	/* optional negator operator name */
 	List	   *restrictionName = NIL;	/* optional restrict. sel. procedure */
 	List	   *joinName = NIL; /* optional join sel. procedure */
 	Oid			functionOid;	/* functions converted to OID */
@@ -111,7 +111,7 @@ DefineOperator(List *names, List *parameters)
 			if (typeName1->setof)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-					errmsg("SETOF type not allowed for operator argument")));
+						 errmsg("SETOF type not allowed for operator argument")));
 		}
 		else if (pg_strcasecmp(defel->defname, "rightarg") == 0)
 		{
@@ -119,7 +119,7 @@ DefineOperator(List *names, List *parameters)
 			if (typeName2->setof)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-					errmsg("SETOF type not allowed for operator argument")));
+						 errmsg("SETOF type not allowed for operator argument")));
 		}
 		else if (pg_strcasecmp(defel->defname, "procedure") == 0)
 			functionName = defGetQualifiedName(defel);
@@ -171,7 +171,7 @@ DefineOperator(List *names, List *parameters)
 	if (!OidIsValid(typeId1) && !OidIsValid(typeId2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-		   errmsg("at least one of leftarg or rightarg must be specified")));
+				 errmsg("at least one of leftarg or rightarg must be specified")));
 
 	if (typeName1)
 	{
@@ -243,9 +243,9 @@ DefineOperator(List *names, List *parameters)
 					   oprNamespace,	/* namespace */
 					   typeId1, /* left type id */
 					   typeId2, /* right type id */
-					   functionOid,		/* function for operator */
+					   functionOid, /* function for operator */
 					   commutatorName,	/* optional commutator operator name */
-					   negatorName,		/* optional negator operator name */
+					   negatorName, /* optional negator operator name */
 					   restrictionOid,	/* optional restrict. sel. procedure */
 					   joinOid, /* optional join sel. procedure name */
 					   canMerge,	/* operator merges */
@@ -275,8 +275,8 @@ ValidateRestrictionEstimator(List *restrictionName)
 	if (get_func_rettype(restrictionOid) != FLOAT8OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("restriction estimator function %s must return type \"float8\"",
-						NameListToString(restrictionName))));
+				 errmsg("restriction estimator function %s must return type %s",
+						NameListToString(restrictionName), "float8")));
 
 	/* Require EXECUTE rights for the estimator */
 	aclresult = pg_proc_aclcheck(restrictionOid, GetUserId(), ACL_EXECUTE);
@@ -321,8 +321,8 @@ ValidateJoinEstimator(List *joinName)
 	if (get_func_rettype(joinOid) != FLOAT8OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-			 errmsg("join estimator function %s must return type \"float8\"",
-					NameListToString(joinName))));
+				 errmsg("join estimator function %s must return type %s",
+						NameListToString(joinName), "float8")));
 
 	/* Require EXECUTE rights for the estimator */
 	aclresult = pg_proc_aclcheck(joinOid, GetUserId(), ACL_EXECUTE);
@@ -341,14 +341,34 @@ RemoveOperatorById(Oid operOid)
 {
 	Relation	relation;
 	HeapTuple	tup;
+	Form_pg_operator op;
 
 	relation = heap_open(OperatorRelationId, RowExclusiveLock);
 
 	tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for operator %u", operOid);
+	op = (Form_pg_operator) GETSTRUCT(tup);
 
-	simple_heap_delete(relation, &tup->t_self);
+	/*
+	 * Reset links from commutator and negator, if any.  In case of a
+	 * self-commutator or self-negator, this means we have to re-fetch the
+	 * updated tuple.  (We could optimize away updates on the tuple we're
+	 * about to drop, but it doesn't seem worth convoluting the logic for.)
+	 */
+	if (OidIsValid(op->oprcom) || OidIsValid(op->oprnegate))
+	{
+		OperatorUpd(operOid, op->oprcom, op->oprnegate, true);
+		if (operOid == op->oprcom || operOid == op->oprnegate)
+		{
+			ReleaseSysCache(tup);
+			tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
+			if (!HeapTupleIsValid(tup)) /* should not happen */
+				elog(ERROR, "cache lookup failed for operator %u", operOid);
+		}
+	}
+
+	CatalogTupleDelete(relation, &tup->t_self);
 
 	ReleaseSysCache(tup);
 
@@ -382,10 +402,7 @@ AlterOperator(AlterOperatorStmt *stmt)
 	Oid			joinOid;
 
 	/* Look up the operator */
-	oprId = LookupOperNameTypeNames(NULL, stmt->opername,
-									(TypeName *) linitial(stmt->operargs),
-									(TypeName *) lsecond(stmt->operargs),
-									false, -1);
+	oprId = LookupOperWithArgs(stmt->opername, false);
 	catalog = heap_open(OperatorRelationId, RowExclusiveLock);
 	tup = SearchSysCacheCopy1(OPEROID, ObjectIdGetDatum(oprId));
 	if (tup == NULL)
@@ -428,7 +445,7 @@ AlterOperator(AlterOperatorStmt *stmt)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("operator attribute \"%s\" can not be changed",
+					 errmsg("operator attribute \"%s\" cannot be changed",
 							defel->defname)));
 		}
 		else
@@ -462,7 +479,7 @@ AlterOperator(AlterOperatorStmt *stmt)
 		if (OidIsValid(joinOid))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				 errmsg("only binary operators can have join selectivity")));
+					 errmsg("only binary operators can have join selectivity")));
 	}
 
 	if (oprForm->oprresult != BOOLOID)
@@ -474,7 +491,7 @@ AlterOperator(AlterOperatorStmt *stmt)
 		if (OidIsValid(joinOid))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				errmsg("only boolean operators can have join selectivity")));
+					 errmsg("only boolean operators can have join selectivity")));
 	}
 
 	/* Update the tuple */
@@ -498,8 +515,7 @@ AlterOperator(AlterOperatorStmt *stmt)
 	tup = heap_modify_tuple(tup, RelationGetDescr(catalog),
 							values, nulls, replaces);
 
-	simple_heap_update(catalog, &tup->t_self, tup);
-	CatalogUpdateIndexes(catalog, tup);
+	CatalogTupleUpdate(catalog, &tup->t_self, tup);
 
 	address = makeOperatorDependencies(tup, true);
 

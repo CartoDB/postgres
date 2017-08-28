@@ -3,7 +3,7 @@
  * fd.c
  *	  Virtual file descriptor code.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -61,6 +61,10 @@
 #include <sys/file.h>
 #include <sys/param.h>
 #include <sys/stat.h>
+#ifndef WIN32
+#include <sys/mman.h>
+#endif
+#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #ifdef HAVE_SYS_RESOURCE_H
@@ -73,6 +77,7 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_tablespace.h"
 #include "pgstat.h"
+#include "portability/mem.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "utils/guc.h"
@@ -81,6 +86,8 @@
 
 /* Define PG_FLUSH_DATA_WORKS if we have an implementation for pg_flush_data */
 #if defined(HAVE_SYNC_FILE_RANGE)
+#define PG_FLUSH_DATA_WORKS 1
+#elif !defined(WIN32) && defined(MS_ASYNC)
 #define PG_FLUSH_DATA_WORKS 1
 #elif defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_DONTNEED)
 #define PG_FLUSH_DATA_WORKS 1
@@ -153,7 +160,14 @@ int			max_safe_fds = 32;	/* default if not changed */
 
 #define FileIsNotOpen(file) (VfdCache[file].fd == VFD_CLOSED)
 
+/*
+ * Note: a VFD's seekPos is normally always valid, but if for some reason
+ * an lseek() fails, it might become set to FileUnknownPos.  We can struggle
+ * along without knowing the seek position in many cases, but in some places
+ * we have to fail if we don't have it.
+ */
 #define FileUnknownPos ((off_t) -1)
+#define FilePosIsUnknown(pos) ((pos) < 0)
 
 /* these are the assigned bits in fdstate below: */
 #define FD_TEMPORARY		(1 << 0)	/* T = delete when closed */
@@ -167,7 +181,7 @@ typedef struct vfd
 	File		nextFree;		/* link to next free VFD, if in freelist */
 	File		lruMoreRecently;	/* doubly linked recency-of-use list */
 	File		lruLessRecently;
-	off_t		seekPos;		/* current logical file position */
+	off_t		seekPos;		/* current logical file position, or -1 */
 	off_t		fileSize;		/* current size of file (0 if not temporary) */
 	char	   *fileName;		/* name of file, or NULL for unused VFD */
 	/* NB: fileName is malloc'd, and must be free'd when closing the VFD */
@@ -306,7 +320,10 @@ static void walkdir(const char *path,
 #ifdef PG_FLUSH_DATA_WORKS
 static void pre_sync_fname(const char *fname, bool isdir, int elevel);
 #endif
-static void fsync_fname_ext(const char *fname, bool isdir, int elevel);
+static void datadir_fsync_fname(const char *fname, bool isdir, int elevel);
+
+static int	fsync_fname_ext(const char *fname, bool isdir, bool ignore_perm, int elevel);
+static int	fsync_parent_path(const char *fname, int elevel);
 
 
 /*
@@ -380,29 +397,163 @@ pg_fdatasync(int fd)
 }
 
 /*
- * pg_flush_data --- advise OS that the data described won't be needed soon
+ * pg_flush_data --- advise OS that the described dirty data should be flushed
  *
- * Not all platforms have sync_file_range or posix_fadvise; treat as no-op
- * if not available.  Also, treat as no-op if enableFsync is off; this is
- * because the call isn't free, and some platforms such as Linux will actually
- * block the requestor until the write is scheduled.
+ * offset of 0 with nbytes 0 means that the entire file should be flushed;
+ * in this case, this function may have side-effects on the file's
+ * seek position!
  */
-int
-pg_flush_data(int fd, off_t offset, off_t amount)
+void
+pg_flush_data(int fd, off_t offset, off_t nbytes)
 {
-#ifdef PG_FLUSH_DATA_WORKS
-	if (enableFsync)
-	{
+	/*
+	 * Right now file flushing is primarily used to avoid making later
+	 * fsync()/fdatasync() calls have less impact. Thus don't trigger flushes
+	 * if fsyncs are disabled - that's a decision we might want to make
+	 * configurable at some point.
+	 */
+	if (!enableFsync)
+		return;
+
+	/*
+	 * We compile all alternatives that are supported on the current platform,
+	 * to find portability problems more easily.
+	 */
 #if defined(HAVE_SYNC_FILE_RANGE)
-		return sync_file_range(fd, offset, amount, SYNC_FILE_RANGE_WRITE);
-#elif defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_DONTNEED)
-		return posix_fadvise(fd, offset, amount, POSIX_FADV_DONTNEED);
-#else
-#error PG_FLUSH_DATA_WORKS should not have been defined
-#endif
+	{
+		int			rc;
+
+		/*
+		 * sync_file_range(SYNC_FILE_RANGE_WRITE), currently linux specific,
+		 * tells the OS that writeback for the specified blocks should be
+		 * started, but that we don't want to wait for completion.  Note that
+		 * this call might block if too much dirty data exists in the range.
+		 * This is the preferable method on OSs supporting it, as it works
+		 * reliably when available (contrast to msync()) and doesn't flush out
+		 * clean data (like FADV_DONTNEED).
+		 */
+		rc = sync_file_range(fd, offset, nbytes,
+							 SYNC_FILE_RANGE_WRITE);
+
+		/* don't error out, this is just a performance optimization */
+		if (rc != 0)
+		{
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not flush dirty data: %m")));
+		}
+
+		return;
 	}
 #endif
-	return 0;
+#if !defined(WIN32) && defined(MS_ASYNC)
+	{
+		void	   *p;
+		static int	pagesize = 0;
+
+		/*
+		 * On several OSs msync(MS_ASYNC) on a mmap'ed file triggers
+		 * writeback. On linux it only does so if MS_SYNC is specified, but
+		 * then it does the writeback synchronously. Luckily all common linux
+		 * systems have sync_file_range().  This is preferable over
+		 * FADV_DONTNEED because it doesn't flush out clean data.
+		 *
+		 * We map the file (mmap()), tell the kernel to sync back the contents
+		 * (msync()), and then remove the mapping again (munmap()).
+		 */
+
+		/* mmap() needs actual length if we want to map whole file */
+		if (offset == 0 && nbytes == 0)
+		{
+			nbytes = lseek(fd, 0, SEEK_END);
+			if (nbytes < 0)
+			{
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("could not determine dirty data size: %m")));
+				return;
+			}
+		}
+
+		/*
+		 * Some platforms reject partial-page mmap() attempts.  To deal with
+		 * that, just truncate the request to a page boundary.  If any extra
+		 * bytes don't get flushed, well, it's only a hint anyway.
+		 */
+
+		/* fetch pagesize only once */
+		if (pagesize == 0)
+			pagesize = sysconf(_SC_PAGESIZE);
+
+		/* align length to pagesize, dropping any fractional page */
+		if (pagesize > 0)
+			nbytes = (nbytes / pagesize) * pagesize;
+
+		/* fractional-page request is a no-op */
+		if (nbytes <= 0)
+			return;
+
+		/*
+		 * mmap could well fail, particularly on 32-bit platforms where there
+		 * may simply not be enough address space.  If so, silently fall
+		 * through to the next implementation.
+		 */
+		if (nbytes <= (off_t) SSIZE_MAX)
+			p = mmap(NULL, nbytes, PROT_READ, MAP_SHARED, fd, offset);
+		else
+			p = MAP_FAILED;
+
+		if (p != MAP_FAILED)
+		{
+			int			rc;
+
+			rc = msync(p, (size_t) nbytes, MS_ASYNC);
+			if (rc != 0)
+			{
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("could not flush dirty data: %m")));
+				/* NB: need to fall through to munmap()! */
+			}
+
+			rc = munmap(p, (size_t) nbytes);
+			if (rc != 0)
+			{
+				/* FATAL error because mapping would remain */
+				ereport(FATAL,
+						(errcode_for_file_access(),
+						 errmsg("could not munmap() while flushing data: %m")));
+			}
+
+			return;
+		}
+	}
+#endif
+#if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_DONTNEED)
+	{
+		int			rc;
+
+		/*
+		 * Signal the kernel that the passed in range should not be cached
+		 * anymore. This has the, desired, side effect of writing out dirty
+		 * data, and the, undesired, side effect of likely discarding useful
+		 * clean cached blocks.  For the latter reason this is the least
+		 * preferable method.
+		 */
+
+		rc = posix_fadvise(fd, offset, nbytes, POSIX_FADV_DONTNEED);
+
+		if (rc != 0)
+		{
+			/* don't error out, this is just a performance optimization */
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not flush dirty data: %m")));
+		}
+
+		return;
+	}
+#endif
 }
 
 
@@ -413,54 +564,195 @@ pg_flush_data(int fd, off_t offset, off_t amount)
  * indicate the OS just doesn't allow/require fsyncing directories.
  */
 void
-fsync_fname(char *fname, bool isdir)
+fsync_fname(const char *fname, bool isdir)
 {
-	int			fd;
-	int			returncode;
-
-	/*
-	 * Some OSs require directories to be opened read-only whereas other
-	 * systems don't allow us to fsync files opened read-only; so we need both
-	 * cases here
-	 */
-	if (!isdir)
-		fd = OpenTransientFile(fname,
-							   O_RDWR | PG_BINARY,
-							   S_IRUSR | S_IWUSR);
-	else
-		fd = OpenTransientFile(fname,
-							   O_RDONLY | PG_BINARY,
-							   S_IRUSR | S_IWUSR);
-
-	/*
-	 * Some OSs don't allow us to open directories at all (Windows returns
-	 * EACCES)
-	 */
-	if (fd < 0 && isdir && (errno == EISDIR || errno == EACCES))
-		return;
-
-	else if (fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", fname)));
-
-	returncode = pg_fsync(fd);
-
-	/* Some OSs don't allow us to fsync directories at all */
-	if (returncode != 0 && isdir && errno == EBADF)
-	{
-		CloseTransientFile(fd);
-		return;
-	}
-
-	if (returncode != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync file \"%s\": %m", fname)));
-
-	CloseTransientFile(fd);
+	fsync_fname_ext(fname, isdir, false, ERROR);
 }
 
+/*
+ * durable_rename -- rename(2) wrapper, issuing fsyncs required for durability
+ *
+ * This routine ensures that, after returning, the effect of renaming file
+ * persists in case of a crash. A crash while this routine is running will
+ * leave you with either the pre-existing or the moved file in place of the
+ * new file; no mixed state or truncated files are possible.
+ *
+ * It does so by using fsync on the old filename and the possibly existing
+ * target filename before the rename, and the target file and directory after.
+ *
+ * Note that rename() cannot be used across arbitrary directories, as they
+ * might not be on the same filesystem. Therefore this routine does not
+ * support renaming across directories.
+ *
+ * Log errors with the caller specified severity.
+ *
+ * Returns 0 if the operation succeeded, -1 otherwise. Note that errno is not
+ * valid upon return.
+ */
+int
+durable_rename(const char *oldfile, const char *newfile, int elevel)
+{
+	int			fd;
+
+	/*
+	 * First fsync the old and target path (if it exists), to ensure that they
+	 * are properly persistent on disk. Syncing the target file is not
+	 * strictly necessary, but it makes it easier to reason about crashes;
+	 * because it's then guaranteed that either source or target file exists
+	 * after a crash.
+	 */
+	if (fsync_fname_ext(oldfile, false, false, elevel) != 0)
+		return -1;
+
+	fd = OpenTransientFile((char *) newfile, PG_BINARY | O_RDWR, 0);
+	if (fd < 0)
+	{
+		if (errno != ENOENT)
+		{
+			ereport(elevel,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m", newfile)));
+			return -1;
+		}
+	}
+	else
+	{
+		if (pg_fsync(fd) != 0)
+		{
+			int			save_errno;
+
+			/* close file upon error, might not be in transaction context */
+			save_errno = errno;
+			CloseTransientFile(fd);
+			errno = save_errno;
+
+			ereport(elevel,
+					(errcode_for_file_access(),
+					 errmsg("could not fsync file \"%s\": %m", newfile)));
+			return -1;
+		}
+		CloseTransientFile(fd);
+	}
+
+	/* Time to do the real deal... */
+	if (rename(oldfile, newfile) < 0)
+	{
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not rename file \"%s\" to \"%s\": %m",
+						oldfile, newfile)));
+		return -1;
+	}
+
+	/*
+	 * To guarantee renaming the file is persistent, fsync the file with its
+	 * new name, and its containing directory.
+	 */
+	if (fsync_fname_ext(newfile, false, false, elevel) != 0)
+		return -1;
+
+	if (fsync_parent_path(newfile, elevel) != 0)
+		return -1;
+
+	return 0;
+}
+
+/*
+ * durable_unlink -- remove a file in a durable manner
+ *
+ * This routine ensures that, after returning, the effect of removing file
+ * persists in case of a crash. A crash while this routine is running will
+ * leave the system in no mixed state.
+ *
+ * It does so by using fsync on the parent directory of the file after the
+ * actual removal is done.
+ *
+ * Log errors with the severity specified by caller.
+ *
+ * Returns 0 if the operation succeeded, -1 otherwise. Note that errno is not
+ * valid upon return.
+ */
+int
+durable_unlink(const char *fname, int elevel)
+{
+	if (unlink(fname) < 0)
+	{
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not remove file \"%s\": %m",
+						fname)));
+		return -1;
+	}
+
+	/*
+	 * To guarantee that the removal of the file is persistent, fsync its
+	 * parent directory.
+	 */
+	if (fsync_parent_path(fname, elevel) != 0)
+		return -1;
+
+	return 0;
+}
+
+/*
+ * durable_link_or_rename -- rename a file in a durable manner.
+ *
+ * Similar to durable_rename(), except that this routine tries (but does not
+ * guarantee) not to overwrite the target file.
+ *
+ * Note that a crash in an unfortunate moment can leave you with two links to
+ * the target file.
+ *
+ * Log errors with the caller specified severity.
+ *
+ * Returns 0 if the operation succeeded, -1 otherwise. Note that errno is not
+ * valid upon return.
+ */
+int
+durable_link_or_rename(const char *oldfile, const char *newfile, int elevel)
+{
+	/*
+	 * Ensure that, if we crash directly after the rename/link, a file with
+	 * valid contents is moved into place.
+	 */
+	if (fsync_fname_ext(oldfile, false, false, elevel) != 0)
+		return -1;
+
+#if HAVE_WORKING_LINK
+	if (link(oldfile, newfile) < 0)
+	{
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not link file \"%s\" to \"%s\": %m",
+						oldfile, newfile)));
+		return -1;
+	}
+	unlink(oldfile);
+#else
+	/* XXX: Add racy file existence check? */
+	if (rename(oldfile, newfile) < 0)
+	{
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not rename file \"%s\" to \"%s\": %m",
+						oldfile, newfile)));
+		return -1;
+	}
+#endif
+
+	/*
+	 * Make change persistent in case of an OS crash, both the new entry and
+	 * its parent directory need to be flushed.
+	 */
+	if (fsync_fname_ext(newfile, false, false, elevel) != 0)
+		return -1;
+
+	/* Same for parent directory */
+	if (fsync_parent_path(newfile, elevel) != 0)
+		return -1;
+
+	return 0;
+}
 
 /*
  * InitFileAccess --- initialize this module during backend startup
@@ -523,10 +815,10 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
 	getrlimit_status = getrlimit(RLIMIT_NOFILE, &rlim);
 #else							/* but BSD doesn't ... */
 	getrlimit_status = getrlimit(RLIMIT_OFILE, &rlim);
-#endif   /* RLIMIT_NOFILE */
+#endif							/* RLIMIT_NOFILE */
 	if (getrlimit_status != 0)
 		ereport(WARNING, (errmsg("getrlimit failed: %m")));
-#endif   /* HAVE_GETRLIMIT */
+#endif							/* HAVE_GETRLIMIT */
 
 	/* dup until failure or probe limit reached */
 	for (;;)
@@ -686,7 +978,7 @@ _dump_lru(void)
 	snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "LEAST");
 	elog(LOG, "%s", buf);
 }
-#endif   /* FDDEBUG */
+#endif							/* FDDEBUG */
 
 static void
 Delete(File file)
@@ -719,19 +1011,33 @@ LruDelete(File file)
 
 	vfdP = &VfdCache[file];
 
+	/*
+	 * Normally we should know the seek position, but if for some reason we
+	 * have lost track of it, try again to get it.  If we still can't get it,
+	 * we have a problem: we will be unable to restore the file seek position
+	 * when and if the file is re-opened.  But we can't really throw an error
+	 * and refuse to close the file, or activities such as transaction cleanup
+	 * will be broken.
+	 */
+	if (FilePosIsUnknown(vfdP->seekPos))
+	{
+		vfdP->seekPos = lseek(vfdP->fd, (off_t) 0, SEEK_CUR);
+		if (FilePosIsUnknown(vfdP->seekPos))
+			elog(LOG, "could not seek file \"%s\" before closing: %m",
+				 vfdP->fileName);
+	}
+
+	/*
+	 * Close the file.  We aren't expecting this to fail; if it does, better
+	 * to leak the FD than to mess up our internal state.
+	 */
+	if (close(vfdP->fd))
+		elog(LOG, "could not close file \"%s\": %m", vfdP->fileName);
+	vfdP->fd = VFD_CLOSED;
+	--nfile;
+
 	/* delete the vfd record from the LRU ring */
 	Delete(file);
-
-	/* save the seek position */
-	vfdP->seekPos = lseek(vfdP->fd, (off_t) 0, SEEK_CUR);
-	Assert(vfdP->seekPos != (off_t) -1);
-
-	/* close the file */
-	if (close(vfdP->fd))
-		elog(ERROR, "could not close file \"%s\": %m", vfdP->fileName);
-
-	--nfile;
-	vfdP->fd = VFD_CLOSED;
 }
 
 static void
@@ -782,22 +1088,39 @@ LruInsert(File file)
 								 vfdP->fileMode);
 		if (vfdP->fd < 0)
 		{
-			DO_DB(elog(LOG, "RE_OPEN FAILED: %d", errno));
+			DO_DB(elog(LOG, "re-open failed: %m"));
 			return -1;
 		}
 		else
 		{
-			DO_DB(elog(LOG, "RE_OPEN SUCCESS"));
 			++nfile;
 		}
 
-		/* seek to the right position */
+		/*
+		 * Seek to the right position.  We need no special case for seekPos
+		 * equal to FileUnknownPos, as lseek() will certainly reject that
+		 * (thus completing the logic noted in LruDelete() that we will fail
+		 * to re-open a file if we couldn't get its seek position before
+		 * closing).
+		 */
 		if (vfdP->seekPos != (off_t) 0)
 		{
-			off_t returnValue PG_USED_FOR_ASSERTS_ONLY;
+			if (lseek(vfdP->fd, vfdP->seekPos, SEEK_SET) < 0)
+			{
+				/*
+				 * If we fail to restore the seek position, treat it like an
+				 * open() failure.
+				 */
+				int			save_errno = errno;
 
-			returnValue = lseek(vfdP->fd, vfdP->seekPos, SEEK_SET);
-			Assert(returnValue != (off_t) -1);
+				elog(LOG, "could not seek file \"%s\" after re-opening: %m",
+					 vfdP->fileName);
+				(void) close(vfdP->fd);
+				vfdP->fd = VFD_CLOSED;
+				--nfile;
+				errno = save_errno;
+				return -1;
+			}
 		}
 	}
 
@@ -1180,15 +1503,15 @@ FileClose(File file)
 
 	if (!FileIsNotOpen(file))
 	{
-		/* remove the file from the lru ring */
-		Delete(file);
-
 		/* close the file */
 		if (close(vfdP->fd))
-			elog(ERROR, "could not close file \"%s\": %m", vfdP->fileName);
+			elog(LOG, "could not close file \"%s\": %m", vfdP->fileName);
 
 		--nfile;
 		vfdP->fd = VFD_CLOSED;
+
+		/* remove the file from the lru ring */
+		Delete(file);
 	}
 
 	/*
@@ -1264,7 +1587,7 @@ FileClose(File file)
  * to read into.
  */
 int
-FilePrefetch(File file, off_t offset, int amount)
+FilePrefetch(File file, off_t offset, int amount, uint32 wait_event_info)
 {
 #if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_WILLNEED)
 	int			returnCode;
@@ -1279,8 +1602,10 @@ FilePrefetch(File file, off_t offset, int amount)
 	if (returnCode < 0)
 		return returnCode;
 
+	pgstat_report_wait_start(wait_event_info);
 	returnCode = posix_fadvise(VfdCache[file].fd, offset, amount,
 							   POSIX_FADV_WILLNEED);
+	pgstat_report_wait_end();
 
 	return returnCode;
 #else
@@ -1289,10 +1614,38 @@ FilePrefetch(File file, off_t offset, int amount)
 #endif
 }
 
-int
-FileRead(File file, char *buffer, int amount)
+void
+FileWriteback(File file, off_t offset, off_t nbytes, uint32 wait_event_info)
 {
 	int			returnCode;
+
+	Assert(FileIsValid(file));
+
+	DO_DB(elog(LOG, "FileWriteback: %d (%s) " INT64_FORMAT " " INT64_FORMAT,
+			   file, VfdCache[file].fileName,
+			   (int64) offset, (int64) nbytes));
+
+	/*
+	 * Caution: do not call pg_flush_data with nbytes = 0, it could trash the
+	 * file's seek position.  We prefer to define that as a no-op here.
+	 */
+	if (nbytes <= 0)
+		return;
+
+	returnCode = FileAccess(file);
+	if (returnCode < 0)
+		return;
+
+	pgstat_report_wait_start(wait_event_info);
+	pg_flush_data(VfdCache[file].fd, offset, nbytes);
+	pgstat_report_wait_end();
+}
+
+int
+FileRead(File file, char *buffer, int amount, uint32 wait_event_info)
+{
+	int			returnCode;
+	Vfd		   *vfdP;
 
 	Assert(FileIsValid(file));
 
@@ -1305,11 +1658,19 @@ FileRead(File file, char *buffer, int amount)
 	if (returnCode < 0)
 		return returnCode;
 
+	vfdP = &VfdCache[file];
+
 retry:
-	returnCode = read(VfdCache[file].fd, buffer, amount);
+	pgstat_report_wait_start(wait_event_info);
+	returnCode = read(vfdP->fd, buffer, amount);
+	pgstat_report_wait_end();
 
 	if (returnCode >= 0)
-		VfdCache[file].seekPos += returnCode;
+	{
+		/* if seekPos is unknown, leave it that way */
+		if (!FilePosIsUnknown(vfdP->seekPos))
+			vfdP->seekPos += returnCode;
+	}
 	else
 	{
 		/*
@@ -1338,16 +1699,17 @@ retry:
 			goto retry;
 
 		/* Trouble, so assume we don't know the file position anymore */
-		VfdCache[file].seekPos = FileUnknownPos;
+		vfdP->seekPos = FileUnknownPos;
 	}
 
 	return returnCode;
 }
 
 int
-FileWrite(File file, char *buffer, int amount)
+FileWrite(File file, char *buffer, int amount, uint32 wait_event_info)
 {
 	int			returnCode;
+	Vfd		   *vfdP;
 
 	Assert(FileIsValid(file));
 
@@ -1360,6 +1722,8 @@ FileWrite(File file, char *buffer, int amount)
 	if (returnCode < 0)
 		return returnCode;
 
+	vfdP = &VfdCache[file];
+
 	/*
 	 * If enforcing temp_file_limit and it's a temp file, check to see if the
 	 * write would overrun temp_file_limit, and throw error if so.  Note: it's
@@ -1368,26 +1732,41 @@ FileWrite(File file, char *buffer, int amount)
 	 * message if we do that.  All current callers would just throw error
 	 * immediately anyway, so this is safe at present.
 	 */
-	if (temp_file_limit >= 0 && (VfdCache[file].fdstate & FD_TEMPORARY))
+	if (temp_file_limit >= 0 && (vfdP->fdstate & FD_TEMPORARY))
 	{
-		off_t		newPos = VfdCache[file].seekPos + amount;
+		off_t		newPos;
 
-		if (newPos > VfdCache[file].fileSize)
+		/*
+		 * Normally we should know the seek position, but if for some reason
+		 * we have lost track of it, try again to get it.  Here, it's fine to
+		 * throw an error if we still can't get it.
+		 */
+		if (FilePosIsUnknown(vfdP->seekPos))
+		{
+			vfdP->seekPos = lseek(vfdP->fd, (off_t) 0, SEEK_CUR);
+			if (FilePosIsUnknown(vfdP->seekPos))
+				elog(ERROR, "could not seek file \"%s\": %m", vfdP->fileName);
+		}
+
+		newPos = vfdP->seekPos + amount;
+		if (newPos > vfdP->fileSize)
 		{
 			uint64		newTotal = temporary_files_size;
 
-			newTotal += newPos - VfdCache[file].fileSize;
+			newTotal += newPos - vfdP->fileSize;
 			if (newTotal > (uint64) temp_file_limit * (uint64) 1024)
 				ereport(ERROR,
 						(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-				 errmsg("temporary file size exceeds temp_file_limit (%dkB)",
-						temp_file_limit)));
+						 errmsg("temporary file size exceeds temp_file_limit (%dkB)",
+								temp_file_limit)));
 		}
 	}
 
 retry:
 	errno = 0;
-	returnCode = write(VfdCache[file].fd, buffer, amount);
+	pgstat_report_wait_start(wait_event_info);
+	returnCode = write(vfdP->fd, buffer, amount);
+	pgstat_report_wait_end();
 
 	/* if write didn't set errno, assume problem is no disk space */
 	if (returnCode != amount && errno == 0)
@@ -1395,17 +1774,25 @@ retry:
 
 	if (returnCode >= 0)
 	{
-		VfdCache[file].seekPos += returnCode;
+		/* if seekPos is unknown, leave it that way */
+		if (!FilePosIsUnknown(vfdP->seekPos))
+			vfdP->seekPos += returnCode;
 
-		/* maintain fileSize and temporary_files_size if it's a temp file */
-		if (VfdCache[file].fdstate & FD_TEMPORARY)
+		/*
+		 * Maintain fileSize and temporary_files_size if it's a temp file.
+		 *
+		 * If seekPos is -1 (unknown), this will do nothing; but we could only
+		 * get here in that state if we're not enforcing temporary_files_size,
+		 * so we don't care.
+		 */
+		if (vfdP->fdstate & FD_TEMPORARY)
 		{
-			off_t		newPos = VfdCache[file].seekPos;
+			off_t		newPos = vfdP->seekPos;
 
-			if (newPos > VfdCache[file].fileSize)
+			if (newPos > vfdP->fileSize)
 			{
-				temporary_files_size += newPos - VfdCache[file].fileSize;
-				VfdCache[file].fileSize = newPos;
+				temporary_files_size += newPos - vfdP->fileSize;
+				vfdP->fileSize = newPos;
 			}
 		}
 	}
@@ -1433,14 +1820,14 @@ retry:
 			goto retry;
 
 		/* Trouble, so assume we don't know the file position anymore */
-		VfdCache[file].seekPos = FileUnknownPos;
+		vfdP->seekPos = FileUnknownPos;
 	}
 
 	return returnCode;
 }
 
 int
-FileSync(File file)
+FileSync(File file, uint32 wait_event_info)
 {
 	int			returnCode;
 
@@ -1453,13 +1840,17 @@ FileSync(File file)
 	if (returnCode < 0)
 		return returnCode;
 
-	return pg_fsync(VfdCache[file].fd);
+	pgstat_report_wait_start(wait_event_info);
+	returnCode = pg_fsync(VfdCache[file].fd);
+	pgstat_report_wait_end();
+
+	return returnCode;
 }
 
 off_t
 FileSeek(File file, off_t offset, int whence)
 {
-	int			returnCode;
+	Vfd		   *vfdP;
 
 	Assert(FileIsValid(file));
 
@@ -1468,25 +1859,33 @@ FileSeek(File file, off_t offset, int whence)
 			   (int64) VfdCache[file].seekPos,
 			   (int64) offset, whence));
 
+	vfdP = &VfdCache[file];
+
 	if (FileIsNotOpen(file))
 	{
 		switch (whence)
 		{
 			case SEEK_SET:
 				if (offset < 0)
-					elog(ERROR, "invalid seek offset: " INT64_FORMAT,
-						 (int64) offset);
-				VfdCache[file].seekPos = offset;
+				{
+					errno = EINVAL;
+					return (off_t) -1;
+				}
+				vfdP->seekPos = offset;
 				break;
 			case SEEK_CUR:
-				VfdCache[file].seekPos += offset;
+				if (FilePosIsUnknown(vfdP->seekPos) ||
+					vfdP->seekPos + offset < 0)
+				{
+					errno = EINVAL;
+					return (off_t) -1;
+				}
+				vfdP->seekPos += offset;
 				break;
 			case SEEK_END:
-				returnCode = FileAccess(file);
-				if (returnCode < 0)
-					return returnCode;
-				VfdCache[file].seekPos = lseek(VfdCache[file].fd,
-											   offset, whence);
+				if (FileAccess(file) < 0)
+					return (off_t) -1;
+				vfdP->seekPos = lseek(vfdP->fd, offset, whence);
 				break;
 			default:
 				elog(ERROR, "invalid whence: %d", whence);
@@ -1499,27 +1898,27 @@ FileSeek(File file, off_t offset, int whence)
 		{
 			case SEEK_SET:
 				if (offset < 0)
-					elog(ERROR, "invalid seek offset: " INT64_FORMAT,
-						 (int64) offset);
-				if (VfdCache[file].seekPos != offset)
-					VfdCache[file].seekPos = lseek(VfdCache[file].fd,
-												   offset, whence);
+				{
+					errno = EINVAL;
+					return (off_t) -1;
+				}
+				if (vfdP->seekPos != offset)
+					vfdP->seekPos = lseek(vfdP->fd, offset, whence);
 				break;
 			case SEEK_CUR:
-				if (offset != 0 || VfdCache[file].seekPos == FileUnknownPos)
-					VfdCache[file].seekPos = lseek(VfdCache[file].fd,
-												   offset, whence);
+				if (offset != 0 || FilePosIsUnknown(vfdP->seekPos))
+					vfdP->seekPos = lseek(vfdP->fd, offset, whence);
 				break;
 			case SEEK_END:
-				VfdCache[file].seekPos = lseek(VfdCache[file].fd,
-											   offset, whence);
+				vfdP->seekPos = lseek(vfdP->fd, offset, whence);
 				break;
 			default:
 				elog(ERROR, "invalid whence: %d", whence);
 				break;
 		}
 	}
-	return VfdCache[file].seekPos;
+
+	return vfdP->seekPos;
 }
 
 /*
@@ -1537,7 +1936,7 @@ FileTell(File file)
 #endif
 
 int
-FileTruncate(File file, off_t offset)
+FileTruncate(File file, off_t offset, uint32 wait_event_info)
 {
 	int			returnCode;
 
@@ -1550,7 +1949,9 @@ FileTruncate(File file, off_t offset)
 	if (returnCode < 0)
 		return returnCode;
 
+	pgstat_report_wait_start(wait_event_info);
 	returnCode = ftruncate(VfdCache[file].fd, offset);
+	pgstat_report_wait_end();
 
 	if (returnCode == 0 && VfdCache[file].fileSize > offset)
 	{
@@ -1577,6 +1978,40 @@ FilePathName(File file)
 	return VfdCache[file].fileName;
 }
 
+/*
+ * Return the raw file descriptor of an opened file.
+ *
+ * The returned file descriptor will be valid until the file is closed, but
+ * there are a lot of things that can make that happen.  So the caller should
+ * be careful not to do much of anything else before it finishes using the
+ * returned file descriptor.
+ */
+int
+FileGetRawDesc(File file)
+{
+	Assert(FileIsValid(file));
+	return VfdCache[file].fd;
+}
+
+/*
+ * FileGetRawFlags - returns the file flags on open(2)
+ */
+int
+FileGetRawFlags(File file)
+{
+	Assert(FileIsValid(file));
+	return VfdCache[file].fileFlags;
+}
+
+/*
+ * FileGetRawMode - returns the mode bitmask passed to open(2)
+ */
+int
+FileGetRawMode(File file)
+{
+	Assert(FileIsValid(file));
+	return VfdCache[file].fileMode;
+}
 
 /*
  * Make room for another allocatedDescs[] array entry if needed and possible.
@@ -2067,7 +2502,7 @@ closeAllVfds(void)
 
 	if (SizeVfdCache > 0)
 	{
-		Assert(FileIsNotOpen(0));		/* Make sure ring not corrupted */
+		Assert(FileIsNotOpen(0));	/* Make sure ring not corrupted */
 		for (i = 1; i < SizeVfdCache; i++)
 		{
 			if (!FileIsNotOpen(i))
@@ -2218,7 +2653,7 @@ CleanupTempFiles(bool isProcExit)
 	 */
 	if (isProcExit || have_xact_temporary_files)
 	{
-		Assert(FileIsNotOpen(0));		/* Make sure ring not corrupted */
+		Assert(FileIsNotOpen(0));	/* Make sure ring not corrupted */
 		for (i = 1; i < SizeVfdCache; i++)
 		{
 			unsigned short fdstate = VfdCache[i].fdstate;
@@ -2270,7 +2705,7 @@ CleanupTempFiles(bool isProcExit)
 void
 RemovePgTempFiles(void)
 {
-	char		temp_path[MAXPGPATH];
+	char		temp_path[MAXPGPATH + 10 + sizeof(TABLESPACE_VERSION_DIRECTORY) + sizeof(PG_TEMP_FILES_DIR)];
 	DIR		   *spc_dir;
 	struct dirent *spc_de;
 
@@ -2293,7 +2728,7 @@ RemovePgTempFiles(void)
 			continue;
 
 		snprintf(temp_path, sizeof(temp_path), "pg_tblspc/%s/%s/%s",
-			spc_de->d_name, TABLESPACE_VERSION_DIRECTORY, PG_TEMP_FILES_DIR);
+				 spc_de->d_name, TABLESPACE_VERSION_DIRECTORY, PG_TEMP_FILES_DIR);
 		RemovePgTempFilesInDir(temp_path);
 
 		snprintf(temp_path, sizeof(temp_path), "pg_tblspc/%s/%s",
@@ -2318,7 +2753,7 @@ RemovePgTempFilesInDir(const char *tmpdirname)
 {
 	DIR		   *temp_dir;
 	struct dirent *temp_de;
-	char		rm_path[MAXPGPATH];
+	char		rm_path[MAXPGPATH * 2];
 
 	temp_dir = AllocateDir(tmpdirname);
 	if (temp_dir == NULL)
@@ -2359,7 +2794,7 @@ RemovePgTempRelationFiles(const char *tsdirname)
 {
 	DIR		   *ts_dir;
 	struct dirent *de;
-	char		dbspace_path[MAXPGPATH];
+	char		dbspace_path[MAXPGPATH * 2];
 
 	ts_dir = AllocateDir(tsdirname);
 	if (ts_dir == NULL)
@@ -2400,7 +2835,7 @@ RemovePgTempRelationFilesInDbspace(const char *dbspacedirname)
 {
 	DIR		   *dbspace_dir;
 	struct dirent *de;
-	char		rm_path[MAXPGPATH];
+	char		rm_path[MAXPGPATH * 2];
 
 	dbspace_dir = AllocateDir(dbspacedirname);
 	if (dbspace_dir == NULL)
@@ -2480,7 +2915,7 @@ looks_like_temp_rel_name(const char *name)
  * Issue fsync recursively on PGDATA and all its contents.
  *
  * We fsync regular files and directories wherever they are, but we
- * follow symlinks only for pg_xlog and immediately under pg_tblspc.
+ * follow symlinks only for pg_wal and immediately under pg_tblspc.
  * Other symlinks are presumed to point at files we're not responsible
  * for fsyncing, and might not have privileges to write at all.
  *
@@ -2504,7 +2939,7 @@ SyncDataDirectory(void)
 		return;
 
 	/*
-	 * If pg_xlog is a symlink, we'll need to recurse into it separately,
+	 * If pg_wal is a symlink, we'll need to recurse into it separately,
 	 * because the first walkdir below will ignore it.
 	 */
 	xlog_is_symlink = false;
@@ -2513,16 +2948,16 @@ SyncDataDirectory(void)
 	{
 		struct stat st;
 
-		if (lstat("pg_xlog", &st) < 0)
+		if (lstat("pg_wal", &st) < 0)
 			ereport(LOG,
 					(errcode_for_file_access(),
 					 errmsg("could not stat file \"%s\": %m",
-							"pg_xlog")));
+							"pg_wal")));
 		else if (S_ISLNK(st.st_mode))
 			xlog_is_symlink = true;
 	}
 #else
-	if (pgwin32_is_junction("pg_xlog"))
+	if (pgwin32_is_junction("pg_wal"))
 		xlog_is_symlink = true;
 #endif
 
@@ -2534,7 +2969,7 @@ SyncDataDirectory(void)
 #ifdef PG_FLUSH_DATA_WORKS
 	walkdir(".", pre_sync_fname, false, DEBUG1);
 	if (xlog_is_symlink)
-		walkdir("pg_xlog", pre_sync_fname, false, DEBUG1);
+		walkdir("pg_wal", pre_sync_fname, false, DEBUG1);
 	walkdir("pg_tblspc", pre_sync_fname, true, DEBUG1);
 #endif
 
@@ -2542,15 +2977,15 @@ SyncDataDirectory(void)
 	 * Now we do the fsync()s in the same order.
 	 *
 	 * The main call ignores symlinks, so in addition to specially processing
-	 * pg_xlog if it's a symlink, pg_tblspc has to be visited separately with
+	 * pg_wal if it's a symlink, pg_tblspc has to be visited separately with
 	 * process_symlinks = true.  Note that if there are any plain directories
 	 * in pg_tblspc, they'll get fsync'd twice.  That's not an expected case
 	 * so we don't worry about optimizing it.
 	 */
-	walkdir(".", fsync_fname_ext, false, LOG);
+	walkdir(".", datadir_fsync_fname, false, LOG);
 	if (xlog_is_symlink)
-		walkdir("pg_xlog", fsync_fname_ext, false, LOG);
-	walkdir("pg_tblspc", fsync_fname_ext, true, LOG);
+		walkdir("pg_wal", datadir_fsync_fname, false, LOG);
+	walkdir("pg_tblspc", datadir_fsync_fname, true, LOG);
 }
 
 /*
@@ -2587,7 +3022,7 @@ walkdir(const char *path,
 
 	while ((de = ReadDirExtended(dir, path, elevel)) != NULL)
 	{
-		char		subpath[MAXPGPATH];
+		char		subpath[MAXPGPATH * 2];
 		struct stat fst;
 		int			sret;
 
@@ -2597,7 +3032,7 @@ walkdir(const char *path,
 			strcmp(de->d_name, "..") == 0)
 			continue;
 
-		snprintf(subpath, MAXPGPATH, "%s/%s", path, de->d_name);
+		snprintf(subpath, sizeof(subpath), "%s/%s", path, de->d_name);
 
 		if (process_symlinks)
 			sret = stat(subpath, &fst);
@@ -2642,11 +3077,15 @@ pre_sync_fname(const char *fname, bool isdir, int elevel)
 {
 	int			fd;
 
+	/* Don't try to flush directories, it'll likely just fail */
+	if (isdir)
+		return;
+
 	fd = OpenTransientFile((char *) fname, O_RDONLY | PG_BINARY, 0);
 
 	if (fd < 0)
 	{
-		if (errno == EACCES || (isdir && errno == EISDIR))
+		if (errno == EACCES)
 			return;
 		ereport(elevel,
 				(errcode_for_file_access(),
@@ -2655,24 +3094,36 @@ pre_sync_fname(const char *fname, bool isdir, int elevel)
 	}
 
 	/*
-	 * We ignore errors from pg_flush_data() because this is only a hint.
+	 * pg_flush_data() ignores errors, which is ok because this is only a
+	 * hint.
 	 */
-	(void) pg_flush_data(fd, 0, 0);
+	pg_flush_data(fd, 0, 0);
 
 	(void) CloseTransientFile(fd);
 }
 
-#endif   /* PG_FLUSH_DATA_WORKS */
+#endif							/* PG_FLUSH_DATA_WORKS */
+
+static void
+datadir_fsync_fname(const char *fname, bool isdir, int elevel)
+{
+	/*
+	 * We want to silently ignoring errors about unreadable files.  Pass that
+	 * desire on to fsync_fname_ext().
+	 */
+	fsync_fname_ext(fname, isdir, true, elevel);
+}
 
 /*
  * fsync_fname_ext -- Try to fsync a file or directory
  *
- * Ignores errors trying to open unreadable files, or trying to fsync
- * directories on systems where that isn't allowed/required, and logs other
- * errors at a caller-specified level.
+ * If ignore_perm is true, ignore errors upon trying to open unreadable
+ * files. Logs other errors at a caller-specified level.
+ *
+ * Returns 0 if the operation succeeded, -1 otherwise.
  */
-static void
-fsync_fname_ext(const char *fname, bool isdir, int elevel)
+static int
+fsync_fname_ext(const char *fname, bool isdir, bool ignore_perm, int elevel)
 {
 	int			fd;
 	int			flags;
@@ -2690,20 +3141,23 @@ fsync_fname_ext(const char *fname, bool isdir, int elevel)
 	else
 		flags |= O_RDONLY;
 
-	/*
-	 * Open the file, silently ignoring errors about unreadable files (or
-	 * unsupported operations, e.g. opening a directory under Windows), and
-	 * logging others.
-	 */
 	fd = OpenTransientFile((char *) fname, flags, 0);
-	if (fd < 0)
+
+	/*
+	 * Some OSs don't allow us to open directories at all (Windows returns
+	 * EACCES), just ignore the error in that case.  If desired also silently
+	 * ignoring errors about unreadable files. Log others.
+	 */
+	if (fd < 0 && isdir && (errno == EISDIR || errno == EACCES))
+		return 0;
+	else if (fd < 0 && ignore_perm && errno == EACCES)
+		return 0;
+	else if (fd < 0)
 	{
-		if (errno == EACCES || (isdir && errno == EISDIR))
-			return;
 		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", fname)));
-		return;
+		return -1;
 	}
 
 	returncode = pg_fsync(fd);
@@ -2713,9 +3167,49 @@ fsync_fname_ext(const char *fname, bool isdir, int elevel)
 	 * those errors. Anything else needs to be logged.
 	 */
 	if (returncode != 0 && !(isdir && errno == EBADF))
+	{
+		int			save_errno;
+
+		/* close file upon error, might not be in transaction context */
+		save_errno = errno;
+		(void) CloseTransientFile(fd);
+		errno = save_errno;
+
 		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", fname)));
+		return -1;
+	}
 
 	(void) CloseTransientFile(fd);
+
+	return 0;
+}
+
+/*
+ * fsync_parent_path -- fsync the parent path of a file or directory
+ *
+ * This is aimed at making file operations persistent on disk in case of
+ * an OS crash or power failure.
+ */
+static int
+fsync_parent_path(const char *fname, int elevel)
+{
+	char		parentpath[MAXPGPATH];
+
+	strlcpy(parentpath, fname, MAXPGPATH);
+	get_parent_directory(parentpath);
+
+	/*
+	 * get_parent_directory() returns an empty string if the input argument is
+	 * just a file name (see comments in path.c), so handle that as being the
+	 * current directory.
+	 */
+	if (strlen(parentpath) == 0)
+		strlcpy(parentpath, ".", MAXPGPATH);
+
+	if (fsync_fname_ext(parentpath, true, false, elevel) != 0)
+		return -1;
+
+	return 0;
 }

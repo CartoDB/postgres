@@ -3,7 +3,7 @@
  * varlena.c
  *	  Functions for the variable-length built-in types.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,8 +21,8 @@
 #include "access/tuptoaster.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "common/md5.h"
 #include "lib/hyperloglog.h"
-#include "libpq/md5.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "parser/scansup.h"
@@ -34,12 +34,14 @@
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/sortsupport.h"
+#include "utils/varlena.h"
 
 
 /* GUC variable */
 int			bytea_output = BYTEA_OUTPUT_HEX;
 
 typedef struct varlena unknown;
+typedef struct varlena VarString;
 
 typedef struct
 {
@@ -67,13 +69,12 @@ typedef struct
 	int			last_returned;	/* Last comparison result (cache) */
 	bool		cache_blob;		/* Does buf2 contain strxfrm() blob, etc? */
 	bool		collate_c;
+	bool		bpchar;			/* Sorting bpchar, not varchar/text/bytea? */
 	hyperLogLogState abbr_card; /* Abbreviated key cardinality state */
 	hyperLogLogState full_card; /* Full key cardinality state */
 	double		prop_card;		/* Required cardinality proportion */
-#ifdef HAVE_LOCALE_T
 	pg_locale_t locale;
-#endif
-} TextSortSupport;
+} VarStringSortSupport;
 
 /*
  * This should be large enough that most strings will fit, but small enough
@@ -87,12 +88,15 @@ typedef struct
 #define PG_GETARG_UNKNOWN_P_COPY(n) DatumGetUnknownPCopy(PG_GETARG_DATUM(n))
 #define PG_RETURN_UNKNOWN_P(x)		PG_RETURN_POINTER(x)
 
-static void btsortsupport_worker(SortSupport ssup, Oid collid);
-static int	bttextfastcmp_c(Datum x, Datum y, SortSupport ssup);
-static int	bttextfastcmp_locale(Datum x, Datum y, SortSupport ssup);
-static int	bttextcmp_abbrev(Datum x, Datum y, SortSupport ssup);
-static Datum bttext_abbrev_convert(Datum original, SortSupport ssup);
-static bool bttext_abbrev_abort(int memtupcount, SortSupport ssup);
+#define DatumGetVarStringP(X)		((VarString *) PG_DETOAST_DATUM(X))
+#define DatumGetVarStringPP(X)		((VarString *) PG_DETOAST_DATUM_PACKED(X))
+
+static int	varstrfastcmp_c(Datum x, Datum y, SortSupport ssup);
+static int	bpcharfastcmp_c(Datum x, Datum y, SortSupport ssup);
+static int	varstrfastcmp_locale(Datum x, Datum y, SortSupport ssup);
+static int	varstrcmp_abbrev(Datum x, Datum y, SortSupport ssup);
+static Datum varstr_abbrev_convert(Datum original, SortSupport ssup);
+static bool varstr_abbrev_abort(int memtupcount, SortSupport ssup);
 static int32 text_length(Datum str);
 static text *text_catenate(text *t1, text *t2);
 static text *text_substring(Datum str,
@@ -217,7 +221,7 @@ text_to_cstring_buffer(const text *src, char *dst, size_t dst_len)
 		dst_len--;
 		if (dst_len >= src_len)
 			dst_len = src_len;
-		else	/* ensure truncation is encoding-safe */
+		else					/* ensure truncation is encoding-safe */
 			dst_len = pg_mbcliplen(VARDATA_ANY(srcunpacked), src_len, dst_len);
 		memcpy(dst, VARDATA_ANY(srcunpacked), dst_len);
 		dst[dst_len] = '\0';
@@ -264,7 +268,7 @@ byteain(PG_FUNCTION_ARGS)
 		bc = (len - 2) / 2 + VARHDRSZ;	/* maximum possible length */
 		result = palloc(bc);
 		bc = hex_decode(inputText + 2, len - 2, VARDATA(result));
-		SET_VARSIZE(result, bc + VARHDRSZ);		/* actual length */
+		SET_VARSIZE(result, bc + VARHDRSZ); /* actual length */
 
 		PG_RETURN_BYTEA_P(result);
 	}
@@ -289,7 +293,7 @@ byteain(PG_FUNCTION_ARGS)
 			 */
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid input syntax for type bytea")));
+					 errmsg("invalid input syntax for type %s", "bytea")));
 		}
 	}
 
@@ -330,7 +334,7 @@ byteain(PG_FUNCTION_ARGS)
 			 */
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid input syntax for type bytea")));
+					 errmsg("invalid input syntax for type %s", "bytea")));
 		}
 	}
 
@@ -819,8 +823,8 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
 	{
 		S1 = Max(S, 1);
 
-		if (length_not_specified)		/* special case - get length to end of
-										 * string */
+		if (length_not_specified)	/* special case - get length to end of
+									 * string */
 			L1 = -1;
 		else
 		{
@@ -884,8 +888,8 @@ text_substring(Datum str, int32 start, int32 length, bool length_not_specified)
 		 */
 		slice_start = 0;
 
-		if (length_not_specified)		/* special case - get length to end of
-										 * string */
+		if (length_not_specified)	/* special case - get length to end of
+									 * string */
 			slice_size = L1 = -1;
 		else
 		{
@@ -1008,8 +1012,8 @@ textoverlay(PG_FUNCTION_ARGS)
 {
 	text	   *t1 = PG_GETARG_TEXT_PP(0);
 	text	   *t2 = PG_GETARG_TEXT_PP(1);
-	int			sp = PG_GETARG_INT32(2);		/* substring start position */
-	int			sl = PG_GETARG_INT32(3);		/* substring length */
+	int			sp = PG_GETARG_INT32(2);	/* substring start position */
+	int			sl = PG_GETARG_INT32(3);	/* substring length */
 
 	PG_RETURN_TEXT_P(text_overlay(t1, t2, sp, sl));
 }
@@ -1019,10 +1023,10 @@ textoverlay_no_len(PG_FUNCTION_ARGS)
 {
 	text	   *t1 = PG_GETARG_TEXT_PP(0);
 	text	   *t2 = PG_GETARG_TEXT_PP(1);
-	int			sp = PG_GETARG_INT32(2);		/* substring start position */
+	int			sp = PG_GETARG_INT32(2);	/* substring start position */
 	int			sl;
 
-	sl = text_length(PointerGetDatum(t2));		/* defaults to length(t2) */
+	sl = text_length(PointerGetDatum(t2));	/* defaults to length(t2) */
 	PG_RETURN_TEXT_P(text_overlay(t1, t2, sp, sl));
 }
 
@@ -1397,10 +1401,7 @@ varstr_cmp(char *arg1, int len1, char *arg2, int len2, Oid collid)
 		char		a2buf[TEXTBUFLEN];
 		char	   *a1p,
 				   *a2p;
-
-#ifdef HAVE_LOCALE_T
 		pg_locale_t mylocale = 0;
-#endif
 
 		if (collid != DEFAULT_COLLATION_OID)
 		{
@@ -1415,9 +1416,7 @@ varstr_cmp(char *arg1, int len1, char *arg2, int len2, Oid collid)
 						 errmsg("could not determine which collation to use for string comparison"),
 						 errhint("Use the COLLATE clause to set the collation explicitly.")));
 			}
-#ifdef HAVE_LOCALE_T
 			mylocale = pg_newlocale_from_collation(collid);
-#endif
 		}
 
 		/*
@@ -1434,7 +1433,8 @@ varstr_cmp(char *arg1, int len1, char *arg2, int len2, Oid collid)
 
 #ifdef WIN32
 		/* Win32 does not have UTF-8, so we need to map to UTF-16 */
-		if (GetDatabaseEncoding() == PG_UTF8)
+		if (GetDatabaseEncoding() == PG_UTF8
+			&& (!mylocale || mylocale->provider == COLLPROVIDER_LIBC))
 		{
 			int			a1len;
 			int			a2len;
@@ -1491,7 +1491,7 @@ varstr_cmp(char *arg1, int len1, char *arg2, int len2, Oid collid)
 			errno = 0;
 #ifdef HAVE_LOCALE_T
 			if (mylocale)
-				result = wcscoll_l((LPWSTR) a1p, (LPWSTR) a2p, mylocale);
+				result = wcscoll_l((LPWSTR) a1p, (LPWSTR) a2p, mylocale->info.lt);
 			else
 #endif
 				result = wcscoll((LPWSTR) a1p, (LPWSTR) a2p);
@@ -1520,7 +1520,7 @@ varstr_cmp(char *arg1, int len1, char *arg2, int len2, Oid collid)
 
 			return result;
 		}
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 
 		if (len1 >= TEXTBUFLEN)
 			a1p = (char *) palloc(len1 + 1);
@@ -1536,11 +1536,59 @@ varstr_cmp(char *arg1, int len1, char *arg2, int len2, Oid collid)
 		memcpy(a2p, arg2, len2);
 		a2p[len2] = '\0';
 
-#ifdef HAVE_LOCALE_T
 		if (mylocale)
-			result = strcoll_l(a1p, a2p, mylocale);
-		else
+		{
+			if (mylocale->provider == COLLPROVIDER_ICU)
+			{
+#ifdef USE_ICU
+#ifdef HAVE_UCOL_STRCOLLUTF8
+				if (GetDatabaseEncoding() == PG_UTF8)
+				{
+					UErrorCode	status;
+
+					status = U_ZERO_ERROR;
+					result = ucol_strcollUTF8(mylocale->info.icu.ucol,
+											  arg1, len1,
+											  arg2, len2,
+											  &status);
+					if (U_FAILURE(status))
+						ereport(ERROR,
+								(errmsg("collation failed: %s", u_errorName(status))));
+				}
+				else
 #endif
+				{
+					int32_t		ulen1,
+								ulen2;
+					UChar	   *uchar1,
+							   *uchar2;
+
+					ulen1 = icu_to_uchar(&uchar1, arg1, len1);
+					ulen2 = icu_to_uchar(&uchar2, arg2, len2);
+
+					result = ucol_strcoll(mylocale->info.icu.ucol,
+										  uchar1, ulen1,
+										  uchar2, ulen2);
+
+					pfree(uchar1);
+					pfree(uchar2);
+				}
+#else							/* not USE_ICU */
+				/* shouldn't happen */
+				elog(ERROR, "unsupported collprovider: %c", mylocale->provider);
+#endif							/* not USE_ICU */
+			}
+			else
+			{
+#ifdef HAVE_LOCALE_T
+				result = strcoll_l(a1p, a2p, mylocale->info.lt);
+#else
+				/* shouldn't happen */
+				elog(ERROR, "unsupported collprovider: %c", mylocale->provider);
+#endif
+			}
+		}
+		else
 			result = strcoll(a1p, a2p);
 
 		/*
@@ -1738,23 +1786,31 @@ bttextsortsupport(PG_FUNCTION_ARGS)
 
 	oldcontext = MemoryContextSwitchTo(ssup->ssup_cxt);
 
-	btsortsupport_worker(ssup, collid);
+	/* Use generic string SortSupport */
+	varstr_sortsupport(ssup, collid, false);
 
 	MemoryContextSwitchTo(oldcontext);
 
 	PG_RETURN_VOID();
 }
 
-static void
-btsortsupport_worker(SortSupport ssup, Oid collid)
+/*
+ * Generic sortsupport interface for character type's operator classes.
+ * Includes locale support, and support for BpChar semantics (i.e. removing
+ * trailing spaces before comparison).
+ *
+ * Relies on the assumption that text, VarChar, BpChar, and bytea all have the
+ * same representation.  Callers that always use the C collation (e.g.
+ * non-collatable type callers like bytea) may have NUL bytes in their strings;
+ * this will not work with any other collation, though.
+ */
+void
+varstr_sortsupport(SortSupport ssup, Oid collid, bool bpchar)
 {
 	bool		abbreviate = ssup->abbreviate;
 	bool		collate_c = false;
-	TextSortSupport *tss;
-
-#ifdef HAVE_LOCALE_T
+	VarStringSortSupport *sss;
 	pg_locale_t locale = 0;
-#endif
 
 	/*
 	 * If possible, set ssup->comparator to a function which can be used to
@@ -1762,20 +1818,25 @@ btsortsupport_worker(SortSupport ssup, Oid collid)
 	 * overhead of a trip through the fmgr layer for every comparison, which
 	 * can be substantial.
 	 *
-	 * Most typically, we'll set the comparator to bttextfastcmp_locale, which
-	 * uses strcoll() to perform comparisons.  However, if LC_COLLATE = C, we
-	 * can make things quite a bit faster with bttextfastcmp_c, which uses
-	 * memcmp() rather than strcoll().
+	 * Most typically, we'll set the comparator to varstrfastcmp_locale, which
+	 * uses strcoll() to perform comparisons and knows about the special
+	 * requirements of BpChar callers.  However, if LC_COLLATE = C, we can
+	 * make things quite a bit faster with varstrfastcmp_c or bpcharfastcmp_c,
+	 * both of which use memcmp() rather than strcoll().
 	 *
 	 * There is a further exception on Windows.  When the database encoding is
 	 * UTF-8 and we are not using the C collation, complex hacks are required.
 	 * We don't currently have a comparator that handles that case, so we fall
-	 * back on the slow method of having the sort code invoke bttextcmp() via
-	 * the fmgr trampoline.
+	 * back on the slow method of having the sort code invoke bttextcmp() (in
+	 * the case of text) via the fmgr trampoline.
 	 */
 	if (lc_collate_is_c(collid))
 	{
-		ssup->comparator = bttextfastcmp_c;
+		if (!bpchar)
+			ssup->comparator = varstrfastcmp_c;
+		else
+			ssup->comparator = bpcharfastcmp_c;
+
 		collate_c = true;
 	}
 #ifdef WIN32
@@ -1784,7 +1845,7 @@ btsortsupport_worker(SortSupport ssup, Oid collid)
 #endif
 	else
 	{
-		ssup->comparator = bttextfastcmp_locale;
+		ssup->comparator = varstrfastcmp_locale;
 
 		/*
 		 * We need a collation-sensitive comparison.  To make things faster,
@@ -1804,46 +1865,57 @@ btsortsupport_worker(SortSupport ssup, Oid collid)
 						 errmsg("could not determine which collation to use for string comparison"),
 						 errhint("Use the COLLATE clause to set the collation explicitly.")));
 			}
-#ifdef HAVE_LOCALE_T
 			locale = pg_newlocale_from_collation(collid);
-#endif
 		}
 	}
 
 	/*
-	 * It's possible that there are platforms where the use of abbreviated
-	 * keys should be disabled at compile time.  Having only 4 byte datums
-	 * could make worst-case performance drastically more likely, for example.
-	 * Moreover, Darwin's strxfrm() implementations is known to not
-	 * effectively concentrate a significant amount of entropy from the
-	 * original string in earlier transformed blobs.  It's possible that other
-	 * supported platforms are similarly encumbered.  However, even in those
-	 * cases, the abbreviated keys optimization may win, and if it doesn't,
-	 * the "abort abbreviation" code may rescue us.  So, for now, we don't
-	 * disable this anywhere on the basis of performance.
+	 * Unfortunately, it seems that abbreviation for non-C collations is
+	 * broken on many common platforms; testing of multiple versions of glibc
+	 * reveals that, for many locales, strcoll() and strxfrm() do not return
+	 * consistent results, which is fatal to this optimization.  While no
+	 * other libc other than Cygwin has so far been shown to have a problem,
+	 * we take the conservative course of action for right now and disable
+	 * this categorically.  (Users who are certain this isn't a problem on
+	 * their system can define TRUST_STRXFRM.)
+	 *
+	 * Even apart from the risk of broken locales, it's possible that there
+	 * are platforms where the use of abbreviated keys should be disabled at
+	 * compile time.  Having only 4 byte datums could make worst-case
+	 * performance drastically more likely, for example.  Moreover, macOS's
+	 * strxfrm() implementation is known to not effectively concentrate a
+	 * significant amount of entropy from the original string in earlier
+	 * transformed blobs.  It's possible that other supported platforms are
+	 * similarly encumbered.  So, if we ever get past disabling this
+	 * categorically, we may still want or need to disable it for particular
+	 * platforms.
 	 */
+#ifndef TRUST_STRXFRM
+	if (!collate_c && !(locale && locale->provider == COLLPROVIDER_ICU))
+		abbreviate = false;
+#endif
 
 	/*
 	 * If we're using abbreviated keys, or if we're using a locale-aware
-	 * comparison, we need to initialize a TextSortSupport object.  Both cases
-	 * will make use of the temporary buffers we initialize here for scratch
-	 * space, and the abbreviation case requires additional state.
+	 * comparison, we need to initialize a StringSortSupport object.  Both
+	 * cases will make use of the temporary buffers we initialize here for
+	 * scratch space (and to detect requirement for BpChar semantics from
+	 * caller), and the abbreviation case requires additional state.
 	 */
 	if (abbreviate || !collate_c)
 	{
-		tss = palloc(sizeof(TextSortSupport));
-		tss->buf1 = palloc(TEXTBUFLEN);
-		tss->buflen1 = TEXTBUFLEN;
-		tss->buf2 = palloc(TEXTBUFLEN);
-		tss->buflen2 = TEXTBUFLEN;
+		sss = palloc(sizeof(VarStringSortSupport));
+		sss->buf1 = palloc(TEXTBUFLEN);
+		sss->buflen1 = TEXTBUFLEN;
+		sss->buf2 = palloc(TEXTBUFLEN);
+		sss->buflen2 = TEXTBUFLEN;
 		/* Start with invalid values */
-		tss->last_len1 = -1;
-		tss->last_len2 = -1;
+		sss->last_len1 = -1;
+		sss->last_len2 = -1;
 		/* Initialize */
-		tss->last_returned = 0;
-#ifdef HAVE_LOCALE_T
-		tss->locale = locale;
-#endif
+		sss->last_returned = 0;
+		sss->locale = locale;
+
 		/*
 		 * To avoid somehow confusing a strxfrm() blob and an original string,
 		 * constantly keep track of the variety of data that buf1 and buf2
@@ -1858,9 +1930,10 @@ btsortsupport_worker(SortSupport ssup, Oid collid)
 		 *
 		 * Arbitrarily initialize cache_blob to true.
 		 */
-		tss->cache_blob = true;
-		tss->collate_c = collate_c;
-		ssup->ssup_extra = tss;
+		sss->cache_blob = true;
+		sss->collate_c = collate_c;
+		sss->bpchar = bpchar;
+		ssup->ssup_extra = sss;
 
 		/*
 		 * If possible, plan to use the abbreviated keys optimization.  The
@@ -1869,13 +1942,13 @@ btsortsupport_worker(SortSupport ssup, Oid collid)
 		 */
 		if (abbreviate)
 		{
-			tss->prop_card = 0.20;
-			initHyperLogLog(&tss->abbr_card, 10);
-			initHyperLogLog(&tss->full_card, 10);
+			sss->prop_card = 0.20;
+			initHyperLogLog(&sss->abbr_card, 10);
+			initHyperLogLog(&sss->full_card, 10);
 			ssup->abbrev_full_comparator = ssup->comparator;
-			ssup->comparator = bttextcmp_abbrev;
-			ssup->abbrev_converter = bttext_abbrev_convert;
-			ssup->abbrev_abort = bttext_abbrev_abort;
+			ssup->comparator = varstrcmp_abbrev;
+			ssup->abbrev_converter = varstr_abbrev_convert;
+			ssup->abbrev_abort = varstr_abbrev_abort;
 		}
 	}
 }
@@ -1884,10 +1957,10 @@ btsortsupport_worker(SortSupport ssup, Oid collid)
  * sortsupport comparison func (for C locale case)
  */
 static int
-bttextfastcmp_c(Datum x, Datum y, SortSupport ssup)
+varstrfastcmp_c(Datum x, Datum y, SortSupport ssup)
 {
-	text	   *arg1 = DatumGetTextPP(x);
-	text	   *arg2 = DatumGetTextPP(y);
+	VarString  *arg1 = DatumGetVarStringPP(x);
+	VarString  *arg2 = DatumGetVarStringPP(y);
 	char	   *a1p,
 			   *a2p;
 	int			len1,
@@ -1914,15 +1987,52 @@ bttextfastcmp_c(Datum x, Datum y, SortSupport ssup)
 }
 
 /*
+ * sortsupport comparison func (for BpChar C locale case)
+ *
+ * BpChar outsources its sortsupport to this module.  Specialization for the
+ * varstr_sortsupport BpChar case, modeled on
+ * internal_bpchar_pattern_compare().
+ */
+static int
+bpcharfastcmp_c(Datum x, Datum y, SortSupport ssup)
+{
+	BpChar	   *arg1 = DatumGetBpCharPP(x);
+	BpChar	   *arg2 = DatumGetBpCharPP(y);
+	char	   *a1p,
+			   *a2p;
+	int			len1,
+				len2,
+				result;
+
+	a1p = VARDATA_ANY(arg1);
+	a2p = VARDATA_ANY(arg2);
+
+	len1 = bpchartruelen(a1p, VARSIZE_ANY_EXHDR(arg1));
+	len2 = bpchartruelen(a2p, VARSIZE_ANY_EXHDR(arg2));
+
+	result = memcmp(a1p, a2p, Min(len1, len2));
+	if ((result == 0) && (len1 != len2))
+		result = (len1 < len2) ? -1 : 1;
+
+	/* We can't afford to leak memory here. */
+	if (PointerGetDatum(arg1) != x)
+		pfree(arg1);
+	if (PointerGetDatum(arg2) != y)
+		pfree(arg2);
+
+	return result;
+}
+
+/*
  * sortsupport comparison func (for locale case)
  */
 static int
-bttextfastcmp_locale(Datum x, Datum y, SortSupport ssup)
+varstrfastcmp_locale(Datum x, Datum y, SortSupport ssup)
 {
-	text	   *arg1 = DatumGetTextPP(x);
-	text	   *arg2 = DatumGetTextPP(y);
+	VarString  *arg1 = DatumGetVarStringPP(x);
+	VarString  *arg2 = DatumGetVarStringPP(y);
 	bool		arg1_match;
-	TextSortSupport *tss = (TextSortSupport *) ssup->ssup_extra;
+	VarStringSortSupport *sss = (VarStringSortSupport *) ssup->ssup_extra;
 
 	/* working state */
 	char	   *a1p,
@@ -1942,43 +2052,58 @@ bttextfastcmp_locale(Datum x, Datum y, SortSupport ssup)
 	{
 		/*
 		 * No change in buf1 or buf2 contents, so avoid changing last_len1 or
-		 * last_len2.  Existing contents of buffers might still be used by next
-		 * call.
+		 * last_len2.  Existing contents of buffers might still be used by
+		 * next call.
+		 *
+		 * It's fine to allow the comparison of BpChar padding bytes here,
+		 * even though that implies that the memcmp() will usually be
+		 * performed for BpChar callers (though multibyte characters could
+		 * still prevent that from occurring).  The memcmp() is still very
+		 * cheap, and BpChar's funny semantics have us remove trailing spaces
+		 * (not limited to padding), so we need make no distinction between
+		 * padding space characters and "real" space characters.
 		 */
 		result = 0;
 		goto done;
 	}
 
-	if (len1 >= tss->buflen1)
+	if (sss->bpchar)
 	{
-		pfree(tss->buf1);
-		tss->buflen1 = Max(len1 + 1, Min(tss->buflen1 * 2, MaxAllocSize));
-		tss->buf1 = MemoryContextAlloc(ssup->ssup_cxt, tss->buflen1);
+		/* Get true number of bytes, ignoring trailing spaces */
+		len1 = bpchartruelen(a1p, len1);
+		len2 = bpchartruelen(a2p, len2);
 	}
-	if (len2 >= tss->buflen2)
+
+	if (len1 >= sss->buflen1)
 	{
-		pfree(tss->buf2);
-		tss->buflen2 = Max(len2 + 1, Min(tss->buflen2 * 2, MaxAllocSize));
-		tss->buf2 = MemoryContextAlloc(ssup->ssup_cxt, tss->buflen2);
+		pfree(sss->buf1);
+		sss->buflen1 = Max(len1 + 1, Min(sss->buflen1 * 2, MaxAllocSize));
+		sss->buf1 = MemoryContextAlloc(ssup->ssup_cxt, sss->buflen1);
+	}
+	if (len2 >= sss->buflen2)
+	{
+		pfree(sss->buf2);
+		sss->buflen2 = Max(len2 + 1, Min(sss->buflen2 * 2, MaxAllocSize));
+		sss->buf2 = MemoryContextAlloc(ssup->ssup_cxt, sss->buflen2);
 	}
 
 	/*
 	 * We're likely to be asked to compare the same strings repeatedly, and
 	 * memcmp() is so much cheaper than strcoll() that it pays to try to cache
 	 * comparisons, even though in general there is no reason to think that
-	 * that will work out (every text datum may be unique).  Caching does not
-	 * slow things down measurably when it doesn't work out, and can speed
+	 * that will work out (every string datum may be unique).  Caching does
+	 * not slow things down measurably when it doesn't work out, and can speed
 	 * things up by rather a lot when it does.  In part, this is because the
 	 * memcmp() compares data from cachelines that are needed in L1 cache even
 	 * when the last comparison's result cannot be reused.
 	 */
 	arg1_match = true;
-	if (len1 != tss->last_len1 || memcmp(tss->buf1, a1p, len1) != 0)
+	if (len1 != sss->last_len1 || memcmp(sss->buf1, a1p, len1) != 0)
 	{
 		arg1_match = false;
-		memcpy(tss->buf1, a1p, len1);
-		tss->buf1[len1] = '\0';
-		tss->last_len1 = len1;
+		memcpy(sss->buf1, a1p, len1);
+		sss->buf1[len1] = '\0';
+		sss->last_len1 = len1;
 	}
 
 	/*
@@ -1987,25 +2112,73 @@ bttextfastcmp_locale(Datum x, Datum y, SortSupport ssup)
 	 * it seems (at least with moderate to low cardinality sets), because
 	 * quicksort compares the same pivot against many values.
 	 */
-	if (len2 != tss->last_len2 || memcmp(tss->buf2, a2p, len2) != 0)
+	if (len2 != sss->last_len2 || memcmp(sss->buf2, a2p, len2) != 0)
 	{
-		memcpy(tss->buf2, a2p, len2);
-		tss->buf2[len2] = '\0';
-		tss->last_len2 = len2;
+		memcpy(sss->buf2, a2p, len2);
+		sss->buf2[len2] = '\0';
+		sss->last_len2 = len2;
 	}
-	else if (arg1_match && !tss->cache_blob)
+	else if (arg1_match && !sss->cache_blob)
 	{
 		/* Use result cached following last actual strcoll() call */
-		result = tss->last_returned;
+		result = sss->last_returned;
 		goto done;
 	}
 
-#ifdef HAVE_LOCALE_T
-	if (tss->locale)
-		result = strcoll_l(tss->buf1, tss->buf2, tss->locale);
-	else
+	if (sss->locale)
+	{
+		if (sss->locale->provider == COLLPROVIDER_ICU)
+		{
+#ifdef USE_ICU
+#ifdef HAVE_UCOL_STRCOLLUTF8
+			if (GetDatabaseEncoding() == PG_UTF8)
+			{
+				UErrorCode	status;
+
+				status = U_ZERO_ERROR;
+				result = ucol_strcollUTF8(sss->locale->info.icu.ucol,
+										  a1p, len1,
+										  a2p, len2,
+										  &status);
+				if (U_FAILURE(status))
+					ereport(ERROR,
+							(errmsg("collation failed: %s", u_errorName(status))));
+			}
+			else
 #endif
-		result = strcoll(tss->buf1, tss->buf2);
+			{
+				int32_t		ulen1,
+							ulen2;
+				UChar	   *uchar1,
+						   *uchar2;
+
+				ulen1 = icu_to_uchar(&uchar1, a1p, len1);
+				ulen2 = icu_to_uchar(&uchar2, a2p, len2);
+
+				result = ucol_strcoll(sss->locale->info.icu.ucol,
+									  uchar1, ulen1,
+									  uchar2, ulen2);
+
+				pfree(uchar1);
+				pfree(uchar2);
+			}
+#else							/* not USE_ICU */
+			/* shouldn't happen */
+			elog(ERROR, "unsupported collprovider: %c", sss->locale->provider);
+#endif							/* not USE_ICU */
+		}
+		else
+		{
+#ifdef HAVE_LOCALE_T
+			result = strcoll_l(sss->buf1, sss->buf2, sss->locale->info.lt);
+#else
+			/* shouldn't happen */
+			elog(ERROR, "unsupported collprovider: %c", sss->locale->provider);
+#endif
+		}
+	}
+	else
+		result = strcoll(sss->buf1, sss->buf2);
 
 	/*
 	 * In some locales strcoll() can claim that nonidentical strings are
@@ -2013,11 +2186,11 @@ bttextfastcmp_locale(Datum x, Datum y, SortSupport ssup)
 	 * follow Perl's lead and sort "equal" strings according to strcmp().
 	 */
 	if (result == 0)
-		result = strcmp(tss->buf1, tss->buf2);
+		result = strcmp(sss->buf1, sss->buf2);
 
 	/* Cache result, perhaps saving an expensive strcoll() call next time */
-	tss->cache_blob = false;
-	tss->last_returned = result;
+	sss->cache_blob = false;
+	sss->last_returned = result;
 done:
 	/* We can't afford to leak memory here. */
 	if (PointerGetDatum(arg1) != x)
@@ -2032,13 +2205,14 @@ done:
  * Abbreviated key comparison func
  */
 static int
-bttextcmp_abbrev(Datum x, Datum y, SortSupport ssup)
+varstrcmp_abbrev(Datum x, Datum y, SortSupport ssup)
 {
 	/*
-	 * When 0 is returned, the core system will call bttextfastcmp_c() or
-	 * bttextfastcmp_locale().  Even a strcmp() on two non-truncated strxfrm()
-	 * blobs cannot indicate *equality* authoritatively, for the same reason
-	 * that there is a strcoll() tie-breaker call to strcmp() in varstr_cmp().
+	 * When 0 is returned, the core system will call varstrfastcmp_c()
+	 * (bpcharfastcmp_c() in BpChar case) or varstrfastcmp_locale().  Even a
+	 * strcmp() on two non-truncated strxfrm() blobs cannot indicate *equality*
+	 * authoritatively, for the same reason that there is a strcoll()
+	 * tie-breaker call to strcmp() in varstr_cmp().
 	 */
 	if (x > y)
 		return 1;
@@ -2049,16 +2223,17 @@ bttextcmp_abbrev(Datum x, Datum y, SortSupport ssup)
 }
 
 /*
- * Conversion routine for sortsupport.  Converts original text to abbreviated
- * key representation.  Our encoding strategy is simple -- pack the first 8
- * bytes of a strxfrm() blob into a Datum (on little-endian machines, the 8
- * bytes are stored in reverse order), and treat it as an unsigned integer.
+ * Conversion routine for sortsupport.  Converts original to abbreviated key
+ * representation.  Our encoding strategy is simple -- pack the first 8 bytes
+ * of a strxfrm() blob into a Datum (on little-endian machines, the 8 bytes are
+ * stored in reverse order), and treat it as an unsigned integer.  When the "C"
+ * locale is used, or in case of bytea, just memcpy() from original instead.
  */
 static Datum
-bttext_abbrev_convert(Datum original, SortSupport ssup)
+varstr_abbrev_convert(Datum original, SortSupport ssup)
 {
-	TextSortSupport *tss = (TextSortSupport *) ssup->ssup_extra;
-	text	   *authoritative = DatumGetTextPP(original);
+	VarStringSortSupport *sss = (VarStringSortSupport *) ssup->ssup_extra;
+	VarString  *authoritative = DatumGetVarStringPP(original);
 	char	   *authoritative_data = VARDATA_ANY(authoritative);
 
 	/* working state */
@@ -2072,66 +2247,148 @@ bttext_abbrev_convert(Datum original, SortSupport ssup)
 	memset(pres, 0, sizeof(Datum));
 	len = VARSIZE_ANY_EXHDR(authoritative);
 
+	/* Get number of bytes, ignoring trailing spaces */
+	if (sss->bpchar)
+		len = bpchartruelen(authoritative_data, len);
+
 	/*
-	 * If we're using the C collation, use memcmp(), rather than strxfrm(), to
+	 * If we're using the C collation, use memcpy(), rather than strxfrm(), to
 	 * abbreviate keys.  The full comparator for the C locale is always
-	 * memcmp(), and we can't risk having this give a different answer.
-	 * Besides, this should be faster, too.
+	 * memcmp().  It would be incorrect to allow bytea callers (callers that
+	 * always force the C collation -- bytea isn't a collatable type, but this
+	 * approach is convenient) to use strxfrm().  This is because bytea
+	 * strings may contain NUL bytes.  Besides, this should be faster, too.
+	 *
+	 * More generally, it's okay that bytea callers can have NUL bytes in
+	 * strings because varstrcmp_abbrev() need not make a distinction between
+	 * terminating NUL bytes, and NUL bytes representing actual NULs in the
+	 * authoritative representation.  Hopefully a comparison at or past one
+	 * abbreviated key's terminating NUL byte will resolve the comparison
+	 * without consulting the authoritative representation; specifically, some
+	 * later non-NUL byte in the longer string can resolve the comparison
+	 * against a subsequent terminating NUL in the shorter string.  There will
+	 * usually be what is effectively a "length-wise" resolution there and
+	 * then.
+	 *
+	 * If that doesn't work out -- if all bytes in the longer string
+	 * positioned at or past the offset of the smaller string's (first)
+	 * terminating NUL are actually representative of NUL bytes in the
+	 * authoritative binary string (perhaps with some *terminating* NUL bytes
+	 * towards the end of the longer string iff it happens to still be small)
+	 * -- then an authoritative tie-breaker will happen, and do the right
+	 * thing: explicitly consider string length.
 	 */
-	if (tss->collate_c)
+	if (sss->collate_c)
 		memcpy(pres, authoritative_data, Min(len, sizeof(Datum)));
 	else
 	{
 		Size		bsize;
+#ifdef USE_ICU
+		int32_t		ulen = -1;
+		UChar	   *uchar = NULL;
+#endif
 
 		/*
-		 * We're not using the C collation, so fall back on strxfrm.
+		 * We're not using the C collation, so fall back on strxfrm or ICU
+		 * analogs.
 		 */
 
-		/* By convention, we use buffer 1 to store and NUL-terminate text */
-		if (len >= tss->buflen1)
+		/* By convention, we use buffer 1 to store and NUL-terminate */
+		if (len >= sss->buflen1)
 		{
-			pfree(tss->buf1);
-			tss->buflen1 = Max(len + 1, Min(tss->buflen1 * 2, MaxAllocSize));
-			tss->buf1 = palloc(tss->buflen1);
+			pfree(sss->buf1);
+			sss->buflen1 = Max(len + 1, Min(sss->buflen1 * 2, MaxAllocSize));
+			sss->buf1 = palloc(sss->buflen1);
 		}
 
 		/* Might be able to reuse strxfrm() blob from last call */
-		if (tss->last_len1 == len && tss->cache_blob &&
-			memcmp(tss->buf1, authoritative_data, len) == 0)
+		if (sss->last_len1 == len && sss->cache_blob &&
+			memcmp(sss->buf1, authoritative_data, len) == 0)
 		{
-			memcpy(pres, tss->buf2, Min(sizeof(Datum), tss->last_len2));
+			memcpy(pres, sss->buf2, Min(sizeof(Datum), sss->last_len2));
 			/* No change affecting cardinality, so no hashing required */
 			goto done;
 		}
 
-		/* Just like strcoll(), strxfrm() expects a NUL-terminated string */
-		memcpy(tss->buf1, authoritative_data, len);
-		tss->buf1[len] = '\0';
-		tss->last_len1 = len;
+		memcpy(sss->buf1, authoritative_data, len);
 
+		/*
+		 * Just like strcoll(), strxfrm() expects a NUL-terminated string. Not
+		 * necessary for ICU, but doesn't hurt.
+		 */
+		sss->buf1[len] = '\0';
+		sss->last_len1 = len;
+
+#ifdef USE_ICU
+		/* When using ICU and not UTF8, convert string to UChar. */
+		if (sss->locale && sss->locale->provider == COLLPROVIDER_ICU &&
+			GetDatabaseEncoding() != PG_UTF8)
+			ulen = icu_to_uchar(&uchar, sss->buf1, len);
+#endif
+
+		/*
+		 * Loop: Call strxfrm() or ucol_getSortKey(), possibly enlarge buffer,
+		 * and try again.  Both of these functions have the result buffer
+		 * content undefined if the result did not fit, so we need to retry
+		 * until everything fits, even though we only need the first few bytes
+		 * in the end.  When using ucol_nextSortKeyPart(), however, we only
+		 * ask for as many bytes as we actually need.
+		 */
 		for (;;)
 		{
-#ifdef HAVE_LOCALE_T
-			if (tss->locale)
-				bsize = strxfrm_l(tss->buf2, tss->buf1,
-								  tss->buflen2, tss->locale);
+#ifdef USE_ICU
+			if (sss->locale && sss->locale->provider == COLLPROVIDER_ICU)
+			{
+				/*
+				 * When using UTF8, use the iteration interface so we only
+				 * need to produce as many bytes as we actually need.
+				 */
+				if (GetDatabaseEncoding() == PG_UTF8)
+				{
+					UCharIterator iter;
+					uint32_t	state[2];
+					UErrorCode	status;
+
+					uiter_setUTF8(&iter, sss->buf1, len);
+					state[0] = state[1] = 0;	/* won't need that again */
+					status = U_ZERO_ERROR;
+					bsize = ucol_nextSortKeyPart(sss->locale->info.icu.ucol,
+												 &iter,
+												 state,
+												 (uint8_t *) sss->buf2,
+												 Min(sizeof(Datum), sss->buflen2),
+												 &status);
+					if (U_FAILURE(status))
+						ereport(ERROR,
+								(errmsg("sort key generation failed: %s",
+										u_errorName(status))));
+				}
+				else
+					bsize = ucol_getSortKey(sss->locale->info.icu.ucol,
+											uchar, ulen,
+											(uint8_t *) sss->buf2, sss->buflen2);
+			}
 			else
 #endif
-				bsize = strxfrm(tss->buf2, tss->buf1, tss->buflen2);
+#ifdef HAVE_LOCALE_T
+			if (sss->locale && sss->locale->provider == COLLPROVIDER_LIBC)
+				bsize = strxfrm_l(sss->buf2, sss->buf1,
+								  sss->buflen2, sss->locale->info.lt);
+			else
+#endif
+				bsize = strxfrm(sss->buf2, sss->buf1, sss->buflen2);
 
-			tss->last_len2 = bsize;
-			if (bsize < tss->buflen2)
+			sss->last_len2 = bsize;
+			if (bsize < sss->buflen2)
 				break;
 
 			/*
-			 * The C standard states that the contents of the buffer is now
-			 * unspecified.  Grow buffer, and retry.
+			 * Grow buffer and retry.
 			 */
-			pfree(tss->buf2);
-			tss->buflen2 = Max(bsize + 1,
-							   Min(tss->buflen2 * 2, MaxAllocSize));
-			tss->buf2 = palloc(tss->buflen2);
+			pfree(sss->buf2);
+			sss->buflen2 = Max(bsize + 1,
+							   Min(sss->buflen2 * 2, MaxAllocSize));
+			sss->buf2 = palloc(sss->buflen2);
 		}
 
 		/*
@@ -2139,8 +2396,16 @@ bttext_abbrev_convert(Datum original, SortSupport ssup)
 		 * strxfrm() blob is itself NUL terminated, leaving no danger of
 		 * misinterpreting any NUL bytes not intended to be interpreted as
 		 * logically representing termination.
+		 *
+		 * (Actually, even if there were NUL bytes in the blob it would be
+		 * okay.  See remarks on bytea case above.)
 		 */
-		memcpy(pres, tss->buf2, Min(sizeof(Datum), bsize));
+		memcpy(pres, sss->buf2, Min(sizeof(Datum), bsize));
+
+#ifdef USE_ICU
+		if (uchar)
+			pfree(uchar);
+#endif
 	}
 
 	/*
@@ -2148,7 +2413,7 @@ bttext_abbrev_convert(Datum original, SortSupport ssup)
 	 * authoritative keys using HyperLogLog.  Used as cheap insurance against
 	 * the worst case, where we do many string transformations for no saving
 	 * in full strcoll()-based comparisons.  These statistics are used by
-	 * bttext_abbrev_abort().
+	 * varstr_abbrev_abort().
 	 *
 	 * First, Hash key proper, or a significant fraction of it.  Mix in length
 	 * in order to compensate for cases where differences are past
@@ -2160,7 +2425,7 @@ bttext_abbrev_convert(Datum original, SortSupport ssup)
 	if (len > PG_CACHE_LINE_SIZE)
 		hash ^= DatumGetUInt32(hash_uint32((uint32) len));
 
-	addHyperLogLog(&tss->full_card, hash);
+	addHyperLogLog(&sss->full_card, hash);
 
 	/* Hash abbreviated key */
 #if SIZEOF_DATUM == 8
@@ -2176,15 +2441,16 @@ bttext_abbrev_convert(Datum original, SortSupport ssup)
 	hash = DatumGetUInt32(hash_uint32((uint32) res));
 #endif
 
-	addHyperLogLog(&tss->abbr_card, hash);
+	addHyperLogLog(&sss->abbr_card, hash);
 
 	/* Cache result, perhaps saving an expensive strxfrm() call next time */
-	tss->cache_blob = true;
+	sss->cache_blob = true;
 done:
+
 	/*
 	 * Byteswap on little-endian machines.
 	 *
-	 * This is needed so that bttextcmp_abbrev() (an unsigned integer 3-way
+	 * This is needed so that varstrcmp_abbrev() (an unsigned integer 3-way
 	 * comparator) works correctly on all platforms.  If we didn't do this,
 	 * the comparator would have to call memcmp() with a pair of pointers to
 	 * the first byte of each abbreviated key, which is slower.
@@ -2204,9 +2470,9 @@ done:
  * should be aborted, based on its projected effectiveness.
  */
 static bool
-bttext_abbrev_abort(int memtupcount, SortSupport ssup)
+varstr_abbrev_abort(int memtupcount, SortSupport ssup)
 {
-	TextSortSupport *tss = (TextSortSupport *) ssup->ssup_extra;
+	VarStringSortSupport *sss = (VarStringSortSupport *) ssup->ssup_extra;
 	double		abbrev_distinct,
 				key_distinct;
 
@@ -2216,8 +2482,8 @@ bttext_abbrev_abort(int memtupcount, SortSupport ssup)
 	if (memtupcount < 100)
 		return false;
 
-	abbrev_distinct = estimateHyperLogLog(&tss->abbr_card);
-	key_distinct = estimateHyperLogLog(&tss->full_card);
+	abbrev_distinct = estimateHyperLogLog(&sss->abbr_card);
+	key_distinct = estimateHyperLogLog(&sss->full_card);
 
 	/*
 	 * Clamp cardinality estimates to at least one distinct value.  While
@@ -2240,10 +2506,10 @@ bttext_abbrev_abort(int memtupcount, SortSupport ssup)
 	{
 		double		norm_abbrev_card = abbrev_distinct / (double) memtupcount;
 
-		elog(LOG, "bttext_abbrev: abbrev_distinct after %d: %f "
+		elog(LOG, "varstr_abbrev: abbrev_distinct after %d: %f "
 			 "(key_distinct: %f, norm_abbrev_card: %f, prop_card: %f)",
 			 memtupcount, abbrev_distinct, key_distinct, norm_abbrev_card,
-			 tss->prop_card);
+			 sss->prop_card);
 	}
 #endif
 
@@ -2263,7 +2529,7 @@ bttext_abbrev_abort(int memtupcount, SortSupport ssup)
 	 * abbreviated comparison with a cheap memcmp()-based authoritative
 	 * resolution are equivalent.
 	 */
-	if (abbrev_distinct > key_distinct * tss->prop_card)
+	if (abbrev_distinct > key_distinct * sss->prop_card)
 	{
 		/*
 		 * When we have exceeded 10,000 tuples, decay required cardinality
@@ -2291,7 +2557,7 @@ bttext_abbrev_abort(int memtupcount, SortSupport ssup)
 		 * apparent it's probably not worth aborting.
 		 */
 		if (memtupcount > 10000)
-			tss->prop_card *= 0.65;
+			sss->prop_card *= 0.65;
 
 		return false;
 	}
@@ -2309,9 +2575,9 @@ bttext_abbrev_abort(int memtupcount, SortSupport ssup)
 	 */
 #ifdef TRACE_SORT
 	if (trace_sort)
-		elog(LOG, "bttext_abbrev: aborted abbreviation at %d "
+		elog(LOG, "varstr_abbrev: aborted abbreviation at %d "
 			 "(abbrev_distinct: %f, key_distinct: %f, prop_card: %f)",
-			 memtupcount, abbrev_distinct, key_distinct, tss->prop_card);
+			 memtupcount, abbrev_distinct, key_distinct, sss->prop_card);
 #endif
 
 	return true;
@@ -2345,8 +2611,9 @@ text_smaller(PG_FUNCTION_ARGS)
 /*
  * The following operators support character-by-character comparison
  * of text datums, to allow building indexes suitable for LIKE clauses.
- * Note that the regular texteq/textne comparison operators are assumed
- * to be compatible with these!
+ * Note that the regular texteq/textne comparison operators, and regular
+ * support functions 1 and 2 with "C" collation are assumed to be
+ * compatible with these!
  */
 
 static int
@@ -2451,6 +2718,23 @@ bttext_pattern_cmp(PG_FUNCTION_ARGS)
 }
 
 
+Datum
+bttext_pattern_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(ssup->ssup_cxt);
+
+	/* Use generic string SortSupport, forcing "C" collation */
+	varstr_sortsupport(ssup, C_COLLATION_OID, false);
+
+	MemoryContextSwitchTo(oldcontext);
+
+	PG_RETURN_VOID();
+}
+
+
 /*-------------------------------------------------------------
  * byteaoctetlen
  *
@@ -2523,7 +2807,7 @@ bytea_catenate(bytea *t1, bytea *t2)
 }
 
 #define PG_STR_GET_BYTEA(str_) \
-	DatumGetByteaP(DirectFunctionCall1(byteain, CStringGetDatum(str_)))
+	DatumGetByteaPP(DirectFunctionCall1(byteain, CStringGetDatum(str_)))
 
 /*
  * bytea_substr()
@@ -2627,8 +2911,8 @@ byteaoverlay(PG_FUNCTION_ARGS)
 {
 	bytea	   *t1 = PG_GETARG_BYTEA_PP(0);
 	bytea	   *t2 = PG_GETARG_BYTEA_PP(1);
-	int			sp = PG_GETARG_INT32(2);		/* substring start position */
-	int			sl = PG_GETARG_INT32(3);		/* substring length */
+	int			sp = PG_GETARG_INT32(2);	/* substring start position */
+	int			sl = PG_GETARG_INT32(3);	/* substring length */
 
 	PG_RETURN_BYTEA_P(bytea_overlay(t1, t2, sp, sl));
 }
@@ -2638,7 +2922,7 @@ byteaoverlay_no_len(PG_FUNCTION_ARGS)
 {
 	bytea	   *t1 = PG_GETARG_BYTEA_PP(0);
 	bytea	   *t2 = PG_GETARG_BYTEA_PP(1);
-	int			sp = PG_GETARG_INT32(2);		/* substring start position */
+	int			sp = PG_GETARG_INT32(2);	/* substring start position */
 	int			sl;
 
 	sl = VARSIZE_ANY_EXHDR(t2); /* defaults to length(t2) */
@@ -2795,25 +3079,18 @@ byteaGetBit(PG_FUNCTION_ARGS)
 Datum
 byteaSetByte(PG_FUNCTION_ARGS)
 {
-	bytea	   *v = PG_GETARG_BYTEA_P(0);
+	bytea	   *res = PG_GETARG_BYTEA_P_COPY(0);
 	int32		n = PG_GETARG_INT32(1);
 	int32		newByte = PG_GETARG_INT32(2);
 	int			len;
-	bytea	   *res;
 
-	len = VARSIZE(v) - VARHDRSZ;
+	len = VARSIZE(res) - VARHDRSZ;
 
 	if (n < 0 || n >= len)
 		ereport(ERROR,
 				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 				 errmsg("index %d out of valid range, 0..%d",
 						n, len - 1)));
-
-	/*
-	 * Make a copy of the original varlena.
-	 */
-	res = (bytea *) palloc(VARSIZE(v));
-	memcpy((char *) res, (char *) v, VARSIZE(v));
 
 	/*
 	 * Now set the byte.
@@ -2834,17 +3111,16 @@ byteaSetByte(PG_FUNCTION_ARGS)
 Datum
 byteaSetBit(PG_FUNCTION_ARGS)
 {
-	bytea	   *v = PG_GETARG_BYTEA_P(0);
+	bytea	   *res = PG_GETARG_BYTEA_P_COPY(0);
 	int32		n = PG_GETARG_INT32(1);
 	int32		newBit = PG_GETARG_INT32(2);
-	bytea	   *res;
 	int			len;
 	int			oldByte,
 				newByte;
 	int			byteNo,
 				bitNo;
 
-	len = VARSIZE(v) - VARHDRSZ;
+	len = VARSIZE(res) - VARHDRSZ;
 
 	if (n < 0 || n >= len * 8)
 		ereport(ERROR,
@@ -2862,12 +3138,6 @@ byteaSetBit(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("new bit must be 0 or 1")));
-
-	/*
-	 * Make a copy of the original varlena.
-	 */
-	res = (bytea *) palloc(VARSIZE(v));
-	memcpy((char *) res, (char *) v, VARSIZE(v));
 
 	/*
 	 * Update the byte.
@@ -2995,7 +3265,7 @@ SplitIdentifierString(char *rawstring, char separator,
 
 	*namelist = NIL;
 
-	while (isspace((unsigned char) *nextp))
+	while (scanner_isspace(*nextp))
 		nextp++;				/* skip leading whitespace */
 
 	if (*nextp == '\0')
@@ -3015,7 +3285,7 @@ SplitIdentifierString(char *rawstring, char separator,
 			{
 				endp = strchr(nextp + 1, '"');
 				if (endp == NULL)
-					return false;		/* mismatched quotes */
+					return false;	/* mismatched quotes */
 				if (endp[1] != '"')
 					break;		/* found end of quoted name */
 				/* Collapse adjacent quotes into one quote, and look again */
@@ -3033,7 +3303,7 @@ SplitIdentifierString(char *rawstring, char separator,
 
 			curname = nextp;
 			while (*nextp && *nextp != separator &&
-				   !isspace((unsigned char) *nextp))
+				   !scanner_isspace(*nextp))
 				nextp++;
 			endp = nextp;
 			if (curname == nextp)
@@ -3055,13 +3325,13 @@ SplitIdentifierString(char *rawstring, char separator,
 			pfree(downname);
 		}
 
-		while (isspace((unsigned char) *nextp))
+		while (scanner_isspace(*nextp))
 			nextp++;			/* skip trailing whitespace */
 
 		if (*nextp == separator)
 		{
 			nextp++;
-			while (isspace((unsigned char) *nextp))
+			while (scanner_isspace(*nextp))
 				nextp++;		/* skip leading whitespace for next */
 			/* we expect another name, so done remains false */
 		}
@@ -3089,7 +3359,9 @@ SplitIdentifierString(char *rawstring, char separator,
 
 
 /*
- * SplitDirectoriesString --- parse a string containing directory names
+ * SplitDirectoriesString --- parse a string containing file/directory names
+ *
+ * This works fine on file names too; the function name is historical.
  *
  * This is similar to SplitIdentifierString, except that the parsing
  * rules are meant to handle pathnames instead of identifiers: there is
@@ -3120,7 +3392,7 @@ SplitDirectoriesString(char *rawstring, char separator,
 
 	*namelist = NIL;
 
-	while (isspace((unsigned char) *nextp))
+	while (scanner_isspace(*nextp))
 		nextp++;				/* skip leading whitespace */
 
 	if (*nextp == '\0')
@@ -3140,7 +3412,7 @@ SplitDirectoriesString(char *rawstring, char separator,
 			{
 				endp = strchr(nextp + 1, '"');
 				if (endp == NULL)
-					return false;		/* mismatched quotes */
+					return false;	/* mismatched quotes */
 				if (endp[1] != '"')
 					break;		/* found end of quoted name */
 				/* Collapse adjacent quotes into one quote, and look again */
@@ -3157,7 +3429,7 @@ SplitDirectoriesString(char *rawstring, char separator,
 			while (*nextp && *nextp != separator)
 			{
 				/* trailing whitespace should not be included in name */
-				if (!isspace((unsigned char) *nextp))
+				if (!scanner_isspace(*nextp))
 					endp = nextp + 1;
 				nextp++;
 			}
@@ -3165,13 +3437,13 @@ SplitDirectoriesString(char *rawstring, char separator,
 				return false;	/* empty unquoted name not allowed */
 		}
 
-		while (isspace((unsigned char) *nextp))
+		while (scanner_isspace(*nextp))
 			nextp++;			/* skip trailing whitespace */
 
 		if (*nextp == separator)
 		{
 			nextp++;
-			while (isspace((unsigned char) *nextp))
+			while (scanner_isspace(*nextp))
 				nextp++;		/* skip leading whitespace for next */
 			/* we expect another name, so done remains false */
 		}
@@ -3373,6 +3645,22 @@ byteacmp(PG_FUNCTION_ARGS)
 	PG_FREE_IF_COPY(arg2, 1);
 
 	PG_RETURN_INT32(cmp);
+}
+
+Datum
+bytea_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(ssup->ssup_cxt);
+
+	/* Use generic string SortSupport, forcing "C" collation */
+	varstr_sortsupport(ssup, C_COLLATION_OID, false);
+
+	MemoryContextSwitchTo(oldcontext);
+
+	PG_RETURN_VOID();
 }
 
 /*
@@ -3656,7 +3944,7 @@ replace_text_regexp(text *src_text, void *regexp,
 									data,
 									data_len,
 									search_start,
-									NULL,		/* no details */
+									NULL,	/* no details */
 									REGEXP_REPLACE_BACKREF_CNT,
 									pmatch,
 									0);
@@ -3952,19 +4240,30 @@ text_to_array_internal(PG_FUNCTION_ARGS)
 		 */
 		if (fldsep_len < 1)
 		{
+			Datum		elems[1];
+			bool		nulls[1];
+			int			dims[1];
+			int			lbs[1];
+
 			text_position_cleanup(&state);
 			/* single element can be a NULL too */
 			is_null = null_string ? text_isequal(inputstring, null_string) : false;
-			PG_RETURN_ARRAYTYPE_P(create_singleton_array(fcinfo, TEXTOID,
-												PointerGetDatum(inputstring),
-														 is_null, 1));
+
+			elems[0] = PointerGetDatum(inputstring);
+			nulls[0] = is_null;
+			dims[0] = 1;
+			lbs[0] = 1;
+			/* XXX: this hardcodes assumptions about the text type */
+			PG_RETURN_ARRAYTYPE_P(construct_md_array(elems, nulls,
+													 1, dims, lbs,
+													 TEXTOID, -1, false, 'i'));
 		}
 
 		start_posn = 1;
 		/* start_ptr points to the start_posn'th character of inputstring */
 		start_ptr = VARDATA_ANY(inputstring);
 
-		for (fldnum = 1;; fldnum++)		/* field number is 1 based */
+		for (fldnum = 1;; fldnum++) /* field number is 1 based */
 		{
 			CHECK_FOR_INTERRUPTS();
 
@@ -4408,7 +4707,7 @@ string_agg_transfn(PG_FUNCTION_ARGS)
 		else if (!PG_ARGISNULL(2))
 			appendStringInfoText(state, PG_GETARG_TEXT_PP(2));	/* delimiter */
 
-		appendStringInfoText(state, PG_GETARG_TEXT_PP(1));		/* value */
+		appendStringInfoText(state, PG_GETARG_TEXT_PP(1));	/* value */
 	}
 
 	/*
@@ -4647,7 +4946,8 @@ text_reverse(PG_FUNCTION_ARGS)
 		if (++(ptr) >= (end_ptr)) \
 			ereport(ERROR, \
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), \
-					 errmsg("unterminated format specifier"))); \
+					 errmsg("unterminated format() type specifier"), \
+					 errhint("For a single \"%%\" use \"%%%%\"."))); \
 	} while (0)
 
 /*
@@ -4779,8 +5079,9 @@ text_format(PG_FUNCTION_ARGS)
 		if (strchr("sIL", *cp) == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("unrecognized conversion type specifier \"%c\"",
-							*cp)));
+					 errmsg("unrecognized format() type specifier \"%c\"",
+							*cp),
+					 errhint("For a single \"%%\" use \"%%%%\".")));
 
 		/* If indirect width was specified, get its value */
 		if (widthpos >= 0)
@@ -4791,7 +5092,7 @@ text_format(PG_FUNCTION_ARGS)
 			if (arg >= nargs)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("too few arguments for format")));
+						 errmsg("too few arguments for format()")));
 
 			/* Get the value and type of the selected argument */
 			if (!funcvariadic)
@@ -4848,7 +5149,7 @@ text_format(PG_FUNCTION_ARGS)
 		if (arg >= nargs)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("too few arguments for format")));
+					 errmsg("too few arguments for format()")));
 
 		/* Get the value and type of the selected argument */
 		if (!funcvariadic)
@@ -4899,8 +5200,9 @@ text_format(PG_FUNCTION_ARGS)
 				/* should not get here, because of previous check */
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					  errmsg("unrecognized conversion type specifier \"%c\"",
-							 *cp)));
+						 errmsg("unrecognized format() type specifier \"%c\"",
+								*cp),
+						 errhint("For a single \"%%\" use \"%%%%\".")));
 				break;
 		}
 	}
@@ -5027,7 +5329,7 @@ text_format_parse_format(const char *start_ptr, const char *end_ptr,
 			if (*cp != '$')
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				  errmsg("width argument position must be ended by \"$\"")));
+						 errmsg("width argument position must be ended by \"$\"")));
 			/* The number was width argument position */
 			*widthpos = n;
 			/* Explicit 0 for argument index is immediately refused */
@@ -5072,7 +5374,7 @@ text_format_string_conversion(StringInfo buf, char conversion,
 		else if (conversion == 'I')
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-			errmsg("null values cannot be formatted as an SQL identifier")));
+					 errmsg("null values cannot be formatted as an SQL identifier")));
 		return;
 	}
 

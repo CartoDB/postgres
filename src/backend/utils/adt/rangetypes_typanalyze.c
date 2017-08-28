@@ -13,7 +13,7 @@
  * come from different tuples. In theory, the standard scalar selectivity
  * functions could be used with the combined histogram.
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,7 +33,7 @@
 static int	float8_qsort_cmp(const void *a1, const void *a2);
 static int	range_bound_qsort_cmp(const void *a1, const void *a2, void *arg);
 static void compute_range_stats(VacAttrStats *stats,
-		   AnalyzeAttrFetchFunc fetchfunc, int samplerows, double totalrows);
+					AnalyzeAttrFetchFunc fetchfunc, int samplerows, double totalrows);
 
 /*
  * range_typanalyze -- typanalyze function for range columns
@@ -165,9 +165,9 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 				 * and lower bound values.
 				 */
 				length = DatumGetFloat8(FunctionCall2Coll(
-												&typcache->rng_subdiff_finfo,
-													 typcache->rng_collation,
-													  upper.val, lower.val));
+														  &typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														  upper.val, lower.val));
 			}
 			else
 			{
@@ -203,7 +203,9 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		/* Do the simple null-frac and width stats */
 		stats->stanullfrac = (double) null_cnt / (double) samplerows;
 		stats->stawidth = total_width / (double) non_null_cnt;
-		stats->stadistinct = -1.0;
+
+		/* Estimate that non-null values are unique */
+		stats->stadistinct = -1.0 * (1.0 - stats->stanullfrac);
 
 		/* Must copy the target values into anl_context */
 		old_cxt = MemoryContextSwitchTo(stats->anl_context);
@@ -244,7 +246,7 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			for (i = 0; i < num_hist; i++)
 			{
 				bound_hist_values[i] = PointerGetDatum(range_serialize(
-							   typcache, &lowers[pos], &uppers[pos], false));
+																	   typcache, &lowers[pos], &uppers[pos], false));
 				pos += delta;
 				posfrac += deltafrac;
 				if (posfrac >= (num_hist - 1))
@@ -345,7 +347,7 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		stats->stats_valid = true;
 		stats->stanullfrac = 1.0;
 		stats->stawidth = 0;	/* "unknown" */
-		stats->stadistinct = 0.0;		/* "unknown" */
+		stats->stadistinct = 0.0;	/* "unknown" */
 	}
 
 	/*

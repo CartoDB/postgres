@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2016, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2017, PostgreSQL Global Development Group
  *
  * src/bin/psql/common.c
  */
@@ -10,6 +10,7 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <math.h>
 #include <signal.h>
 #ifndef WIN32
 #include <unistd.h>				/* for write() */
@@ -18,12 +19,14 @@
 #include <win32.h>
 #endif
 
+#include "fe_utils/string_utils.h"
 #include "portability/instr_time.h"
 
 #include "settings.h"
 #include "command.h"
 #include "copy.h"
-#include "mbprint.h"
+#include "crosstabview.h"
+#include "fe_utils/mbprint.h"
 
 
 static bool ExecQueryUsingCursor(const char *query, double *elapsed_msec);
@@ -108,6 +111,108 @@ setQFout(const char *fname)
 
 
 /*
+ * Variable-fetching callback for flex lexer
+ *
+ * If the specified variable exists, return its value as a string (malloc'd
+ * and expected to be freed by the caller); else return NULL.
+ *
+ * If "quote" isn't PQUOTE_PLAIN, then return the value suitably quoted and
+ * escaped for the specified quoting requirement.  (Failure in escaping
+ * should lead to printing an error and returning NULL.)
+ *
+ * "passthrough" is the pointer previously given to psql_scan_set_passthrough.
+ * In psql, passthrough points to a ConditionalStack, which we check to
+ * determine whether variable expansion is allowed.
+ */
+char *
+psql_get_variable(const char *varname, PsqlScanQuoteType quote,
+				  void *passthrough)
+{
+	char	   *result = NULL;
+	const char *value;
+
+	/* In an inactive \if branch, suppress all variable substitutions */
+	if (passthrough && !conditional_active((ConditionalStack) passthrough))
+		return NULL;
+
+	value = GetVariable(pset.vars, varname);
+	if (!value)
+		return NULL;
+
+	switch (quote)
+	{
+		case PQUOTE_PLAIN:
+			result = pg_strdup(value);
+			break;
+		case PQUOTE_SQL_LITERAL:
+		case PQUOTE_SQL_IDENT:
+			{
+				/*
+				 * For these cases, we use libpq's quoting functions, which
+				 * assume the string is in the connection's client encoding.
+				 */
+				char	   *escaped_value;
+
+				if (!pset.db)
+				{
+					psql_error("cannot escape without active connection\n");
+					return NULL;
+				}
+
+				if (quote == PQUOTE_SQL_LITERAL)
+					escaped_value =
+						PQescapeLiteral(pset.db, value, strlen(value));
+				else
+					escaped_value =
+						PQescapeIdentifier(pset.db, value, strlen(value));
+
+				if (escaped_value == NULL)
+				{
+					const char *error = PQerrorMessage(pset.db);
+
+					psql_error("%s", error);
+					return NULL;
+				}
+
+				/*
+				 * Rather than complicate the lexer's API with a notion of
+				 * which free() routine to use, just pay the price of an extra
+				 * strdup().
+				 */
+				result = pg_strdup(escaped_value);
+				PQfreemem(escaped_value);
+				break;
+			}
+		case PQUOTE_SHELL_ARG:
+			{
+				/*
+				 * For this we use appendShellStringNoError, which is
+				 * encoding-agnostic, which is fine since the shell probably
+				 * is too.  In any case, the only special character is "'",
+				 * which is not known to appear in valid multibyte characters.
+				 */
+				PQExpBufferData buf;
+
+				initPQExpBuffer(&buf);
+				if (!appendShellStringNoError(&buf, value))
+				{
+					psql_error("shell command argument contains a newline or carriage return: \"%s\"\n",
+							   value);
+					free(buf.data);
+					return NULL;
+				}
+				result = buf.data;
+				break;
+			}
+
+			/* No default: we want a compiler warning for missing cases */
+	}
+
+	return result;
+}
+
+
+/*
  * Error reporting for scripts. Errors should look like
  *	 psql:filename:lineno: message
  */
@@ -175,8 +280,18 @@ static PGcancel *volatile cancelConn = NULL;
 static CRITICAL_SECTION cancelConnLock;
 #endif
 
-/* Used from signal handlers, no buffering */
-#define write_stderr(str)	write(fileno(stderr), str, strlen(str))
+/*
+ * Write a simple string to stderr --- must be safe in a signal handler.
+ * We ignore the write() result since there's not much we could do about it.
+ * Certain compilers make that harder than it ought to be.
+ */
+#define write_stderr(str) \
+	do { \
+		const char *str_ = (str); \
+		int		rc_; \
+		rc_ = write(fileno(stderr), str_, strlen(str_)); \
+		(void) rc_; \
+	} while (0)
 
 
 #ifndef WIN32
@@ -185,7 +300,6 @@ static void
 handle_sigint(SIGNAL_ARGS)
 {
 	int			save_errno = errno;
-	int			rc;
 	char		errbuf[256];
 
 	/* if we are waiting for input, longjmp out of it */
@@ -202,16 +316,11 @@ handle_sigint(SIGNAL_ARGS)
 	if (cancelConn != NULL)
 	{
 		if (PQcancel(cancelConn, errbuf, sizeof(errbuf)))
-		{
-			rc = write_stderr("Cancel request sent\n");
-			(void) rc;			/* ignore errors, nothing we can do here */
-		}
+			write_stderr("Cancel request sent\n");
 		else
 		{
-			rc = write_stderr("Could not send cancel request: ");
-			(void) rc;			/* ignore errors, nothing we can do here */
-			rc = write_stderr(errbuf);
-			(void) rc;			/* ignore errors, nothing we can do here */
+			write_stderr("Could not send cancel request: ");
+			write_stderr(errbuf);
 		}
 	}
 
@@ -268,7 +377,7 @@ setup_cancel_handler(void)
 
 	SetConsoleCtrlHandler(consoleHandler, TRUE);
 }
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 
 
 /* ConnectionUp
@@ -438,6 +547,84 @@ AcceptResult(const PGresult *result)
 }
 
 
+/*
+ * ClearOrSaveResult
+ *
+ * If the result represents an error, remember it for possible display by
+ * \errverbose.  Otherwise, just PQclear() it.
+ */
+static void
+ClearOrSaveResult(PGresult *result)
+{
+	if (result)
+	{
+		switch (PQresultStatus(result))
+		{
+			case PGRES_NONFATAL_ERROR:
+			case PGRES_FATAL_ERROR:
+				if (pset.last_error_result)
+					PQclear(pset.last_error_result);
+				pset.last_error_result = result;
+				break;
+
+			default:
+				PQclear(result);
+				break;
+		}
+	}
+}
+
+
+/*
+ * Print microtiming output.  Always print raw milliseconds; if the interval
+ * is >= 1 second, also break it down into days/hours/minutes/seconds.
+ */
+static void
+PrintTiming(double elapsed_msec)
+{
+	double		seconds;
+	double		minutes;
+	double		hours;
+	double		days;
+
+	if (elapsed_msec < 1000.0)
+	{
+		/* This is the traditional (pre-v10) output format */
+		printf(_("Time: %.3f ms\n"), elapsed_msec);
+		return;
+	}
+
+	/*
+	 * Note: we could print just seconds, in a format like %06.3f, when the
+	 * total is less than 1min.  But that's hard to interpret unless we tack
+	 * on "s" or otherwise annotate it.  Forcing the display to include
+	 * minutes seems like a better solution.
+	 */
+	seconds = elapsed_msec / 1000.0;
+	minutes = floor(seconds / 60.0);
+	seconds -= 60.0 * minutes;
+	if (minutes < 60.0)
+	{
+		printf(_("Time: %.3f ms (%02d:%06.3f)\n"),
+			   elapsed_msec, (int) minutes, seconds);
+		return;
+	}
+
+	hours = floor(minutes / 60.0);
+	minutes -= 60.0 * hours;
+	if (hours < 24.0)
+	{
+		printf(_("Time: %.3f ms (%02d:%02d:%06.3f)\n"),
+			   elapsed_msec, (int) hours, (int) minutes, seconds);
+		return;
+	}
+
+	days = floor(hours / 24.0);
+	hours -= 24.0 * days;
+	printf(_("Time: %.3f ms (%.0f d %02d:%02d:%06.3f)\n"),
+		   elapsed_msec, days, (int) hours, (int) minutes, seconds);
+}
+
 
 /*
  * PSQLexec
@@ -489,7 +676,7 @@ PSQLexec(const char *query)
 
 	if (!AcceptResult(res))
 	{
-		PQclear(res);
+		ClearOrSaveResult(res);
 		res = NULL;
 	}
 
@@ -531,7 +718,7 @@ PSQLexecWatch(const char *query, const printQueryOpt *opt)
 
 	if (!AcceptResult(res))
 	{
-		PQclear(res);
+		ClearOrSaveResult(res);
 		return 0;
 	}
 
@@ -587,7 +774,7 @@ PSQLexecWatch(const char *query, const printQueryOpt *opt)
 
 	/* Possible microtiming output */
 	if (pset.timing)
-		printf(_("Time: %.3f ms\n"), elapsed_msec);
+		PrintTiming(elapsed_msec);
 
 	return 1;
 }
@@ -625,6 +812,10 @@ static bool
 PrintQueryTuples(const PGresult *results)
 {
 	printQueryOpt my_popt = pset.popt;
+
+	/* one-shot expanded output requested via \gx */
+	if (pset.g_expanded)
+		my_popt.topt.expanded = 1;
 
 	/* write output to \g argument, if any */
 	if (pset.gfname)
@@ -684,7 +875,7 @@ StoreQueryTuple(const PGresult *result)
 			char	   *varname;
 			char	   *value;
 
-			/* concate prefix and column name */
+			/* concatenate prefix and column name */
 			varname = psprintf("%s%s", pset.gset_prefix, colname);
 
 			if (!PQgetisnull(result, 0, i))
@@ -697,7 +888,6 @@ StoreQueryTuple(const PGresult *result)
 
 			if (!SetVariable(pset.vars, varname, value))
 			{
-				psql_error("could not set variable \"%s\"\n", varname);
 				free(varname);
 				success = false;
 				break;
@@ -707,6 +897,76 @@ StoreQueryTuple(const PGresult *result)
 		}
 	}
 
+	return success;
+}
+
+
+/*
+ * ExecQueryTuples: assuming query result is OK, execute each query
+ * result field as a SQL statement
+ *
+ * Returns true if successful, false otherwise.
+ */
+static bool
+ExecQueryTuples(const PGresult *result)
+{
+	bool		success = true;
+	int			nrows = PQntuples(result);
+	int			ncolumns = PQnfields(result);
+	int			r,
+				c;
+
+	/*
+	 * We must turn off gexec_flag to avoid infinite recursion.  Note that
+	 * this allows ExecQueryUsingCursor to be applied to the individual query
+	 * results.  SendQuery prevents it from being applied when fetching the
+	 * queries-to-execute, because it can't handle recursion either.
+	 */
+	pset.gexec_flag = false;
+
+	for (r = 0; r < nrows; r++)
+	{
+		for (c = 0; c < ncolumns; c++)
+		{
+			if (!PQgetisnull(result, r, c))
+			{
+				const char *query = PQgetvalue(result, r, c);
+
+				/* Abandon execution if cancel_pressed */
+				if (cancel_pressed)
+					goto loop_exit;
+
+				/*
+				 * ECHO_ALL mode should echo these queries, but SendQuery
+				 * assumes that MainLoop did that, so we have to do it here.
+				 */
+				if (pset.echo == PSQL_ECHO_ALL && !pset.singlestep)
+				{
+					puts(query);
+					fflush(stdout);
+				}
+
+				if (!SendQuery(query))
+				{
+					/* Error - abandon execution if ON_ERROR_STOP */
+					success = false;
+					if (pset.on_error_stop)
+						goto loop_exit;
+				}
+			}
+		}
+	}
+
+loop_exit:
+
+	/*
+	 * Restore state.  We know gexec_flag was on, else we'd not be here. (We
+	 * also know it'll get turned off at end of command, but that's not ours
+	 * to do here.)
+	 */
+	pset.gexec_flag = true;
+
+	/* Return true if all queries were successful */
 	return success;
 }
 
@@ -885,7 +1145,7 @@ PrintQueryStatus(PGresult *results)
 
 
 /*
- * PrintQueryResults: print out (or store) query results as required
+ * PrintQueryResults: print out (or store or execute) query results as required
  *
  * Note: Utility function for use by SendQuery() only.
  *
@@ -903,9 +1163,13 @@ PrintQueryResults(PGresult *results)
 	switch (PQresultStatus(results))
 	{
 		case PGRES_TUPLES_OK:
-			/* store or print the data ... */
+			/* store or execute or print the data ... */
 			if (pset.gset_prefix)
 				success = StoreQueryTuple(results);
+			else if (pset.gexec_flag)
+				success = ExecQueryTuples(results);
+			else if (pset.crosstab_flag)
+				success = PrintResultsInCrosstab(results);
 			else
 				success = PrintQueryTuples(results);
 			/* if it's INSERT/UPDATE/DELETE RETURNING, also print status */
@@ -969,6 +1233,7 @@ SendQuery(const char *query)
 	PGTransactionStatusType transaction_status;
 	double		elapsed_msec = 0;
 	bool		OK = false;
+	int			i;
 	bool		on_error_rollback_savepoint = false;
 	static bool on_error_rollback_warning = false;
 
@@ -982,6 +1247,7 @@ SendQuery(const char *query)
 	{
 		char		buf[3];
 
+		fflush(stderr);
 		printf(_("***(Single step mode: verify command)*******************************************\n"
 				 "%s\n"
 				 "***(press return to proceed or enter x and return to cancel)********************\n"),
@@ -990,6 +1256,8 @@ SendQuery(const char *query)
 		if (fgets(buf, sizeof(buf), stdin) != NULL)
 			if (buf[0] == 'x')
 				goto sendquery_cleanup;
+		if (cancel_pressed)
+			goto sendquery_cleanup;
 	}
 	else if (pset.echo == PSQL_ECHO_QUERIES)
 	{
@@ -1018,11 +1286,11 @@ SendQuery(const char *query)
 		if (PQresultStatus(results) != PGRES_COMMAND_OK)
 		{
 			psql_error("%s", PQerrorMessage(pset.db));
-			PQclear(results);
+			ClearOrSaveResult(results);
 			ResetCancelConn();
 			goto sendquery_cleanup;
 		}
-		PQclear(results);
+		ClearOrSaveResult(results);
 		transaction_status = PQtransactionStatus(pset.db);
 	}
 
@@ -1033,8 +1301,11 @@ SendQuery(const char *query)
 	{
 		if (on_error_rollback_warning == false && pset.sversion < 80000)
 		{
-			psql_error("The server (version %d.%d) does not support savepoints for ON_ERROR_ROLLBACK.\n",
-					   pset.sversion / 10000, (pset.sversion / 100) % 100);
+			char		sverbuf[32];
+
+			psql_error("The server (version %s) does not support savepoints for ON_ERROR_ROLLBACK.\n",
+					   formatPGVersionNumber(pset.sversion, false,
+											 sverbuf, sizeof(sverbuf)));
 			on_error_rollback_warning = true;
 		}
 		else
@@ -1043,16 +1314,17 @@ SendQuery(const char *query)
 			if (PQresultStatus(results) != PGRES_COMMAND_OK)
 			{
 				psql_error("%s", PQerrorMessage(pset.db));
-				PQclear(results);
+				ClearOrSaveResult(results);
 				ResetCancelConn();
 				goto sendquery_cleanup;
 			}
-			PQclear(results);
+			ClearOrSaveResult(results);
 			on_error_rollback_savepoint = true;
 		}
 	}
 
-	if (pset.fetch_count <= 0 || !is_select_command(query))
+	if (pset.fetch_count <= 0 || pset.gexec_flag ||
+		pset.crosstab_flag || !is_select_command(query))
 	{
 		/* Default fetch-it-all-and-print mode */
 		instr_time	before,
@@ -1143,7 +1415,7 @@ SendQuery(const char *query)
 			if (PQresultStatus(svptres) != PGRES_COMMAND_OK)
 			{
 				psql_error("%s", PQerrorMessage(pset.db));
-				PQclear(svptres);
+				ClearOrSaveResult(svptres);
 				OK = false;
 
 				PQclear(results);
@@ -1154,11 +1426,11 @@ SendQuery(const char *query)
 		}
 	}
 
-	PQclear(results);
+	ClearOrSaveResult(results);
 
 	/* Possible microtiming output */
 	if (pset.timing)
-		printf(_("Time: %.3f ms\n"), elapsed_msec);
+		PrintTiming(elapsed_msec);
 
 	/* check for events that may occur during query execution */
 
@@ -1185,11 +1457,25 @@ sendquery_cleanup:
 		pset.gfname = NULL;
 	}
 
+	/* reset \gx's expanded-mode flag */
+	pset.g_expanded = false;
+
 	/* reset \gset trigger */
 	if (pset.gset_prefix)
 	{
 		free(pset.gset_prefix);
 		pset.gset_prefix = NULL;
+	}
+
+	/* reset \gexec trigger */
+	pset.gexec_flag = false;
+
+	/* reset \crosstabview trigger */
+	pset.crosstab_flag = false;
+	for (i = 0; i < lengthof(pset.ctv_args); i++)
+	{
+		pg_free(pset.ctv_args[i]);
+		pset.ctv_args[i] = NULL;
 	}
 
 	return OK;
@@ -1240,7 +1526,7 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 		results = PQexec(pset.db, "BEGIN");
 		OK = AcceptResult(results) &&
 			(PQresultStatus(results) == PGRES_COMMAND_OK);
-		PQclear(results);
+		ClearOrSaveResult(results);
 		if (!OK)
 			return false;
 		started_txn = true;
@@ -1254,7 +1540,7 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 	results = PQexec(pset.db, buf.data);
 	OK = AcceptResult(results) &&
 		(PQresultStatus(results) == PGRES_COMMAND_OK);
-	PQclear(results);
+	ClearOrSaveResult(results);
 	termPQExpBuffer(&buf);
 	if (!OK)
 		goto cleanup;
@@ -1278,6 +1564,10 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 	snprintf(fetch_cmd, sizeof(fetch_cmd),
 			 "FETCH FORWARD %d FROM _psql_cursor",
 			 fetch_count);
+
+	/* one-shot expanded output requested via \gx */
+	if (pset.g_expanded)
+		my_popt.topt.expanded = 1;
 
 	/* prepare to write output to \g argument, if any */
 	if (pset.gfname)
@@ -1325,7 +1615,7 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 
 			OK = AcceptResult(results);
 			Assert(!OK);
-			PQclear(results);
+			ClearOrSaveResult(results);
 			break;
 		}
 
@@ -1333,9 +1623,11 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 		{
 			/* StoreQueryTuple will complain if not exactly one row */
 			OK = StoreQueryTuple(results);
-			PQclear(results);
+			ClearOrSaveResult(results);
 			break;
 		}
+
+		/* Note we do not deal with \gexec or \crosstabview modes here */
 
 		ntuples = PQntuples(results);
 
@@ -1356,7 +1648,7 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 
 		printQuery(results, &my_popt, fout, is_pager, pset.logfile);
 
-		PQclear(results);
+		ClearOrSaveResult(results);
 
 		/* after the first result set, disallow header decoration */
 		my_popt.topt.start_table = false;
@@ -1413,15 +1705,17 @@ cleanup:
 	{
 		OK = AcceptResult(results) &&
 			(PQresultStatus(results) == PGRES_COMMAND_OK);
+		ClearOrSaveResult(results);
 	}
-	PQclear(results);
+	else
+		PQclear(results);
 
 	if (started_txn)
 	{
 		results = PQexec(pset.db, OK ? "COMMIT" : "ROLLBACK");
 		OK &= AcceptResult(results) &&
 			(PQresultStatus(results) == PGRES_COMMAND_OK);
-		PQclear(results);
+		ClearOrSaveResult(results);
 	}
 
 	if (pset.timing)

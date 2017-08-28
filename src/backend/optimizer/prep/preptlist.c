@@ -27,7 +27,7 @@
  * that because it's faster in typical non-inherited cases.
  *
  *
- * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -44,6 +44,7 @@
 #include "nodes/makefuncs.h"
 #include "optimizer/prep.h"
 #include "optimizer/tlist.h"
+#include "optimizer/var.h"
 #include "parser/parsetree.h"
 #include "parser/parse_coerce.h"
 #include "utils/rel.h"
@@ -167,7 +168,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 		ListCell   *l;
 
 		vars = pull_var_clause((Node *) parse->returningList,
-							   PVC_RECURSE_AGGREGATES,
+							   PVC_RECURSE_AGGREGATES |
+							   PVC_RECURSE_WINDOWFUNCS |
 							   PVC_INCLUDE_PLACEHOLDERS);
 		foreach(l, vars)
 		{
@@ -178,7 +180,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 				var->varno == result_relation)
 				continue;		/* don't need it */
 
-			if (tlist_member((Node *) var, tlist))
+			if (tlist_member((Expr *) var, tlist))
 				continue;		/* already got it */
 
 			tle = makeTargetEntry((Expr *) var,
@@ -246,7 +248,7 @@ expand_targetlist(List *tlist, int command_type,
 
 	for (attrno = 1; attrno <= numattrs; attrno++)
 	{
-		Form_pg_attribute att_tup = rel->rd_att->attrs[attrno - 1];
+		Form_pg_attribute att_tup = TupleDescAttr(rel->rd_att, attrno - 1);
 		TargetEntry *new_tle = NULL;
 
 		if (tlist_item != NULL)
@@ -299,7 +301,7 @@ expand_targetlist(List *tlist, int command_type,
 													  attcollation,
 													  att_tup->attlen,
 													  (Datum) 0,
-													  true,		/* isnull */
+													  true, /* isnull */
 													  att_tup->attbyval);
 						new_expr = coerce_to_domain(new_expr,
 													InvalidOid, -1,
@@ -317,7 +319,7 @@ expand_targetlist(List *tlist, int command_type,
 													  InvalidOid,
 													  sizeof(int32),
 													  (Datum) 0,
-													  true,		/* isnull */
+													  true, /* isnull */
 													  true /* byval */ );
 					}
 					break;
@@ -339,7 +341,7 @@ expand_targetlist(List *tlist, int command_type,
 													  InvalidOid,
 													  sizeof(int32),
 													  (Datum) 0,
-													  true,		/* isnull */
+													  true, /* isnull */
 													  true /* byval */ );
 					}
 					break;
