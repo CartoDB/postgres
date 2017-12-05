@@ -1,13 +1,13 @@
 # Changelog
 
-## next
+## 10.1+carto-3
 
-**Release date**: TBD
+**Release date**: 2017-12-05
 
 Changes:
- - Add this very changelog
- - Allow SQL functions to inline in the presence of costly parameter functions (planned)
- - Parallel planning improvement for costly functions on target list (planned)
+ - Add this very changelog [#13](https://github.com/CartoDB/postgres/pull/13)
+ - Allow SQL functions to inline in the presence of costly parameter functions [#12](https://github.com/CartoDB/postgres/pull/12)
+ - Parallel planning improvement for costly functions on target list [#11](https://github.com/CartoDB/postgres/pull/11)
 
 
 ## 10.1+carto-2
