@@ -1697,9 +1697,11 @@ ExecutePlan(EState *estate,
 
 	/*
 	 * If the plan might potentially be executed multiple times, we must force
-	 * it to run without parallelism, because we might exit early.
+	 * it to run without parallelism, because we might exit early.  Also
+	 * disable parallelism when writing into a relation, because no database
+	 * changes are allowed in parallel mode.
 	 */
-	if (!execute_once)
+	if (!execute_once || dest->mydest == DestIntoRel)
 		use_parallel_mode = false;
 
 	estate->es_use_parallel_mode = use_parallel_mode;
