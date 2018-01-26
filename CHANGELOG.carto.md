@@ -1,5 +1,12 @@
 # Changelog
 
+## 10.1.2+carto-1
+
+**Release data**: 2018-XX-XX
+
+Changes
+  - Revert [#10](https://github.com/CartoDB/postgres/pull/10) as the patch was incomplete and causing crashes
+
 ## 10.1.1+carto-1
 
 **Release date**: 2017-12-05
