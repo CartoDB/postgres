@@ -323,7 +323,7 @@ SocketBackend(StringInfo inBuf)
 	/*
 	 * Get message type code from the frontend.
 	 */
-	HOLD_CANCEL_INTERRUPTS();
+	//HOLD_CANCEL_INTERRUPTS();
 	pq_startmsgread();
 	qtype = pq_getbyte();
 
@@ -480,7 +480,7 @@ SocketBackend(StringInfo inBuf)
 	}
 	else
 		pq_endmsgread();
-	RESUME_CANCEL_INTERRUPTS();
+	//RESUME_CANCEL_INTERRUPTS();
 
 	return qtype;
 }

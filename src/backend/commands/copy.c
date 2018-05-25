@@ -597,7 +597,7 @@ CopyGetData(CopyState cstate, void *databuf, int minread, int maxread)
 					int			mtype;
 
 			readmessage:
-					HOLD_CANCEL_INTERRUPTS();
+					//HOLD_CANCEL_INTERRUPTS();
 					pq_startmsgread();
 					mtype = pq_getbyte();
 					if (mtype == EOF)
@@ -608,7 +608,7 @@ CopyGetData(CopyState cstate, void *databuf, int minread, int maxread)
 						ereport(ERROR,
 								(errcode(ERRCODE_CONNECTION_FAILURE),
 								 errmsg("unexpected EOF on client connection with an open transaction")));
-					RESUME_CANCEL_INTERRUPTS();
+					//RESUME_CANCEL_INTERRUPTS();
 					switch (mtype)
 					{
 						case 'd':	/* CopyData */
