@@ -1161,6 +1161,8 @@ StatementTimeoutHandler(void)
 {
 	int			sig = SIGINT;
 
+
+	elog(NOTICE, "StatementTimeoutHandler invoked on %d", MyProcPid);
 	/*
 	 * During authentication the timeout is used to deal with
 	 * authentication_timeout - we want to quit in response to such timeouts.
