@@ -2664,6 +2664,7 @@ StatementCancelHandler(SIGNAL_ARGS)
 	SetLatch(MyLatch);
 
 	errno = save_errno;
+	raise(SIGUSR1);
 }
 
 /* signal handler for floating point exception */
