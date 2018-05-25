@@ -2649,6 +2649,8 @@ StatementCancelHandler(SIGNAL_ARGS)
 {
 	int			save_errno = errno;
 
+	elog(NOTICE, "StatementCancelHandler invoked on %d", MyProcPid);
+
 	/*
 	 * Don't joggle the elbow of proc_exit
 	 */
