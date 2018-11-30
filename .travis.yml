@@ -1,0 +1,21 @@
+dist: xenial
+language: c
+compiler: clang
+perl: 5.26
+
+env:
+  global:
+    - CFLAGS="-g -O2 -fstack-protector -Wformat -Werror=format-security" LDFLAGS="-Wl,-Bsymbolic-functions -Wl,-z,relro"
+    - CC="clang"
+    - CXX="clang++"
+    - MAKEFLAGS="-j 2"
+
+addons:
+  apt:
+    packages:
+    - libipc-run-perl
+
+script:
+  - ./configure --with-llvm   --enable-tap-tests
+  - make
+  - make check-world
