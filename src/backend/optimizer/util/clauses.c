@@ -4747,7 +4747,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 		else if (usecounts[i] != 1)
 		{
 			/* Param used multiple times: uncool if expensive or volatile */
-			QualCost	eval_cost;
+			// QualCost	eval_cost;
 
 			/*
 			 * We define "expensive" as "contains any subplan or more than 10
@@ -4757,10 +4757,10 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 			 */
 			if (contain_subplans(param))
 				goto fail;
-			cost_qual_eval(&eval_cost, list_make1(param), NULL);
-			if (eval_cost.startup + eval_cost.per_tuple >
-				10 * cpu_operator_cost)
-				goto fail;
+			// cost_qual_eval(&eval_cost, list_make1(param), NULL);
+			// if (eval_cost.startup + eval_cost.per_tuple >
+			// 	10 * cpu_operator_cost)
+			// 	goto fail;
 
 			/*
 			 * Check volatility last since this is more expensive than the
