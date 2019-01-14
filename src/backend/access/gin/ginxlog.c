@@ -513,11 +513,25 @@ ginRedoDeletePage(XLogReaderState *record)
 	Buffer		lbuffer;
 	Page		page;
 
+	/*
+	 * Lock left page first in order to prevent possible deadlock with
+	 * ginStepRight().
+	 */
+	if (XLogReadBufferForRedo(record, 2, &lbuffer) == BLK_NEEDS_REDO)
+	{
+		page = BufferGetPage(lbuffer);
+		Assert(GinPageIsData(page));
+		GinPageGetOpaque(page)->rightlink = data->rightLink;
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(lbuffer);
+	}
+
 	if (XLogReadBufferForRedo(record, 0, &dbuffer) == BLK_NEEDS_REDO)
 	{
 		page = BufferGetPage(dbuffer);
 		Assert(GinPageIsData(page));
 		GinPageGetOpaque(page)->flags = GIN_DELETED;
+		GinPageSetDeleteXid(page, data->deleteXid);
 		PageSetLSN(page, lsn);
 		MarkBufferDirty(dbuffer);
 	}
@@ -530,15 +544,6 @@ ginRedoDeletePage(XLogReaderState *record)
 		GinPageDeletePostingItem(page, data->parentOffset);
 		PageSetLSN(page, lsn);
 		MarkBufferDirty(pbuffer);
-	}
-
-	if (XLogReadBufferForRedo(record, 2, &lbuffer) == BLK_NEEDS_REDO)
-	{
-		page = BufferGetPage(lbuffer);
-		Assert(GinPageIsData(page));
-		GinPageGetOpaque(page)->rightlink = data->rightLink;
-		PageSetLSN(page, lsn);
-		MarkBufferDirty(lbuffer);
 	}
 
 	if (BufferIsValid(lbuffer))
