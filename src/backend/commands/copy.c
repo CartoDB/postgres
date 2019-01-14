@@ -17,7 +17,6 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -1732,7 +1731,7 @@ ClosePipeToProgram(CopyState cstate)
 		 * problem.
 		 */
 		if (cstate->is_copy_from && !cstate->reached_eof &&
-			WIFSIGNALED(pclose_rc) && WTERMSIG(pclose_rc) == SIGPIPE)
+			wait_result_is_signal(pclose_rc, SIGPIPE))
 			return;
 
 		ereport(ERROR,
@@ -2424,10 +2423,17 @@ CopyFrom(CopyState cstate)
 	 * possible to improve on this, but it does mean maintaining heap insert
 	 * option flags per partition and setting them when we first open the
 	 * partition.
+	 *
+	 * This optimization is not supported for relation types which do not
+	 * have any physical storage, with foreign tables and views using
+	 * INSTEAD OF triggers entering in this category.  Partitioned tables
+	 * are not supported as per the description above.
 	 *----------
 	 */
 	/* createSubid is creation check, newRelfilenodeSubid is truncation check */
-	if (cstate->rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+	if (cstate->rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&
+		cstate->rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+		cstate->rel->rd_rel->relkind != RELKIND_VIEW &&
 		(cstate->rel->rd_createSubid != InvalidSubTransactionId ||
 		 cstate->rel->rd_newRelfilenodeSubid != InvalidSubTransactionId))
 	{
