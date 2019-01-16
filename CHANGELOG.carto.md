@@ -1,5 +1,5 @@
 11.1+carto-1
-Release date: XXXX-XX-XX
+Release date: 2019-01-16
 
 Changes:
 
@@ -7,4 +7,4 @@ Changes:
 - Add this CHANGELOG.
 - Port #12: Allow SQL functions to inline in the presence of costly parameter functions
 - Setup travis tests
-- Update from upstream (20b4ed8d03047501cc28b600973564850bd1dd80)
+- Update from upstream (6afea53c30d9ec841d593651ab7ae252801f64c5)
