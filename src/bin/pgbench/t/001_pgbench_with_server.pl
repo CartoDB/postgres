@@ -802,7 +802,7 @@ sub check_pgbench_logs
 
 	my @logs = glob "$prefix.*";
 	ok(@logs == $nb, "number of log files");
-	ok(grep(/^$prefix\.\d+(\.\d+)?$/, @logs) == $nb, "file name format");
+	ok(grep(/^$prefix\.\d+(\.\d+)?$/, @logs) == $nb, "file name format (@logs)");
 
 	my $log_number = 0;
 	for my $log (sort @logs)
