@@ -1,3 +1,9 @@
+11.1.2+carto-1
+Release date: 2019-01-18
+
+Changes:
+- PGbench test: Print log filenames on file format failure.
+
 11.1.1+carto-1
 Release date: 2019-01-16
 
