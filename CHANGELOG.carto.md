@@ -1,5 +1,5 @@
 11.2.1+carto-1
-Release date: 2019-XX-XX
+Release date: 2019-02-12
 
 Changes:
 - Update drom upstream (a4c6a73aa438d6c44fbe1e5e0c8878051e8c2b54)
