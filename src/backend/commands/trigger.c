@@ -3396,6 +3396,11 @@ ltrmark:;
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	}
 
+	/*
+	 * While this is not necessary anymore after 297d627e, as a defense
+	 * against C code that has not recompiled for minor releases after the
+	 * fix, continue to expand the tuple.
+	 */
 	if (HeapTupleHeaderGetNatts(tuple.t_data) < relation->rd_att->natts)
 		result = heap_expand_tuple(&tuple, relation->rd_att);
 	else
