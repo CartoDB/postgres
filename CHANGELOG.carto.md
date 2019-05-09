@@ -2,7 +2,7 @@
 Release date: 2019-05-09
 
 Changes:
-- Update from upstream (11.3
+- Update from upstream (11.3 25f12acd53f603a581d8bc89920037a811f12f82)
 
 11.2.1+carto-1
 Release date: 2019-02-12
