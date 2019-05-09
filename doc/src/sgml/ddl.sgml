@@ -3357,27 +3357,6 @@ ALTER TABLE measurement ATTACH PARTITION measurement_y2008m02
 
      <listitem>
       <para>
-       When an <command>UPDATE</command> causes a row to move from one
-       partition to another, there is a chance that another concurrent
-       <command>UPDATE</command> or <command>DELETE</command> will get a
-       serialization failure error.  Suppose session 1 is performing an
-       <command>UPDATE</command> on a partition key, and meanwhile a concurrent
-       session 2 for which this row is visible performs an
-       <command>UPDATE</command> or <command>DELETE</command> operation on this
-       row.  In such case, session 2's <command>UPDATE</command> or
-       <command>DELETE</command>, will detect the row movement and raise a
-       serialization failure error (which always returns with an SQLSTATE code
-       '40001').  Applications may wish to retry the transaction if this
-       occurs.  In the usual case where the table is not partitioned, or where
-       there is no row movement, session 2 would have identified the newly
-       updated row and carried out the
-       <command>UPDATE</command>/<command>DELETE</command> on this new row
-       version.
-      </para>
-     </listitem>
-
-     <listitem>
-      <para>
        <literal>BEFORE ROW</literal> triggers, if necessary, must be defined
        on individual partitions, not the partitioned table.
       </para>
@@ -3939,22 +3918,11 @@ EXPLAIN SELECT count(*) FROM measurement WHERE logdate &gt;= DATE '2008-01-01';
 
    <note>
     <para>
-     Currently, pruning of partitions during the planning of an
-     <command>UPDATE</command> or <command>DELETE</command> command is
-     implemented using the constraint exclusion method (however, it is
-     controlled by the <literal>enable_partition_pruning</literal> rather than
-     <literal>constraint_exclusion</literal>) &mdash; see the following section
-     for details and caveats that apply.
-    </para>
-
-    <para>
-     Also, execution-time partition pruning currently only occurs for the
-     <literal>Append</literal> node type, not <literal>MergeAppend</literal>.
-    </para>
-
-    <para>
-     Both of these behaviors are likely to be changed in a future release
-     of <productname>PostgreSQL</productname>.
+     Execution-time partition pruning currently only occurs for the
+     <literal>Append</literal> node type, not
+     for <literal>MergeAppend</literal> or <literal>ModifyTable</literal>
+     nodes.  That is likely to be changed in a future release of
+     <productname>PostgreSQL</productname>.
     </para>
    </note>
   </sect2>

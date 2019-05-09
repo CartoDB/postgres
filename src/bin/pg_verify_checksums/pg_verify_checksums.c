@@ -167,7 +167,7 @@ scan_directory(const char *basedir, const char *subdir)
 		if (strncmp(de->d_name,
 					PG_TEMP_FILES_DIR,
 					strlen(PG_TEMP_FILES_DIR)) == 0)
-			return;
+			continue;
 
 		snprintf(fn, sizeof(fn), "%s/%s", path, de->d_name);
 		if (lstat(fn, &st) < 0)
@@ -313,6 +313,22 @@ main(int argc, char *argv[])
 	if (!crc_ok)
 	{
 		fprintf(stderr, _("%s: pg_control CRC value is incorrect\n"), progname);
+		exit(1);
+	}
+
+	if (ControlFile->pg_control_version != PG_CONTROL_VERSION)
+	{
+		fprintf(stderr, _("%s: cluster is not compatible with this version of pg_verify_checksums\n"),
+				progname);
+		exit(1);
+	}
+
+	if (ControlFile->blcksz != BLCKSZ)
+	{
+		fprintf(stderr, _("%s: database cluster is not compatible\n"),
+				progname);
+		fprintf(stderr, _("The database cluster was initialized with block size %u, but pg_verify_checksums was compiled with block size %u.\n"),
+				ControlFile->blcksz, BLCKSZ);
 		exit(1);
 	}
 
