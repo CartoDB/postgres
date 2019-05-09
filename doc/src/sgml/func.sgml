@@ -18687,6 +18687,8 @@ SELECT set_config('log_statement_stats', 'off', false);
     The functions shown in <xref
     linkend="functions-admin-backup-table"/> assist in making on-line backups.
     These functions cannot be executed during recovery (except
+    non-exclusive <function>pg_start_backup</function>,
+    non-exclusive <function>pg_stop_backup</function>,
     <function>pg_is_in_backup</function>, <function>pg_backup_start_time</function>
     and <function>pg_wal_lsn_diff</function>).
    </para>
@@ -19166,8 +19168,10 @@ postgres=# SELECT * FROM pg_walfile_name_offset(pg_stop_backup());
     See <xref linkend="streaming-replication"/>,
     <xref linkend="streaming-replication-slots"/>, and
     <xref linkend="replication-origins"/>
-    for information about the underlying features.  Use of these
-    functions is restricted to superusers.
+    for information about the underlying features.
+    Use of functions for replication origin is restricted to superusers.
+    Use of functions for replication slot is restricted to superusers
+    and users having <literal>REPLICATION</literal> privilege.
    </para>
 
    <para>

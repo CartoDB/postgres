@@ -495,8 +495,6 @@ static ObjectAddress ATExecAttachPartitionIdx(List **wqueue, Relation rel,
 static void validatePartitionedIndex(Relation partedIdx, Relation partedTbl);
 static void refuseDupeIndexAttach(Relation parentIdx, Relation partIdx,
 					  Relation partitionTbl);
-static void update_relispartition(Relation classRel, Oid relationId,
-					  bool newval);
 
 
 /* ----------------------------------------------------------------
@@ -4534,6 +4532,15 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode)
 		Relation	rel = NULL;
 		ListCell   *lcon;
 
+		/*
+		 * Foreign tables have no storage, nor do partitioned tables and
+		 * indexes.
+		 */
+		if (tab->relkind == RELKIND_FOREIGN_TABLE ||
+			tab->relkind == RELKIND_PARTITIONED_TABLE ||
+			tab->relkind == RELKIND_PARTITIONED_INDEX)
+			continue;
+
 		foreach(lcon, tab->constraints)
 		{
 			NewConstraint *con = lfirst(lcon);
@@ -7919,7 +7926,7 @@ CloneFkReferencing(Relation pg_constraint, Relation parentRel,
 		int			i;
 
 		tuple = SearchSysCache1(CONSTROID, parentConstrOid);
-		if (!tuple)
+		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "cache lookup failed for constraint %u",
 				 parentConstrOid);
 		constrForm = (Form_pg_constraint) GETSTRUCT(tuple);
@@ -7988,7 +7995,7 @@ CloneFkReferencing(Relation pg_constraint, Relation parentRel,
 			 */
 			partcontup = SearchSysCache1(CONSTROID,
 										 ObjectIdGetDatum(fk->conoid));
-			if (!partcontup)
+			if (!HeapTupleIsValid(partcontup))
 				elog(ERROR, "cache lookup failed for constraint %u",
 					 fk->conoid);
 			partConstr = (Form_pg_constraint) GETSTRUCT(partcontup);
@@ -10687,7 +10694,9 @@ TryReuseIndex(Oid oldId, IndexStmt *stmt)
 	{
 		Relation	irel = index_open(oldId, NoLock);
 
-		stmt->oldNode = irel->rd_node.relNode;
+		/* If it's a partitioned index, there is no storage to share. */
+		if (irel->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
+			stmt->oldNode = irel->rd_node.relNode;
 		index_close(irel, NoLock);
 	}
 }
@@ -15027,7 +15036,6 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
 				IndexSetParentIndex(attachrelIdxRels[i], idx);
 				if (OidIsValid(constraintOid))
 					ConstraintSetParentConstraint(cldConstrOid, constraintOid);
-				update_relispartition(NULL, cldIdxId, true);
 				found = true;
 				break;
 			}
@@ -15278,7 +15286,6 @@ ATExecDetachPartition(Relation rel, RangeVar *name)
 
 		idx = index_open(idxid, AccessExclusiveLock);
 		IndexSetParentIndex(idx, InvalidOid);
-		update_relispartition(classRel, idxid, false);
 
 		/* If there's a constraint associated with the index, detach it too */
 		constrOid = get_relation_idx_constraint_oid(RelationGetRelid(partRel),
@@ -15303,7 +15310,7 @@ ATExecDetachPartition(Relation rel, RangeVar *name)
 		Constraint *fkconstraint;
 
 		contup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(fk->conoid));
-		if (!contup)
+		if (!HeapTupleIsValid(contup))
 			elog(ERROR, "cache lookup failed for constraint %u", fk->conoid);
 		conform = (Form_pg_constraint) GETSTRUCT(contup);
 
@@ -15518,7 +15525,7 @@ ATExecAttachPartitionIdx(List **wqueue, Relation parentIdx, RangeVar *name)
 							  partIdx->rd_opfamily,
 							  parentIdx->rd_opfamily,
 							  attmap,
-							  RelationGetDescr(partTbl)->natts))
+							  RelationGetDescr(parentTbl)->natts))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("cannot attach index \"%s\" as a partition of index \"%s\"",
@@ -15553,7 +15560,6 @@ ATExecAttachPartitionIdx(List **wqueue, Relation parentIdx, RangeVar *name)
 		IndexSetParentIndex(partIdx, RelationGetRelid(parentIdx));
 		if (OidIsValid(constraintOid))
 			ConstraintSetParentConstraint(cldConstrId, constraintOid);
-		update_relispartition(NULL, partIdxId, true);
 
 		pfree(attmap);
 
@@ -15644,9 +15650,8 @@ validatePartitionedIndex(Relation partedIdx, Relation partedTbl)
 
 		indTup = SearchSysCache1(INDEXRELID,
 								 ObjectIdGetDatum(inhForm->inhrelid));
-		if (!indTup)
-			elog(ERROR, "cache lookup failed for index %u",
-				 inhForm->inhrelid);
+		if (!HeapTupleIsValid(indTup))
+			elog(ERROR, "cache lookup failed for index %u", inhForm->inhrelid);
 		indexForm = (Form_pg_index) GETSTRUCT(indTup);
 		if (IndexIsValid(indexForm))
 			tuples += 1;
@@ -15702,36 +15707,4 @@ validatePartitionedIndex(Relation partedIdx, Relation partedTbl)
 		relation_close(parentIdx, AccessExclusiveLock);
 		relation_close(parentTbl, AccessExclusiveLock);
 	}
-}
-
-/*
- * Update the relispartition flag of the given relation to the given value.
- *
- * classRel is the pg_class relation, already open and suitably locked.
- * It can be passed as NULL, in which case it's opened and closed locally.
- */
-static void
-update_relispartition(Relation classRel, Oid relationId, bool newval)
-{
-	HeapTuple	tup;
-	HeapTuple	newtup;
-	Form_pg_class classForm;
-	bool		opened = false;
-
-	if (classRel == NULL)
-	{
-		classRel = heap_open(RelationRelationId, RowExclusiveLock);
-		opened = true;
-	}
-
-	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relationId));
-	newtup = heap_copytuple(tup);
-	classForm = (Form_pg_class) GETSTRUCT(newtup);
-	classForm->relispartition = newval;
-	CatalogTupleUpdate(classRel, &tup->t_self, newtup);
-	heap_freetuple(newtup);
-	ReleaseSysCache(tup);
-
-	if (opened)
-		heap_close(classRel, RowExclusiveLock);
 }
