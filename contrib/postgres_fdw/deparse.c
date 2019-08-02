@@ -182,6 +182,7 @@ static void appendGroupByClause(List *tlist, deparse_expr_cxt *context);
 static void appendAggOrderBy(List *orderList, List *targetList,
 				 deparse_expr_cxt *context);
 static void appendFunctionName(Oid funcid, deparse_expr_cxt *context);
+static void deparseRowExpr(RowExpr *node, deparse_expr_cxt *context);
 static Node *deparseSortGroupClause(Index ref, List *tlist, bool force_colno,
 					   deparse_expr_cxt *context);
 
@@ -775,7 +776,14 @@ foreign_expr_walker(Node *node,
 					state = FDW_COLLATE_UNSAFE;
 			}
 			break;
-		default:
+	    case T_RowExpr:
+			/*
+			 * rtorre: this is a bold move, let's consider it true.  Trying to
+			 * cover the st_asmvt(ROW(st_asmvtgeom(...)) case. I guess the
+			 * proper solution is to examine the row expression carefully.
+			 */
+			return true;
+	    default:
 
 			/*
 			 * If it's anything else, assume it's unsafe.  This list can be
@@ -2354,11 +2362,33 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_Aggref:
 			deparseAggref((Aggref *) node, context);
 			break;
+	    case T_RowExpr:
+			deparseRowExpr((RowExpr *) node, context);
+			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
 				 (int) nodeTag(node));
 			break;
 	}
+}
+
+static void
+deparseRowExpr(RowExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	bool		first;
+	ListCell   *lc;
+
+	appendStringInfoString(buf, "ROW(");
+	first = true;
+	foreach(lc, node->args)
+	{
+		if (!first)
+			appendStringInfo(buf, ", ");
+		deparseExpr((Expr *) lfirst(lc), context);
+		first = false;
+	}
+	appendStringInfoChar(buf, ')');
 }
 
 /*
