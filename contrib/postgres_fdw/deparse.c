@@ -2433,7 +2433,7 @@ deparseRowExpr(RowExpr *node, deparse_expr_cxt *context)
 	bool		first;
 	ListCell   *lc;
 
-	appendStringInfoString(buf, "(");
+	appendStringInfoString(buf, "ROW(");
 	first = true;
 	foreach(lc, node->args)
 	{
