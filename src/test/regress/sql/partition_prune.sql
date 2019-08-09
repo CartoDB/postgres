@@ -83,6 +83,7 @@ explain (costs off) select * from rlp where a = 1 or b = 'ab';
 explain (costs off) select * from rlp where a > 20 and a < 27;
 explain (costs off) select * from rlp where a = 29;
 explain (costs off) select * from rlp where a >= 29;
+explain (costs off) select * from rlp where a < 1 or (a > 20 and a < 25);
 
 -- redundant clauses are eliminated
 explain (costs off) select * from rlp where a > 1 and a = 10;	/* only default */
@@ -158,6 +159,15 @@ explain (costs off) select * from boolpart where a is not true;
 explain (costs off) select * from boolpart where a is not true and a is not false;
 explain (costs off) select * from boolpart where a is unknown;
 explain (costs off) select * from boolpart where a is not unknown;
+
+create table boolrangep (a bool, b bool, c int) partition by range (a,b,c);
+create table boolrangep_tf partition of boolrangep for values from ('true', 'false', 0) to ('true', 'false', 100);
+create table boolrangep_ft partition of boolrangep for values from ('false', 'true', 0) to ('false', 'true', 100);
+create table boolrangep_ff1 partition of boolrangep for values from ('false', 'false', 0) to ('false', 'false', 50);
+create table boolrangep_ff2 partition of boolrangep for values from ('false', 'false', 50) to ('false', 'false', 100);
+
+-- try a more complex case that's been known to trip up pruning in the past
+explain (costs off)  select * from boolrangep where not a and not b and c = 25;
 
 -- test scalar-to-array operators
 create table coercepart (a varchar) partition by list (a);
@@ -264,7 +274,7 @@ create table rparted_by_int2_maxvalue partition of rparted_by_int2 for values fr
 -- all partitions but rparted_by_int2_maxvalue pruned
 explain (costs off) select * from rparted_by_int2 where a > 100000000000000;
 
-drop table lp, coll_pruning, rlp, mc3p, mc2p, boolpart, rp, coll_pruning_multi, like_op_noprune, lparted_by_int2, rparted_by_int2;
+drop table lp, coll_pruning, rlp, mc3p, mc2p, boolpart, boolrangep, rp, coll_pruning_multi, like_op_noprune, lparted_by_int2, rparted_by_int2;
 
 --
 -- Test Partition pruning for HASH partitioning
@@ -718,6 +728,82 @@ explain (analyze, costs off, summary off, timing off)
 select * from listp where a = (select null::int);
 
 drop table listp;
+
+--
+-- check that stable query clauses are only used in run-time pruning
+--
+create table stable_qual_pruning (a timestamp) partition by range (a);
+create table stable_qual_pruning1 partition of stable_qual_pruning
+  for values from ('2000-01-01') to ('2000-02-01');
+create table stable_qual_pruning2 partition of stable_qual_pruning
+  for values from ('2000-02-01') to ('2000-03-01');
+create table stable_qual_pruning3 partition of stable_qual_pruning
+  for values from ('3000-02-01') to ('3000-03-01');
+
+-- comparison against a stable value requires run-time pruning
+explain (analyze, costs off, summary off, timing off)
+select * from stable_qual_pruning where a < localtimestamp;
+
+-- timestamp < timestamptz comparison is only stable, not immutable
+explain (analyze, costs off, summary off, timing off)
+select * from stable_qual_pruning where a < '2000-02-01'::timestamptz;
+
+-- check ScalarArrayOp cases
+explain (analyze, costs off, summary off, timing off)
+select * from stable_qual_pruning
+  where a = any(array['2010-02-01', '2020-01-01']::timestamp[]);
+explain (analyze, costs off, summary off, timing off)
+select * from stable_qual_pruning
+  where a = any(array['2000-02-01', '2010-01-01']::timestamp[]);
+explain (analyze, costs off, summary off, timing off)
+select * from stable_qual_pruning
+  where a = any(array['2000-02-01', localtimestamp]::timestamp[]);
+explain (analyze, costs off, summary off, timing off)
+select * from stable_qual_pruning
+  where a = any(array['2010-02-01', '2020-01-01']::timestamptz[]);
+explain (analyze, costs off, summary off, timing off)
+select * from stable_qual_pruning
+  where a = any(array['2000-02-01', '2010-01-01']::timestamptz[]);
+
+drop table stable_qual_pruning;
+
+--
+-- Check that pruning with composite range partitioning works correctly when
+-- it must ignore clauses for trailing keys once it has seen a clause with
+-- non-inclusive operator for an earlier key
+--
+create table mc3p (a int, b int, c int) partition by range (a, abs(b), c);
+create table mc3p0 partition of mc3p
+  for values from (0, 0, 0) to (0, maxvalue, maxvalue);
+create table mc3p1 partition of mc3p
+  for values from (1, 1, 1) to (2, minvalue, minvalue);
+create table mc3p2 partition of mc3p
+  for values from (2, minvalue, minvalue) to (3, maxvalue, maxvalue);
+insert into mc3p values (0, 1, 1), (1, 1, 1), (2, 1, 1);
+
+explain (analyze, costs off, summary off, timing off)
+select * from mc3p where a < 3 and abs(b) = 1;
+
+--
+-- Check that pruning with composite range partitioning works correctly when
+-- a combination of runtime parameters is specified, not all of whose values
+-- are available at the same time
+--
+-- Note: this test doesn't actually prove much in v11, for lack of a way
+-- to force use of a generic plan.
+--
+prepare ps1 as
+  select * from mc3p where a = $1 and abs(b) < (select 3);
+explain (analyze, costs off, summary off, timing off)
+execute ps1(1);
+deallocate ps1;
+prepare ps2 as
+  select * from mc3p where a <= $1 and abs(b) < (select 3);
+explain (analyze, costs off, summary off, timing off)
+execute ps2(1);
+deallocate ps2;
+
+drop table mc3p;
 
 -- Ensure runtime pruning works with initplans params with boolean types
 create table boolvalues (value bool not null);
