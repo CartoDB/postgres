@@ -17,6 +17,7 @@ test: partial-index
 test: two-ids
 test: multiple-row-versions
 test: index-only-scan
+test: predicate-lock-hot-tuple
 test: deadlock-simple
 test: deadlock-hard
 test: deadlock-soft
@@ -34,6 +35,7 @@ test: insert-conflict-do-update
 test: insert-conflict-do-update-2
 test: insert-conflict-do-update-3
 test: insert-conflict-toast
+test: insert-conflict-specconflict
 test: delete-abort-savept
 test: delete-abort-savept-2
 test: aborted-keyrevoke
@@ -45,6 +47,7 @@ test: update-locked-tuple
 test: propagate-lock-delete
 test: tuplelock-conflict
 test: tuplelock-update
+test: tuplelock-upgrade-no-deadlock
 test: freeze-the-dead
 test: nowait
 test: nowait-2

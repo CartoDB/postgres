@@ -808,6 +808,31 @@ coerce_function_result_tuple(PLpgSQL_execstate *estate, TupleDesc tupdesc)
 			estate->retval = PointerGetDatum(SPI_returntuple(rettup, tupdesc));
 			/* no need to free map, we're about to return anyway */
 		}
+		else if (!(tupdesc->tdtypeid == erh->er_decltypeid ||
+				   (tupdesc->tdtypeid == RECORDOID &&
+					!ExpandedRecordIsDomain(erh))))
+		{
+			/*
+			 * The expanded record has the right physical tupdesc, but the
+			 * wrong type ID.  (Typically, the expanded record is RECORDOID
+			 * but the function is declared to return a named composite type.
+			 * As in exec_move_row_from_datum, we don't allow returning a
+			 * composite-domain record from a function declared to return
+			 * RECORD.)  So we must flatten the record to a tuple datum and
+			 * overwrite its type fields with the right thing.  spi.c doesn't
+			 * provide any easy way to deal with this case, so we end up
+			 * duplicating the guts of datumCopy() :-(
+			 */
+			Size		resultsize;
+			HeapTupleHeader tuphdr;
+
+			resultsize = EOH_get_flat_size(&erh->hdr);
+			tuphdr = (HeapTupleHeader) SPI_palloc(resultsize);
+			EOH_flatten_into(&erh->hdr, (void *) tuphdr, resultsize);
+			HeapTupleHeaderSetTypeId(tuphdr, tupdesc->tdtypeid);
+			HeapTupleHeaderSetTypMod(tuphdr, tupdesc->tdtypmod);
+			estate->retval = PointerGetDatum(tuphdr);
+		}
 		else
 		{
 			/*
@@ -5552,7 +5577,7 @@ plpgsql_exec_get_datum_type(PLpgSQL_execstate *estate,
 void
 plpgsql_exec_get_datum_type_info(PLpgSQL_execstate *estate,
 								 PLpgSQL_datum *datum,
-								 Oid *typeid, int32 *typmod, Oid *collation)
+								 Oid *typeId, int32 *typMod, Oid *collation)
 {
 	switch (datum->dtype)
 	{
@@ -5561,8 +5586,8 @@ plpgsql_exec_get_datum_type_info(PLpgSQL_execstate *estate,
 			{
 				PLpgSQL_var *var = (PLpgSQL_var *) datum;
 
-				*typeid = var->datatype->typoid;
-				*typmod = var->datatype->atttypmod;
+				*typeId = var->datatype->typoid;
+				*typMod = var->datatype->atttypmod;
 				*collation = var->datatype->collation;
 				break;
 			}
@@ -5574,15 +5599,15 @@ plpgsql_exec_get_datum_type_info(PLpgSQL_execstate *estate,
 				if (rec->erh == NULL || rec->rectypeid != RECORDOID)
 				{
 					/* Report variable's declared type */
-					*typeid = rec->rectypeid;
-					*typmod = -1;
+					*typeId = rec->rectypeid;
+					*typMod = -1;
 				}
 				else
 				{
 					/* Report record's actual type if declared RECORD */
-					*typeid = rec->erh->er_typeid;
+					*typeId = rec->erh->er_typeid;
 					/* do NOT return the mutable typmod of a RECORD variable */
-					*typmod = -1;
+					*typMod = -1;
 				}
 				/* composite types are never collatable */
 				*collation = InvalidOid;
@@ -5620,16 +5645,16 @@ plpgsql_exec_get_datum_type_info(PLpgSQL_execstate *estate,
 					recfield->rectupledescid = rec->erh->er_tupdesc_id;
 				}
 
-				*typeid = recfield->finfo.ftypeid;
-				*typmod = recfield->finfo.ftypmod;
+				*typeId = recfield->finfo.ftypeid;
+				*typMod = recfield->finfo.ftypmod;
 				*collation = recfield->finfo.fcollation;
 				break;
 			}
 
 		default:
 			elog(ERROR, "unrecognized dtype: %d", datum->dtype);
-			*typeid = InvalidOid;	/* keep compiler quiet */
-			*typmod = -1;
+			*typeId = InvalidOid;	/* keep compiler quiet */
+			*typMod = -1;
 			*collation = InvalidOid;
 			break;
 	}

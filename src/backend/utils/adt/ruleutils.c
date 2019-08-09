@@ -9400,6 +9400,14 @@ get_coercion_expr(Node *arg, deparse_context *context,
 		if (!PRETTY_PAREN(context))
 			appendStringInfoChar(buf, ')');
 	}
+
+	/*
+	 * Never emit resulttype(arg) functional notation. A pg_proc entry could
+	 * take precedence, and a resulttype in pg_temp would require schema
+	 * qualification that format_type_with_typemod() would usually omit. We've
+	 * standardized on arg::resulttype, but CAST(arg AS resulttype) notation
+	 * would work fine.
+	 */
 	appendStringInfo(buf, "::%s",
 					 format_type_with_typemod(resulttype, resulttypmod));
 }
@@ -10245,8 +10253,16 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 		/* Yes, it's correct to put alias after the right paren ... */
 		if (j->alias != NULL)
 		{
+			/*
+			 * Note that it's correct to emit an alias clause if and only if
+			 * there was one originally.  Otherwise we'd be converting a named
+			 * join to unnamed or vice versa, which creates semantic
+			 * subtleties we don't want.  However, we might print a different
+			 * alias name than was there originally.
+			 */
 			appendStringInfo(buf, " %s",
-							 quote_identifier(j->alias->aliasname));
+							 quote_identifier(get_rtable_name(j->rtindex,
+															  context)));
 			get_column_alias_list(colinfo, context);
 		}
 	}
