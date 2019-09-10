@@ -103,6 +103,7 @@ typedef struct deparse_expr_cxt
 								 * a base relation. */
 	StringInfo	buf;			/* output buffer to append to */
 	List	  **params_list;	/* exprs that will become remote Params */
+	RowExpr   *row_expr;        /* used for later generation of equivalent subquery */
 } deparse_expr_cxt;
 
 #define REL_ALIAS_PREFIX	"r"
@@ -1060,6 +1061,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	context.foreignrel = rel;
 	context.scanrel = IS_UPPER_REL(rel) ? fpinfo->outerrel : rel;
 	context.params_list = params_list;
+	context.row_expr = NULL;
 
 	/* Construct SELECT clause */
 	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
@@ -1186,6 +1188,26 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 
 	/* Construct FROM clause */
 	appendStringInfoString(buf, " FROM ");
+
+	// We have a row expression. Add the corresponding subquery
+	if (context->row_expr) {
+		bool		first;
+		ListCell   *lc;
+		RowExpr    *node = context->row_expr;
+
+		appendStringInfoString(buf, "(SELECT ");
+		first = true;
+		foreach(lc, node->args)
+		{
+			if (!first)
+				appendStringInfo(buf, ", ");
+			deparseExpr((Expr *) lfirst(lc), context);
+			first = false;
+		}
+
+		appendStringInfoString(buf, " FROM ");
+	}
+
 	deparseFromExprForRel(buf, context->root, scanrel,
 						  (bms_num_members(scanrel->relids) > 1),
 						  (Index) 0, NULL, context->params_list);
@@ -1195,6 +1217,12 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 	{
 		appendStringInfoString(buf, " WHERE ");
 		appendConditions(quals, context);
+	}
+
+	// Close subquery and add an alias
+	if (context->row_expr) {
+		appendStringInfoString(buf, ") myalias");
+		context->row_expr = NULL;
 	}
 }
 
@@ -2430,19 +2458,12 @@ static void
 deparseRowExpr(RowExpr *node, deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
-	bool		first;
-	ListCell   *lc;
 
-	appendStringInfoString(buf, "ROW(");
-	first = true;
-	foreach(lc, node->args)
-	{
-		if (!first)
-			appendStringInfo(buf, ", ");
-		deparseExpr((Expr *) lfirst(lc), context);
-		first = false;
-	}
-	appendStringInfoChar(buf, ')');
+	// Add an arbitrary alias
+	appendStringInfoString(buf, "myalias");
+	
+	// Just save the node for later generation of subquery
+	context->row_expr = node;
 }
 
 /*
