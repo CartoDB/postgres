@@ -103,6 +103,7 @@ typedef struct deparse_expr_cxt
 								 * a base relation. */
 	StringInfo	buf;			/* output buffer to append to */
 	List	  **params_list;	/* exprs that will become remote Params */
+	RowExpr   *row_expr;        /* used for later generation of equivalent subquery */
 } deparse_expr_cxt;
 
 #define REL_ALIAS_PREFIX	"r"
@@ -182,6 +183,7 @@ static void appendGroupByClause(List *tlist, deparse_expr_cxt *context);
 static void appendAggOrderBy(List *orderList, List *targetList,
 				 deparse_expr_cxt *context);
 static void appendFunctionName(Oid funcid, deparse_expr_cxt *context);
+static void deparseRowExpr(RowExpr *node, deparse_expr_cxt *context);
 static Node *deparseSortGroupClause(Index ref, List *tlist, bool force_colno,
 					   deparse_expr_cxt *context);
 
@@ -338,8 +340,10 @@ foreign_expr_walker(Node *node,
 					 */
 					if (var->varattno < 0 &&
 						var->varattno != SelfItemPointerAttributeNumber &&
-						var->varattno != ObjectIdAttributeNumber)
+						var->varattno != ObjectIdAttributeNumber) {
+						elog(WARNING, "RTORRE return false 1");
 						return false;
+					}
 
 					/* Else check the collation */
 					collation = var->varcollid;
@@ -407,8 +411,10 @@ foreign_expr_walker(Node *node,
 				ArrayRef   *ar = (ArrayRef *) node;
 
 				/* Assignment should not be in restrictions. */
-				if (ar->refassgnexpr != NULL)
+				if (ar->refassgnexpr != NULL) {
+					elog(WARNING, "RTORRE return false 2");
 					return false;
+				}
 
 				/*
 				 * Recurse to remaining subexpressions.  Since the array
@@ -416,14 +422,20 @@ foreign_expr_walker(Node *node,
 				 * affect the inner_cxt state.
 				 */
 				if (!foreign_expr_walker((Node *) ar->refupperindexpr,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 3");
 					return false;
+				}
 				if (!foreign_expr_walker((Node *) ar->reflowerindexpr,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 4");
 					return false;
+				}
 				if (!foreign_expr_walker((Node *) ar->refexpr,
 										 glob_cxt, &inner_cxt))
+					elog(WARNING, "RTORRE return false 5"); {
 					return false;
+				}
 
 				/*
 				 * Array subscripting should yield same collation as input,
@@ -450,15 +462,19 @@ foreign_expr_walker(Node *node,
 				 * can't be sent to remote because it might have incompatible
 				 * semantics on remote side.
 				 */
-				if (!is_shippable(fe->funcid, ProcedureRelationId, fpinfo))
+				if (!is_shippable(fe->funcid, ProcedureRelationId, fpinfo)) {
+					elog(WARNING, "RTORRE return false 6");
 					return false;
+				}
 
 				/*
 				 * Recurse to input subexpressions.
 				 */
 				if (!foreign_expr_walker((Node *) fe->args,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 7");
 					return false;
+				}
 
 				/*
 				 * If function's input collation is not derived from a foreign
@@ -467,8 +483,10 @@ foreign_expr_walker(Node *node,
 				if (fe->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 fe->inputcollid != inner_cxt.collation)
+						 fe->inputcollid != inner_cxt.collation) {
+					elog(WARNING, "RTORRE return false 8");
 					return false;
+				}
 
 				/*
 				 * Detect whether node is introducing a collation not derived
@@ -498,15 +516,19 @@ foreign_expr_walker(Node *node,
 				 * (If the operator is shippable, we assume its underlying
 				 * function is too.)
 				 */
-				if (!is_shippable(oe->opno, OperatorRelationId, fpinfo))
+				if (!is_shippable(oe->opno, OperatorRelationId, fpinfo)) {
+					elog(WARNING, "RTORRE return false 9");
 					return false;
+				}
 
 				/*
 				 * Recurse to input subexpressions.
 				 */
 				if (!foreign_expr_walker((Node *) oe->args,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 10");
 					return false;
+				}
 
 				/*
 				 * If operator's input collation is not derived from a foreign
@@ -515,8 +537,10 @@ foreign_expr_walker(Node *node,
 				if (oe->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 oe->inputcollid != inner_cxt.collation)
+						 oe->inputcollid != inner_cxt.collation) {
+					elog(WARNING, "RTORRE return false 11");
 					return false;
+				}
 
 				/* Result-collation handling is same as for functions */
 				collation = oe->opcollid;
@@ -538,15 +562,19 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Again, only shippable operators can be sent to remote.
 				 */
-				if (!is_shippable(oe->opno, OperatorRelationId, fpinfo))
+				if (!is_shippable(oe->opno, OperatorRelationId, fpinfo)) {
+					elog(WARNING, "RTORRE return false 12");
 					return false;
+				}
 
 				/*
 				 * Recurse to input subexpressions.
 				 */
 				if (!foreign_expr_walker((Node *) oe->args,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 13");
 					return false;
+				}
 
 				/*
 				 * If operator's input collation is not derived from a foreign
@@ -555,8 +583,10 @@ foreign_expr_walker(Node *node,
 				if (oe->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 oe->inputcollid != inner_cxt.collation)
+						 oe->inputcollid != inner_cxt.collation) {
+					elog(WARNING, "RTORRE return false 14");
 					return false;
+				}
 
 				/* Output is always boolean and so noncollatable. */
 				collation = InvalidOid;
@@ -571,8 +601,10 @@ foreign_expr_walker(Node *node,
 				 * Recurse to input subexpression.
 				 */
 				if (!foreign_expr_walker((Node *) r->arg,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 15");
 					return false;
+				}
 
 				/*
 				 * RelabelType must not introduce a collation not derived from
@@ -598,8 +630,10 @@ foreign_expr_walker(Node *node,
 				 * Recurse to input subexpressions.
 				 */
 				if (!foreign_expr_walker((Node *) b->args,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 16");
 					return false;
+				}
 
 				/* Output is always boolean and so noncollatable. */
 				collation = InvalidOid;
@@ -614,8 +648,10 @@ foreign_expr_walker(Node *node,
 				 * Recurse to input subexpressions.
 				 */
 				if (!foreign_expr_walker((Node *) nt->arg,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 17");
 					return false;
+				}
 
 				/* Output is always boolean and so noncollatable. */
 				collation = InvalidOid;
@@ -630,8 +666,10 @@ foreign_expr_walker(Node *node,
 				 * Recurse to input subexpressions.
 				 */
 				if (!foreign_expr_walker((Node *) a->elements,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 18");
 					return false;
+				}
 
 				/*
 				 * ArrayExpr must not introduce a collation not derived from
@@ -660,8 +698,10 @@ foreign_expr_walker(Node *node,
 				foreach(lc, l)
 				{
 					if (!foreign_expr_walker((Node *) lfirst(lc),
-											 glob_cxt, &inner_cxt))
+											 glob_cxt, &inner_cxt)) {
+						elog(WARNING, "RTORRE return false 19");
 						return false;
+					}
 				}
 
 				/*
@@ -681,16 +721,22 @@ foreign_expr_walker(Node *node,
 				ListCell   *lc;
 
 				/* Not safe to pushdown when not in grouping context */
-				if (!IS_UPPER_REL(glob_cxt->foreignrel))
+				if (!IS_UPPER_REL(glob_cxt->foreignrel)) {
+					elog(WARNING, "RTORRE return false 20");
 					return false;
+				}
 
 				/* Only non-split aggregates are pushable. */
-				if (agg->aggsplit != AGGSPLIT_SIMPLE)
+				if (agg->aggsplit != AGGSPLIT_SIMPLE) {
+					elog(WARNING, "RTORRE return false 21");
 					return false;
+				}
 
 				/* As usual, it must be shippable. */
-				if (!is_shippable(agg->aggfnoid, ProcedureRelationId, fpinfo))
+				if (!is_shippable(agg->aggfnoid, ProcedureRelationId, fpinfo)) {
+					elog(WARNING, "RTORRE return false 22");
 					return false;
+				}
 
 				/*
 				 * Recurse to input args. aggdirectargs, aggorder and
@@ -709,8 +755,10 @@ foreign_expr_walker(Node *node,
 						n = (Node *) tle->expr;
 					}
 
-					if (!foreign_expr_walker(n, glob_cxt, &inner_cxt))
+					if (!foreign_expr_walker(n, glob_cxt, &inner_cxt)) {
+						elog(WARNING, "RTORRE return false 23");
 						return false;
+					}
 				}
 
 				/*
@@ -737,25 +785,31 @@ foreign_expr_walker(Node *node,
 						if (srt->sortop != typentry->lt_opr &&
 							srt->sortop != typentry->gt_opr &&
 							!is_shippable(srt->sortop, OperatorRelationId,
-										  fpinfo))
+										  fpinfo)) {
+							elog(WARNING, "RTORRE return false 24");
 							return false;
+						}
 					}
 				}
 
 				/* Check aggregate filter */
 				if (!foreign_expr_walker((Node *) agg->aggfilter,
-										 glob_cxt, &inner_cxt))
+										 glob_cxt, &inner_cxt)) {
+					elog(WARNING, "RTORRE return false 25");
 					return false;
+				}
 
 				/*
 				 * If aggregate's input collation is not derived from a
 				 * foreign Var, it can't be sent to remote.
 				 */
-				if (agg->inputcollid == InvalidOid)
+				if (agg->inputcollid == InvalidOid || inner_cxt.state == FDW_COLLATE_NONE)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 agg->inputcollid != inner_cxt.collation)
+						 agg->inputcollid != inner_cxt.collation) {
+					elog(WARNING, "RTORRE return false 26");
 					return false;
+				}
 
 				/*
 				 * Detect whether node is introducing a collation not derived
@@ -775,12 +829,21 @@ foreign_expr_walker(Node *node,
 					state = FDW_COLLATE_UNSAFE;
 			}
 			break;
-		default:
+	    case T_RowExpr:
+			/*
+			 * rtorre: this is a bold move, let's consider it true.  Trying to
+			 * cover the st_asmvt(ROW(st_asmvtgeom(...)) case. I guess the
+			 * proper solution is to examine the row expression carefully.
+			 */
+			ereport(WARNING, (errmsg_internal("RTORRE in a T_RowExpr")));
+			return true;
+	    default:
 
 			/*
 			 * If it's anything else, assume it's unsafe.  This list can be
 			 * expanded later, but don't forget to add deparse support below.
 			 */
+			elog(WARNING, "RTORRE unrecognized node type: %d", (int) nodeTag(node));
 			return false;
 	}
 
@@ -998,6 +1061,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	context.foreignrel = rel;
 	context.scanrel = IS_UPPER_REL(rel) ? fpinfo->outerrel : rel;
 	context.params_list = params_list;
+	context.row_expr = NULL;
 
 	/* Construct SELECT clause */
 	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
@@ -1124,6 +1188,26 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 
 	/* Construct FROM clause */
 	appendStringInfoString(buf, " FROM ");
+
+	// We have a row expression. Add the corresponding subquery
+	if (context->row_expr) {
+		bool		first;
+		ListCell   *lc;
+		RowExpr    *node = context->row_expr;
+
+		appendStringInfoString(buf, "(SELECT ");
+		first = true;
+		foreach(lc, node->args)
+		{
+			if (!first)
+				appendStringInfo(buf, ", ");
+			deparseExpr((Expr *) lfirst(lc), context);
+			first = false;
+		}
+
+		appendStringInfoString(buf, " FROM ");
+	}
+
 	deparseFromExprForRel(buf, context->root, scanrel,
 						  (bms_num_members(scanrel->relids) > 1),
 						  (Index) 0, NULL, context->params_list);
@@ -1133,6 +1217,12 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 	{
 		appendStringInfoString(buf, " WHERE ");
 		appendConditions(quals, context);
+	}
+
+	// Close subquery and add an alias
+	if (context->row_expr) {
+		appendStringInfoString(buf, ") myalias");
+		context->row_expr = NULL;
 	}
 }
 
@@ -2354,11 +2444,26 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_Aggref:
 			deparseAggref((Aggref *) node, context);
 			break;
+	    case T_RowExpr:
+			deparseRowExpr((RowExpr *) node, context);
+			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
 				 (int) nodeTag(node));
 			break;
 	}
+}
+
+static void
+deparseRowExpr(RowExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+
+	// Add an arbitrary alias
+	appendStringInfoString(buf, "myalias");
+	
+	// Just save the node for later generation of subquery
+	context->row_expr = node;
 }
 
 /*
