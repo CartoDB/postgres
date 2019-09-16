@@ -359,8 +359,8 @@ configure_remote_session(PGconn *conn)
 {
 	int			remoteversion = PQserverVersion(conn);
 
-	/* Force the search path to contain only pg_catalog (see deparse.c) */
-	do_sql_command(conn, "SET search_path = pg_catalog");
+	/* Force the search path to contain only pg_catalog & public (see deparse.c) */
+	do_sql_command(conn, "SET search_path = pg_catalog,public");
 
 	/*
 	 * Set remote timezone; this is basically just cosmetic, since all
