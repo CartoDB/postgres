@@ -8373,13 +8373,13 @@ DROP TYPE "Colors" CASCADE;
 NOTICE:  drop cascades to column Col of table import_source.t5
 IMPORT FOREIGN SCHEMA import_source LIMIT TO (t5)
   FROM SERVER loopback INTO import_dest5;  -- ERROR
-ERROR:  type "public.Colors" does not exist
-LINE 4:   "Col" public."Colors" OPTIONS (column_name 'Col')
+ERROR:  type "Colors" does not exist
+LINE 4:   "Col" "Colors" OPTIONS (column_name 'Col')
                 ^
 QUERY:  CREATE FOREIGN TABLE t5 (
   c1 integer OPTIONS (column_name 'c1'),
   c2 text OPTIONS (column_name 'c2') COLLATE pg_catalog."C",
-  "Col" public."Colors" OPTIONS (column_name 'Col')
+  "Col" "Colors" OPTIONS (column_name 'Col')
 ) SERVER loopback
 OPTIONS (schema_name 'import_source', table_name 't5');
 CONTEXT:  importing foreign table "t5"
