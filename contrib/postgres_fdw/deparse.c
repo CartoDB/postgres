@@ -103,6 +103,7 @@ typedef struct deparse_expr_cxt
 								 * a base relation. */
 	StringInfo	buf;			/* output buffer to append to */
 	List	  **params_list;	/* exprs that will become remote Params */
+	RowExpr   *row_expr;        /* used for later generation of equivalent subquery */
 } deparse_expr_cxt;
 
 #define REL_ALIAS_PREFIX	"r"
@@ -182,6 +183,7 @@ static void appendGroupByClause(List *tlist, deparse_expr_cxt *context);
 static void appendAggOrderBy(List *orderList, List *targetList,
 				 deparse_expr_cxt *context);
 static void appendFunctionName(Oid funcid, deparse_expr_cxt *context);
+static void deparseRowExpr(RowExpr *node, deparse_expr_cxt *context);
 static Node *deparseSortGroupClause(Index ref, List *tlist, bool force_colno,
 					   deparse_expr_cxt *context);
 
@@ -464,7 +466,7 @@ foreign_expr_walker(Node *node,
 				 * If function's input collation is not derived from a foreign
 				 * Var, it can't be sent to remote.
 				 */
-				if (fe->inputcollid == InvalidOid)
+				if (fe->inputcollid == InvalidOid || inner_cxt.state == FDW_COLLATE_NONE)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 fe->inputcollid != inner_cxt.collation)
@@ -512,7 +514,7 @@ foreign_expr_walker(Node *node,
 				 * If operator's input collation is not derived from a foreign
 				 * Var, it can't be sent to remote.
 				 */
-				if (oe->inputcollid == InvalidOid)
+				if (oe->inputcollid == InvalidOid || inner_cxt.state == FDW_COLLATE_NONE)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 oe->inputcollid != inner_cxt.collation)
@@ -552,7 +554,7 @@ foreign_expr_walker(Node *node,
 				 * If operator's input collation is not derived from a foreign
 				 * Var, it can't be sent to remote.
 				 */
-				if (oe->inputcollid == InvalidOid)
+				if (oe->inputcollid == InvalidOid || inner_cxt.state == FDW_COLLATE_NONE)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 oe->inputcollid != inner_cxt.collation)
@@ -751,7 +753,7 @@ foreign_expr_walker(Node *node,
 				 * If aggregate's input collation is not derived from a
 				 * foreign Var, it can't be sent to remote.
 				 */
-				if (agg->inputcollid == InvalidOid)
+				if (agg->inputcollid == InvalidOid || inner_cxt.state == FDW_COLLATE_NONE)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 agg->inputcollid != inner_cxt.collation)
@@ -775,7 +777,14 @@ foreign_expr_walker(Node *node,
 					state = FDW_COLLATE_UNSAFE;
 			}
 			break;
-		default:
+	    case T_RowExpr:
+			/*
+			 * rtorre: this is a bold move, let's consider it true.  Trying to
+			 * cover the st_asmvt(ROW(st_asmvtgeom(...)) case. I guess the
+			 * proper solution is to examine the row expression carefully.
+			 */
+			return true;
+	    default:
 
 			/*
 			 * If it's anything else, assume it's unsafe.  This list can be
@@ -998,6 +1007,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	context.foreignrel = rel;
 	context.scanrel = IS_UPPER_REL(rel) ? fpinfo->outerrel : rel;
 	context.params_list = params_list;
+	context.row_expr = NULL;
 
 	/* Construct SELECT clause */
 	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
@@ -1124,6 +1134,26 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 
 	/* Construct FROM clause */
 	appendStringInfoString(buf, " FROM ");
+
+	// We have a row expression. Add the corresponding subquery
+	if (context->row_expr) {
+		bool		first;
+		ListCell   *lc;
+		RowExpr    *node = context->row_expr;
+
+		appendStringInfoString(buf, "(SELECT ");
+		first = true;
+		foreach(lc, node->args)
+		{
+			if (!first)
+				appendStringInfo(buf, ", ");
+			deparseExpr((Expr *) lfirst(lc), context);
+			first = false;
+		}
+
+		appendStringInfoString(buf, " FROM ");
+	}
+
 	deparseFromExprForRel(buf, context->root, scanrel,
 						  (bms_num_members(scanrel->relids) > 1),
 						  (Index) 0, NULL, context->params_list);
@@ -1133,6 +1163,12 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 	{
 		appendStringInfoString(buf, " WHERE ");
 		appendConditions(quals, context);
+	}
+
+	// Close subquery and add an alias
+	if (context->row_expr) {
+		appendStringInfoString(buf, ") myalias");
+		context->row_expr = NULL;
 	}
 }
 
@@ -2354,11 +2390,26 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_Aggref:
 			deparseAggref((Aggref *) node, context);
 			break;
+	    case T_RowExpr:
+			deparseRowExpr((RowExpr *) node, context);
+			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
 				 (int) nodeTag(node));
 			break;
 	}
+}
+
+static void
+deparseRowExpr(RowExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+
+	// Add an arbitrary alias
+	appendStringInfoString(buf, "myalias");
+
+	// Just save the node for later generation of subquery
+	context->row_expr = node;
 }
 
 /*
