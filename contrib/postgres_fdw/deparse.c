@@ -466,7 +466,7 @@ foreign_expr_walker(Node *node,
 				 * If function's input collation is not derived from a foreign
 				 * Var, it can't be sent to remote.
 				 */
-				if (fe->inputcollid == InvalidOid)
+				if (fe->inputcollid == InvalidOid || inner_cxt.state == FDW_COLLATE_NONE)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 fe->inputcollid != inner_cxt.collation)
@@ -514,7 +514,7 @@ foreign_expr_walker(Node *node,
 				 * If operator's input collation is not derived from a foreign
 				 * Var, it can't be sent to remote.
 				 */
-				if (oe->inputcollid == InvalidOid)
+				if (oe->inputcollid == InvalidOid || inner_cxt.state == FDW_COLLATE_NONE)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 oe->inputcollid != inner_cxt.collation)
@@ -554,7 +554,7 @@ foreign_expr_walker(Node *node,
 				 * If operator's input collation is not derived from a foreign
 				 * Var, it can't be sent to remote.
 				 */
-				if (oe->inputcollid == InvalidOid)
+				if (oe->inputcollid == InvalidOid || inner_cxt.state == FDW_COLLATE_NONE)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 oe->inputcollid != inner_cxt.collation)
