@@ -7,12 +7,18 @@
  * whether they're safe to send to the remote server for execution, as
  * well as functions to construct the query text to be sent.  The latter
  * functionality is annoyingly duplicative of ruleutils.c, but there are
+
+// TODO take a look at ruleutils.c
+
  * enough special considerations that it seems best to keep this separate.
  * One saving grace is that we only need deparse logic for node types that
  * we consider safe to send.
  *
  * We assume that the remote session's search_path is exactly "pg_catalog",
  * and thus we need schema-qualify all and only names outside pg_catalog.
+
+// A bit of a PITA because of postgis bug
+
  *
  * We do not consider that it is ever safe to send COLLATE expressions to
  * the remote server: it might not have the same collation names we do.
@@ -23,6 +29,10 @@
  * a different answer than we do, the foreign table's columns are not marked
  * with collations that match the remote table's columns, which we can
  * consider to be user error.
+
+// Why does this affect beyond WHERE clauses?
+// TODO check how this is affected by import_collate, though set true by default
+
  *
  * Portions Copyright (c) 2012-2018, PostgreSQL Global Development Group
  *
@@ -80,10 +90,16 @@ typedef enum
 	FDW_COLLATE_NONE,			/* expression is of a noncollatable type, or
 								 * it has default collation that is not
 								 * traceable to a foreign Var */
+	// mind that noncollatable OR default
+
 	FDW_COLLATE_SAFE,			/* collation derives from a foreign Var */
+
 	FDW_COLLATE_UNSAFE			/* collation is non-default and derives from
 								 * something other than a foreign Var */
+	// then, what happens with noncollatable?
 } FDWCollateState;
+// This enum defines an implicit ordering: NONE < SAFE < UNSAFE used later
+// on. IMO, little sense.
 
 typedef struct foreign_loc_cxt
 {
@@ -132,6 +148,8 @@ static void deparseTargetList(StringInfo buf,
 				  Bitmapset *attrs_used,
 				  bool qualify_col,
 				  List **retrieved_attrs);
+// TODO how does it affect SELECT func(a) FROM foreign_table? when func is NOT an aggregate?
+
 static void deparseExplicitTargetList(List *tlist,
 						  bool is_returning,
 						  List **retrieved_attrs,
@@ -252,7 +270,9 @@ is_foreign_expr(PlannerInfo *root,
 	else
 		glob_cxt.relids = baserel->relids;
 	loc_cxt.collation = InvalidOid;
-	loc_cxt.state = FDW_COLLATE_NONE;
+	loc_cxt.state = FDW_COLLATE_NONE; // in most systems, this kind of
+									  // initialization will happen implicitly
+									  // (zeroes)
 	if (!foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
 		return false;
 
@@ -289,6 +309,9 @@ is_foreign_expr(PlannerInfo *root,
  * assign_collations_walker() in parse_collate.c, though we can assume here
  * that the given expression is valid.  Note function mutability is not
  * currently considered here.
+
+// TODO review assign_collations_walker in parse_collate.c
+
  */
 static bool
 foreign_expr_walker(Node *node,
@@ -439,6 +462,7 @@ foreign_expr_walker(Node *node,
 					state = FDW_COLLATE_NONE;
 				else
 					state = FDW_COLLATE_UNSAFE;
+				// so far this makes sense to me
 			}
 			break;
 		case T_FuncExpr:
@@ -469,6 +493,8 @@ foreign_expr_walker(Node *node,
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 fe->inputcollid != inner_cxt.collation)
 					return false;
+				// Here, but what if the function doesn't care about collation
+				// at all?
 
 				/*
 				 * Detect whether node is introducing a collation not derived
@@ -512,6 +538,7 @@ foreign_expr_walker(Node *node,
 				 * If operator's input collation is not derived from a foreign
 				 * Var, it can't be sent to remote.
 				 */
+				// Same pattern repeated here, and over again
 				if (oe->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
