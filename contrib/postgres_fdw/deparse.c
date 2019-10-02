@@ -753,7 +753,7 @@ foreign_expr_walker(Node *node,
 				 * If aggregate's input collation is not derived from a
 				 * foreign Var, it can't be sent to remote.
 				 */
-				if (agg->inputcollid == InvalidOid || inner_cxt.state == FDW_COLLATE_NONE)
+				if (agg->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 agg->inputcollid != inner_cxt.collation)
