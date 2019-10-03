@@ -778,12 +778,27 @@ foreign_expr_walker(Node *node,
 			}
 			break;
 	    case T_RowExpr:
-			/*
-			 * rtorre: this is a bold move, let's consider it true.  Trying to
-			 * cover the st_asmvt(ROW(st_asmvtgeom(...)) case. I guess the
-			 * proper solution is to examine the row expression carefully.
-			 */
-			return true;
+			{
+				RowExpr *re = (RowExpr *) node;
+
+				/*
+				 * Recurse to input subexpressions.
+				 */
+				if (!foreign_expr_walker((Node *) re->args,
+										 glob_cxt, &inner_cxt))
+					return false;
+
+				/*
+				 * From primnodes.h:
+				 *
+				 * We don't need to store a collation either.  The result type
+				 * is necessarily composite, and composite types never have a
+				 * collation.
+				 */
+				collation = InvalidOid;
+				state = FDW_COLLATE_NONE;
+			}
+			break;
 	    default:
 
 			/*
