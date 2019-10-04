@@ -782,8 +782,6 @@ foreign_expr_walker(Node *node,
 				RowExpr *re = (RowExpr *) node;
 				ListCell   *lc;
 
-				elog(NOTICE, "in case T_RowExpr");
-
 				if(re->row_typeid != RECORDOID)
 				{
 					elog(NOTICE, "not a RECORDOID, returning false");
@@ -793,20 +791,9 @@ foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				/* if (!foreign_expr_walker((Node *) re->args, */
-				/* 						 glob_cxt, &inner_cxt)) */
-				/* 	return false; */
-
-				/*
-				 * Recurse to input subexpressions.
-				 */
-				foreach(lc, re->args)
-				{
-					if (!foreign_expr_walker((Node *) lfirst(lc),
-											 glob_cxt, &inner_cxt))
-						return false;
-				}
-
+				if (!foreign_expr_walker((Node *) re->args,
+										 glob_cxt, &inner_cxt))
+					return false;
 
 				/*
 				 * From primnodes.h:
@@ -814,9 +801,11 @@ foreign_expr_walker(Node *node,
 				 * We don't need to store a collation either.  The result type
 				 * is necessarily composite, and composite types never have a
 				 * collation.
+				 *
+				 * Bubble up collation state from args, just like for lists.
 				 */
-				collation = InvalidOid;
-				state = FDW_COLLATE_NONE;
+				collation = inner_cxt.collation;
+				state = inner_cxt.state;
 			}
 			break;
 	    default:
