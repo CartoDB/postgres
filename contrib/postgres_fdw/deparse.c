@@ -2450,7 +2450,6 @@ deparseRowExpr(RowExpr *node, deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
 	List 	  **row_exprs_list = context->row_exprs_list;
-	elog(NOTICE, "In deparseRowExpr");
 
 	// Just save the node for later generation of subquery
 	*row_exprs_list = lappend(*row_exprs_list, node);
