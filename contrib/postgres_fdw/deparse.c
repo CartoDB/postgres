@@ -785,7 +785,6 @@ foreign_expr_walker(Node *node,
 	    case T_RowExpr:
 			{
 				RowExpr *re = (RowExpr *) node;
-				ListCell   *lc;
 
 				if(re->row_typeid != RECORDOID)
 				{
