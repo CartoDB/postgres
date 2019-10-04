@@ -382,11 +382,16 @@ foreign_expr_walker(Node *node,
 				 * non-collation-sensitive context.
 				 */
 				collation = c->constcollid;
-				if (collation == InvalidOid ||
-					collation == DEFAULT_COLLATION_OID)
-					state = FDW_COLLATE_NONE;
-				else
-					state = FDW_COLLATE_UNSAFE;
+				switch(collation) {
+					case InvalidOid:
+						state = FDW_COLLATE_NONE;
+						break;
+					case DEFAULT_COLLATION_OID:
+						state = FDW_COLLATE_SAFE;
+						break;
+					default:
+						state = FDW_COLLATE_UNSAFE;
+				}
 			}
 			break;
 		case T_Param:
