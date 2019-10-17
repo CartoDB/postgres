@@ -3,6 +3,7 @@ Release date: XXXX-XX-XX
 
 Changes:
 - Add `public` to the search_path of FDW queries.
+- Update from upstream (11.5 6737111a7ae1fac6b4781250be7c0719c5a7ed48)
 
 11.5.1+carto-1
 Release date: 2019-05-09
