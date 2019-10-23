@@ -5909,6 +5909,8 @@ Datum
 postgres_fdw_query(PG_FUNCTION_ARGS)
 {
 	FuncCallContext	 *funcctx;
+	Name              server;
+	text             *sql;
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -5917,7 +5919,14 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 		/* One-time setup code appears here: */
-		/* user code */
+
+		// get input args
+		server = PG_GETARG_NAME(0);
+		sql = PG_GETARG_TEXT_P(1);
+
+		elog(DEBUG3, "server = %s", NameStr(*server));
+		elog(DEBUG3, "sql = %s", text_to_cstring(sql));
+
 		/* if returning composite */
 		/*	   build TupleDesc, and perhaps AttInMetadata */
 		/* endif returning composite */
