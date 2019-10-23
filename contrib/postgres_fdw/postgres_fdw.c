@@ -5900,3 +5900,47 @@ find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 	/* We didn't find any suitable equivalence class expression */
 	return NULL;
 }
+
+
+
+PG_FUNCTION_INFO_V1(postgres_fdw_query);
+
+Datum
+postgres_fdw_query(PG_FUNCTION_ARGS)
+{
+	FuncCallContext	 *funcctx;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+		/* One-time setup code appears here: */
+		/* user code */
+		/* if returning composite */
+		/*	   build TupleDesc, and perhaps AttInMetadata */
+		/* endif returning composite */
+		/* user code */
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	/* Each-time setup code appears here: */
+	//user code
+	funcctx = SRF_PERCALL_SETUP();
+
+	/* this is just one way we might test whether we are done: */
+	/* if (funcctx->call_cntr < funcctx->max_calls) */
+	/* { */
+	/*	   /\* Here we want to return another item: *\/ */
+	/*	   user code */
+	/*	   obtain result Datum */
+	/*	   SRF_RETURN_NEXT(funcctx, result); */
+	/* } */
+	/* else */
+	{
+		/* Here we are done returning items and just need to clean up: */
+		//user code
+		SRF_RETURN_DONE(funcctx);
+	}
+}
