@@ -5909,12 +5909,15 @@ Datum
 postgres_fdw_query(PG_FUNCTION_ARGS)
 {
 	FuncCallContext	*funcctx;
-	Name             server;
-	text            *sql;
+	Name             server_name;
+	text            *sql_text;
+	char            *server;
+	char 			*sql;
 	Oid			     userid;
 	PGconn	   		*conn;
 	UserMapping     *user_mapping;
 	ForeignServer   *foreign_server;
+	PGresult   		*res = NULL;
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -5925,19 +5928,36 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 		/* One-time setup code appears here: */
 
 		// Get input args
-		server = PG_GETARG_NAME(0);
-		sql = PG_GETARG_TEXT_P(1);
+		server_name = PG_GETARG_NAME(0);
+		sql_text = PG_GETARG_TEXT_P(1);
 
-		elog(DEBUG3, "server = %s", NameStr(*server));
-		elog(DEBUG3, "sql = %s", text_to_cstring(sql));
+		server = NameStr(*server_name);
+		sql = text_to_cstring(sql_text);
+
+		elog(DEBUG3, "server = %s", server);
+		elog(DEBUG3, "sql = %s", sql);
 
 		// Get a connection to the server with the current user
 		userid = GetUserId();
-		foreign_server = GetForeignServerByName(NameStr(*server), false);
+		foreign_server = GetForeignServerByName(server, false);
 		user_mapping = GetUserMapping(userid, foreign_server->serverid);
 		conn = GetConnection(user_mapping, false);
 
-		// TODO: Execute the sql query
+		// Execute the sql query
+		PG_TRY();
+		{
+			res = pgfdw_exec_query(conn, sql);
+			if (PQresultStatus(res) != PGRES_TUPLES_OK)
+				pgfdw_report_error(ERROR, res, conn, false, sql);
+
+		}
+		PG_CATCH();
+		{
+			if (res)
+				PQclear(res);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 
 		ReleaseConnection(conn);
 
