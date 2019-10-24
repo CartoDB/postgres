@@ -5918,6 +5918,9 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 	UserMapping     *user_mapping;
 	ForeignServer   *foreign_server;
 	PGresult   		*res = NULL;
+	TupleDesc	     tupdesc;
+	int				 ntuples;
+	int 			 nfields;
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -5929,7 +5932,7 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 
 		// Get input args
 		server_name = PG_GETARG_NAME(0);
-		sql_text = PG_GETARG_TEXT_P(1);
+		sql_text = PG_GETARG_TEXT_PP(1);
 
 		server = NameStr(*server_name);
 		sql = text_to_cstring(sql_text);
@@ -5947,8 +5950,41 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 		PG_TRY();
 		{
 			res = pgfdw_exec_query(conn, sql);
+			nfields = PQnfields(res);
 			if (PQresultStatus(res) != PGRES_TUPLES_OK)
 				pgfdw_report_error(ERROR, res, conn, false, sql);
+
+			/* get a tuple descriptor for our result type */
+			switch (get_call_result_type(fcinfo, NULL, &tupdesc))
+			{
+				case TYPEFUNC_COMPOSITE:
+					/* success */
+					break;
+				case TYPEFUNC_RECORD:
+					/* failed to determine actual type of RECORD */
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("function returning record called in context "
+									"that cannot accept type record")));
+					break;
+				default:
+					/* result type isn't composite */
+					elog(ERROR, "return type must be a row type");
+					break;
+			}
+
+			/* make sure we have a persistent copy of the tupdesc */
+			tupdesc = CreateTupleDescCopy(tupdesc);
+			ntuples = PQntuples(res);
+			nfields = PQnfields(res);
+
+			/* check result and tuple descriptor have the same number of columns */
+			if (nfields != tupdesc->natts)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("remote query result rowtype does not match "
+								"the specified FROM clause rowtype")));
+
 
 		}
 		PG_CATCH();
