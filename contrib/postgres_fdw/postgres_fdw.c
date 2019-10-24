@@ -5903,12 +5903,14 @@ find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 
 
 
+static void prepTuplestoreResult(FunctionCallInfo fcinfo);
+
 PG_FUNCTION_INFO_V1(postgres_fdw_query);
 
 Datum
 postgres_fdw_query(PG_FUNCTION_ARGS)
 {
-	FuncCallContext	*funcctx;
+	ReturnSetInfo 	*rsinfo;
 	Name             server_name;
 	text            *sql_text;
 	char            *server;
@@ -5922,105 +5924,146 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 	int				 ntuples;
 	int 			 nfields;
 
-	if (SRF_IS_FIRSTCALL())
+	prepTuplestoreResult(fcinfo);
+	rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	/* One-time setup code appears here: */
+
+	// Get input args
+	server_name = PG_GETARG_NAME(0);
+	sql_text = PG_GETARG_TEXT_PP(1);
+
+	server = NameStr(*server_name);
+	sql = text_to_cstring(sql_text);
+
+	elog(DEBUG3, "server = %s", server);
+	elog(DEBUG3, "sql = %s", sql);
+
+	// Get a connection to the server with the current user
+	userid = GetUserId();
+	foreign_server = GetForeignServerByName(server, false);
+	user_mapping = GetUserMapping(userid, foreign_server->serverid);
+	conn = GetConnection(user_mapping, false);
+
+	// Execute the sql query
+	PG_TRY();
 	{
-		MemoryContext oldcontext;
+		res = pgfdw_exec_query(conn, sql);
+		nfields = PQnfields(res);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			pgfdw_report_error(ERROR, res, conn, false, sql);
 
-		funcctx = SRF_FIRSTCALL_INIT();
-		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-		/* One-time setup code appears here: */
-
-		// Get input args
-		server_name = PG_GETARG_NAME(0);
-		sql_text = PG_GETARG_TEXT_PP(1);
-
-		server = NameStr(*server_name);
-		sql = text_to_cstring(sql_text);
-
-		elog(DEBUG3, "server = %s", server);
-		elog(DEBUG3, "sql = %s", sql);
-
-		// Get a connection to the server with the current user
-		userid = GetUserId();
-		foreign_server = GetForeignServerByName(server, false);
-		user_mapping = GetUserMapping(userid, foreign_server->serverid);
-		conn = GetConnection(user_mapping, false);
-
-		// Execute the sql query
-		PG_TRY();
+		/* get a tuple descriptor for our result type */
+		switch (get_call_result_type(fcinfo, NULL, &tupdesc))
 		{
-			res = pgfdw_exec_query(conn, sql);
-			nfields = PQnfields(res);
-			if (PQresultStatus(res) != PGRES_TUPLES_OK)
-				pgfdw_report_error(ERROR, res, conn, false, sql);
+			case TYPEFUNC_COMPOSITE:
+				/* success */
+				break;
+			case TYPEFUNC_RECORD:
+				/* failed to determine actual type of RECORD */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("function returning record called in context "
+								"that cannot accept type record")));
+				break;
+			default:
+				/* result type isn't composite */
+				elog(ERROR, "return type must be a row type");
+				break;
+		}
 
-			/* get a tuple descriptor for our result type */
-			switch (get_call_result_type(fcinfo, NULL, &tupdesc))
+		/* make sure we have a persistent copy of the tupdesc */
+		tupdesc = CreateTupleDescCopy(tupdesc);
+		ntuples = PQntuples(res);
+		nfields = PQnfields(res);
+
+		/* check result and tuple descriptor have the same number of columns */
+		if (nfields != tupdesc->natts)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("remote query result rowtype does not match "
+							"the specified FROM clause rowtype")));
+
+		if (ntuples > 0)
+		{
+			AttInMetadata *attinmeta;
+			Tuplestorestate *tupstore;
+			MemoryContext oldcontext;
+			int			row;
+			char	  **values;
+
+			attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+			oldcontext = MemoryContextSwitchTo(
+				rsinfo->econtext->ecxt_per_query_memory);
+			tupstore = tuplestore_begin_heap(true, false, work_mem);
+			rsinfo->setResult = tupstore;
+			rsinfo->setDesc = tupdesc;
+			MemoryContextSwitchTo(oldcontext);
+
+			values = (char **) palloc(nfields * sizeof(char *));
+
+			/* put all tuples into the tuplestore */
+			for (row = 0; row < ntuples; row++)
 			{
-				case TYPEFUNC_COMPOSITE:
-					/* success */
-					break;
-				case TYPEFUNC_RECORD:
-					/* failed to determine actual type of RECORD */
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("function returning record called in context "
-									"that cannot accept type record")));
-					break;
-				default:
-					/* result type isn't composite */
-					elog(ERROR, "return type must be a row type");
-					break;
+				HeapTuple	tuple;
+				int			i;
+
+				for (i = 0; i < nfields; i++)
+				{
+					if (PQgetisnull(res, row, i))
+						values[i] = NULL;
+					else
+						values[i] = PQgetvalue(res, row, i);
+				}
+
+				/* build the tuple and put it into the tuplestore. */
+				tuple = BuildTupleFromCStrings(attinmeta, values);
+				tuplestore_puttuple(tupstore, tuple);
 			}
 
-			/* make sure we have a persistent copy of the tupdesc */
-			tupdesc = CreateTupleDescCopy(tupdesc);
-			ntuples = PQntuples(res);
-			nfields = PQnfields(res);
-
-			/* check result and tuple descriptor have the same number of columns */
-			if (nfields != tupdesc->natts)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATATYPE_MISMATCH),
-						 errmsg("remote query result rowtype does not match "
-								"the specified FROM clause rowtype")));
-
-
+			/* clean up and return the tuplestore */
+			tuplestore_donestoring(tupstore);
 		}
-		PG_CATCH();
-		{
-			if (res)
-				PQclear(res);
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
 
-		ReleaseConnection(conn);
-
-
-		/* if returning composite */
-		/*	   build TupleDesc, and perhaps AttInMetadata */
-		/* endif returning composite */
-		/* user code */
-		MemoryContextSwitchTo(oldcontext);
+		PQclear(res);
 	}
-
-	/* Each-time setup code appears here: */
-	//user code
-	funcctx = SRF_PERCALL_SETUP();
-
-	/* this is just one way we might test whether we are done: */
-	/* if (funcctx->call_cntr < funcctx->max_calls) */
-	/* { */
-	/*	   /\* Here we want to return another item: *\/ */
-	/*	   user code */
-	/*	   obtain result Datum */
-	/*	   SRF_RETURN_NEXT(funcctx, result); */
-	/* } */
-	/* else */
+	PG_CATCH();
 	{
-		/* Here we are done returning items and just need to clean up: */
-		//user code
-		SRF_RETURN_DONE(funcctx);
+		if (res)
+			PQclear(res);
+		PG_RE_THROW();
 	}
+	PG_END_TRY();
+
+	ReleaseConnection(conn);
+	return (Datum) 0;
+}
+
+/*
+ * Verify function caller can handle a tuplestore result, and set up for that.
+ *
+ * Note: if the caller returns without actually creating a tuplestore, the
+ * executor will treat the function result as an empty set.
+ */
+static void
+prepTuplestoreResult(FunctionCallInfo fcinfo)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	/* check to see if query supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* let the executor know we're sending back a tuplestore */
+	rsinfo->returnMode = SFRM_Materialize;
+
+	/* caller must fill these to return a non-empty result */
+	rsinfo->setResult = NULL;
+	rsinfo->setDesc = NULL;
 }
