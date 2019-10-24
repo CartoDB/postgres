@@ -5908,9 +5908,13 @@ PG_FUNCTION_INFO_V1(postgres_fdw_query);
 Datum
 postgres_fdw_query(PG_FUNCTION_ARGS)
 {
-	FuncCallContext	 *funcctx;
-	Name              server;
-	text             *sql;
+	FuncCallContext	*funcctx;
+	Name             server;
+	text            *sql;
+	Oid			     userid;
+	PGconn	   		*conn;
+	UserMapping     *user_mapping;
+	ForeignServer   *foreign_server;
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -5920,12 +5924,23 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 		/* One-time setup code appears here: */
 
-		// get input args
+		// Get input args
 		server = PG_GETARG_NAME(0);
 		sql = PG_GETARG_TEXT_P(1);
 
 		elog(DEBUG3, "server = %s", NameStr(*server));
 		elog(DEBUG3, "sql = %s", text_to_cstring(sql));
+
+		// Get a connection to the server with the current user
+		userid = GetUserId();
+		foreign_server = GetForeignServerByName(NameStr(*server), false);
+		user_mapping = GetUserMapping(userid, foreign_server->serverid);
+		conn = GetConnection(user_mapping, false);
+
+		// TODO: Execute the sql query
+
+		ReleaseConnection(conn);
+
 
 		/* if returning composite */
 		/*	   build TupleDesc, and perhaps AttInMetadata */
