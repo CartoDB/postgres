@@ -2416,10 +2416,6 @@ RESET enable_partitionwise_aggregate;
 -- Most simple SELECT through postgres_fdw_query
 SELECT * FROM postgres_fdw_query('loopback', 'SELECT 42') AS t(i int);
 
--- Select the effective role configured in the user mapping
-SELECT * FROM postgres_fdw_query('loopback', 'SELECT current_user')
-  AS t(role_name name);
-
 -- Select schemas owned by the role configured in the user mapping
 SELECT * FROM postgres_fdw_query('loopback', $$SELECT s.nspname
     FROM pg_catalog.pg_namespace s
