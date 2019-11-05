@@ -5923,6 +5923,7 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 	TupleDesc	     tupdesc;
 	int				 ntuples;
 	int 			 nfields;
+	bool			 is_sql_cmd;
 
 	prepTuplestoreResult(fcinfo);
 	rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
@@ -5948,33 +5949,54 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		res = pgfdw_exec_query(conn, sql);
-		nfields = PQnfields(res);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-			pgfdw_report_error(ERROR, res, conn, false, sql);
 
-		/* get a tuple descriptor for our result type */
-		switch (get_call_result_type(fcinfo, NULL, &tupdesc))
+		if (PQresultStatus(res) == PGRES_COMMAND_OK)
 		{
-			case TYPEFUNC_COMPOSITE:
-				/* success */
-				break;
-			case TYPEFUNC_RECORD:
-				/* failed to determine actual type of RECORD */
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("function returning record called in context "
-								"that cannot accept type record")));
-				break;
-			default:
-				/* result type isn't composite */
-				elog(ERROR, "return type must be a row type");
-				break;
-		}
+			is_sql_cmd = true;
 
-		/* make sure we have a persistent copy of the tupdesc */
-		tupdesc = CreateTupleDescCopy(tupdesc);
-		ntuples = PQntuples(res);
-		nfields = PQnfields(res);
+			/*
+			 * need a tuple descriptor representing one TEXT column to return
+			 * the command status string as our result tuple
+			 */
+			tupdesc = CreateTemplateTupleDesc(1, false);
+			TupleDescInitEntry(tupdesc, (AttrNumber) 1, "status",
+							   TEXTOID, -1, 0);
+			ntuples = 1;
+			nfields = 1;
+		}
+		else
+		{
+			is_sql_cmd = false;
+
+			if (PQresultStatus(res) != PGRES_TUPLES_OK)
+				pgfdw_report_error(ERROR, res, conn, false, sql);
+
+			nfields = PQnfields(res);
+
+			/* get a tuple descriptor for our result type */
+			switch (get_call_result_type(fcinfo, NULL, &tupdesc))
+			{
+				case TYPEFUNC_COMPOSITE:
+					/* success */
+					break;
+				case TYPEFUNC_RECORD:
+					/* failed to determine actual type of RECORD */
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("function returning record called in context "
+									"that cannot accept type record")));
+					break;
+				default:
+					/* result type isn't composite */
+					elog(ERROR, "return type must be a row type");
+					break;
+			}
+
+			/* make sure we have a persistent copy of the tupdesc */
+			tupdesc = CreateTupleDescCopy(tupdesc);
+			ntuples = PQntuples(res);
+			nfields = PQnfields(res);
+		}
 
 		/* check result and tuple descriptor have the same number of columns */
 		if (nfields != tupdesc->natts)
@@ -6006,14 +6028,22 @@ postgres_fdw_query(PG_FUNCTION_ARGS)
 			for (row = 0; row < ntuples; row++)
 			{
 				HeapTuple	tuple;
-				int			i;
 
-				for (i = 0; i < nfields; i++)
+				if (is_sql_cmd)
 				{
-					if (PQgetisnull(res, row, i))
-						values[i] = NULL;
-					else
-						values[i] = PQgetvalue(res, row, i);
+					values[0] = PQcmdStatus(res);
+				}
+				else
+				{
+					int			i;
+
+					for (i = 0; i < nfields; i++)
+					{
+						if (PQgetisnull(res, row, i))
+							values[i] = NULL;
+						else
+							values[i] = PQgetvalue(res, row, i);
+					}
 				}
 
 				/* build the tuple and put it into the tuplestore. */

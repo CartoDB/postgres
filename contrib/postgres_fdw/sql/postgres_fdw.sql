@@ -2431,3 +2431,9 @@ SELECT * FROM postgres_fdw_query('loopback', $$SELECT table_name, table_type
     WHERE table_schema = 'S 1'
     ORDER BY table_name$$
 ) AS schemas(table_name text, table_type text);
+
+-- Test we can send commands (e.g: prepared statements)
+SELECT * FROM postgres_fdw_query('loopback', $$PREPARE fooplan (int) AS
+SELECT $1 + 42$$) AS t(res text);
+SELECT * FROM postgres_fdw_query('loopback', 'EXECUTE fooplan (1)') AS t(i int);
+SELECT * FROM postgres_fdw_query('loopback', 'DEALLOCATE fooplan') AS t(res text);

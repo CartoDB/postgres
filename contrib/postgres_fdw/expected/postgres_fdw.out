@@ -8850,3 +8850,23 @@ SELECT * FROM postgres_fdw_query('loopback', $$SELECT table_name, table_type
  T 4        | BASE TABLE
 (4 rows)
 
+-- Test we can send commands (e.g: prepared statements)
+SELECT * FROM postgres_fdw_query('loopback', $$PREPARE fooplan (int) AS
+SELECT $1 + 42$$) AS t(res text);
+   res   
+---------
+ PREPARE
+(1 row)
+
+SELECT * FROM postgres_fdw_query('loopback', 'EXECUTE fooplan (1)') AS t(i int);
+ i  
+----
+ 43
+(1 row)
+
+SELECT * FROM postgres_fdw_query('loopback', 'DEALLOCATE fooplan') AS t(res text);
+    res     
+------------
+ DEALLOCATE
+(1 row)
+
