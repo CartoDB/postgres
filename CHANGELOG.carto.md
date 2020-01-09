@@ -1,4 +1,10 @@
-11.5.2+carto-2
+11.5.3+carto-1
+Release date: 2020-01-09
+
+Changes:
+- [#30](https://github.com/CartoDB/postgres/pull/30): Apply a patch to abort pg_dump / pg_restore using _exit instead of exit to avoid Builder CI stuck processes.
+
+11.5.2+carto-1
 Release date: 2019-10-17
 
 Changes:
