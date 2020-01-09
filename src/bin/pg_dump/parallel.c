@@ -611,8 +611,14 @@ sigTermHandler(SIGNAL_ARGS)
 		write_stderr("terminated by user\n");
 	}
 
-	/* And die. */
-	exit(1);
+	/*
+	 * We abort the program using _exit because using exit may interfere
+	 * with the function that was running when the interruption came.
+	 * For example, if the running function had acquired an allocation mutex
+	 * before it was interrupted and one of the atexit functions tried to
+	 * deallocate memory, it would block indefinitely.
+	 */
+	_exit(1);
 }
 
 /*
