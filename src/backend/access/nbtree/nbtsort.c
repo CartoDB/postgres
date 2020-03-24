@@ -1352,6 +1352,7 @@ _bt_begin_parallel(BTBuildState *buildstate, bool isconcurrent, int request)
 	Assert(request > 0);
 	pcxt = CreateParallelContext("postgres", "_bt_parallel_build_main",
 								 request);
+
 	scantuplesortstates = leaderparticipates ? request + 1 : request;
 
 	/*
@@ -1394,6 +1395,16 @@ _bt_begin_parallel(BTBuildState *buildstate, bool isconcurrent, int request)
 
 	/* Everyone's had a chance to ask for space, so now create the DSM */
 	InitializeParallelDSM(pcxt);
+
+	/* If no DSM segment was available, back out (do serial build) */
+	if (pcxt->seg == NULL)
+	{
+		if (IsMVCCSnapshot(snapshot))
+			UnregisterSnapshot(snapshot);
+		DestroyParallelContext(pcxt);
+		ExitParallelMode();
+		return;
+	}
 
 	/* Store shared build state, for which we reserved space */
 	btshared = (BTShared *) shm_toc_allocate(pcxt->toc, estbtshared);

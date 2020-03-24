@@ -174,6 +174,7 @@ typedef struct AlteredTableInfo
 	List	   *changedConstraintDefs;	/* string definitions of same */
 	List	   *changedIndexOids;	/* OIDs of indexes to rebuild */
 	List	   *changedIndexDefs;	/* string definitions of same */
+	char	   *replicaIdentityIndex;	/* index to reset as REPLICA IDENTITY */
 } AlteredTableInfo;
 
 /* Struct describing one new constraint to check in Phase 3 scan */
@@ -1235,7 +1236,11 @@ RemoveRelations(DropStmt *drop)
 	/* DROP CONCURRENTLY uses a weaker lock, and has some restrictions */
 	if (drop->concurrent)
 	{
-		flags |= PERFORM_DELETION_CONCURRENTLY;
+		/*
+		 * Note that for temporary relations this lock may get upgraded
+		 * later on, but as no other session can access a temporary
+		 * relation, this is actually fine.
+		 */
 		lockmode = ShareUpdateExclusiveLock;
 		Assert(drop->removeType == OBJECT_INDEX);
 		if (list_length(drop->objects) != 1)
@@ -1324,6 +1329,18 @@ RemoveRelations(DropStmt *drop)
 		{
 			DropErrorMsgNonExistent(rel, relkind, drop->missing_ok);
 			continue;
+		}
+
+		/*
+		 * Decide if concurrent mode needs to be used here or not.  The
+		 * relation persistence cannot be known without its OID.
+		 */
+		if (drop->concurrent &&
+			get_rel_persistence(relOid) != RELPERSISTENCE_TEMP)
+		{
+			Assert(list_length(drop->objects) == 1 &&
+				   drop->removeType == OBJECT_INDEX);
+			flags |= PERFORM_DELETION_CONCURRENTLY;
 		}
 
 		/* OK, we're ready to delete this one */
@@ -8533,13 +8550,13 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 	List	   *clone = NIL;
 
 	/*
-	 * Search for any constraints where this partition is in the referenced
-	 * side.  However, we must ignore any constraint whose parent constraint
-	 * is also going to be cloned, to avoid duplicates.  So do it in two
-	 * steps: first construct the list of constraints to clone, then go over
-	 * that list cloning those whose parents are not in the list.  (We must
-	 * not rely on the parent being seen first, since the catalog scan could
-	 * return children first.)
+	 * Search for any constraints where this partition's parent is in the
+	 * referenced side.  However, we must not clone any constraint whose
+	 * parent constraint is also going to be cloned, to avoid duplicates.  So
+	 * do it in two steps: first construct the list of constraints to clone,
+	 * then go over that list cloning those whose parents are not in the list.
+	 * (We must not rely on the parent being seen first, since the catalog
+	 * scan could return children first.)
 	 */
 	pg_constraint = table_open(ConstraintRelationId, RowShareLock);
 	ScanKeyInit(&key[0],
@@ -8554,10 +8571,6 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 	while ((tuple = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_constraint constrForm = (Form_pg_constraint) GETSTRUCT(tuple);
-
-		/* Only try to clone the top-level constraint; skip child ones. */
-		if (constrForm->conparentid != InvalidOid)
-			continue;
 
 		clone = lappend_oid(clone, constrForm->oid);
 	}
@@ -8587,6 +8600,16 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "cache lookup failed for constraint %u", constrOid);
 		constrForm = (Form_pg_constraint) GETSTRUCT(tuple);
+
+		/*
+		 * As explained above: don't try to clone a constraint for which we're
+		 * going to clone the parent.
+		 */
+		if (list_member_oid(clone, constrForm->conparentid))
+		{
+			ReleaseSysCache(tuple);
+			continue;
+		}
 
 		/*
 		 * Because we're only expanding the key space at the referenced side,
@@ -11117,6 +11140,22 @@ ATExecAlterColumnType(AlteredTableInfo *tab, Relation rel,
 }
 
 /*
+ * Subroutine for ATExecAlterColumnType: remember that a replica identity
+ * needs to be reset.
+ */
+static void
+RememberReplicaIdentityForRebuilding(Oid indoid, AlteredTableInfo *tab)
+{
+	if (!get_index_isreplident(indoid))
+		return;
+
+	if (tab->replicaIdentityIndex)
+		elog(ERROR, "relation %u has multiple indexes marked as replica identity", tab->relid);
+
+	tab->replicaIdentityIndex = get_rel_name(indoid);
+}
+
+/*
  * Subroutine for ATExecAlterColumnType: remember that a constraint needs
  * to be rebuilt (which we might already know).
  */
@@ -11134,11 +11173,16 @@ RememberConstraintForRebuilding(Oid conoid, AlteredTableInfo *tab)
 	{
 		/* OK, capture the constraint's existing definition string */
 		char	   *defstring = pg_get_constraintdef_command(conoid);
+		Oid			indoid;
 
 		tab->changedConstraintOids = lappend_oid(tab->changedConstraintOids,
 												 conoid);
 		tab->changedConstraintDefs = lappend(tab->changedConstraintDefs,
 											 defstring);
+
+		indoid = get_constraint_index(conoid);
+		if (OidIsValid(indoid))
+			RememberReplicaIdentityForRebuilding(indoid, tab);
 	}
 }
 
@@ -11181,6 +11225,8 @@ RememberIndexForRebuilding(Oid indoid, AlteredTableInfo *tab)
 												indoid);
 			tab->changedIndexDefs = lappend(tab->changedIndexDefs,
 											defstring);
+
+			RememberReplicaIdentityForRebuilding(indoid, tab);
 		}
 	}
 }
@@ -11287,6 +11333,24 @@ ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab, LOCKMODE lockmode)
 
 		ObjectAddressSet(obj, RelationRelationId, oldId);
 		add_exact_object_address(&obj, objects);
+	}
+
+	/*
+	 * Queue up command to restore replica identity index marking
+	 */
+	if (tab->replicaIdentityIndex)
+	{
+		AlterTableCmd *cmd = makeNode(AlterTableCmd);
+		ReplicaIdentityStmt *subcmd = makeNode(ReplicaIdentityStmt);
+
+		subcmd->identity_type = REPLICA_IDENTITY_INDEX;
+		subcmd->name = tab->replicaIdentityIndex;
+		cmd->subtype = AT_ReplicaIdentity;
+		cmd->def = (Node *) subcmd;
+
+		/* do it after indexes and constraints */
+		tab->subcmds[AT_PASS_OLD_CONSTR] =
+			lappend(tab->subcmds[AT_PASS_OLD_CONSTR], cmd);
 	}
 
 	/*
