@@ -103,6 +103,7 @@ typedef struct deparse_expr_cxt
 								 * a base relation. */
 	StringInfo	buf;			/* output buffer to append to */
 	List	  **params_list;	/* exprs that will become remote Params */
+	List	  **row_exprs_list; /* used for later generation of equivalent subquery */
 } deparse_expr_cxt;
 
 #define REL_ALIAS_PREFIX	"r"
@@ -182,6 +183,7 @@ static void appendGroupByClause(List *tlist, deparse_expr_cxt *context);
 static void appendAggOrderBy(List *orderList, List *targetList,
 				 deparse_expr_cxt *context);
 static void appendFunctionName(Oid funcid, deparse_expr_cxt *context);
+static void deparseRowExpr(RowExpr *node, deparse_expr_cxt *context);
 static Node *deparseSortGroupClause(Index ref, List *tlist, bool force_colno,
 					   deparse_expr_cxt *context);
 
@@ -380,11 +382,16 @@ foreign_expr_walker(Node *node,
 				 * non-collation-sensitive context.
 				 */
 				collation = c->constcollid;
-				if (collation == InvalidOid ||
-					collation == DEFAULT_COLLATION_OID)
-					state = FDW_COLLATE_NONE;
-				else
-					state = FDW_COLLATE_UNSAFE;
+				switch(collation) {
+					case InvalidOid:
+						state = FDW_COLLATE_NONE;
+						break;
+					case DEFAULT_COLLATION_OID:
+						state = FDW_COLLATE_SAFE;
+						break;
+					default:
+						state = FDW_COLLATE_UNSAFE;
+				}
 			}
 			break;
 		case T_Param:
@@ -775,7 +782,37 @@ foreign_expr_walker(Node *node,
 					state = FDW_COLLATE_UNSAFE;
 			}
 			break;
-		default:
+	    case T_RowExpr:
+			{
+				RowExpr *re = (RowExpr *) node;
+
+				if(re->row_typeid != RECORDOID)
+				{
+					elog(NOTICE, "not a RECORDOID, returning false");
+					return false;
+				}
+
+				/*
+				 * Recurse to input subexpressions.
+				 */
+				if (!foreign_expr_walker((Node *) re->args,
+										 glob_cxt, &inner_cxt))
+					return false;
+
+				/*
+				 * From primnodes.h:
+				 *
+				 * We don't need to store a collation either.  The result type
+				 * is necessarily composite, and composite types never have a
+				 * collation.
+				 *
+				 * Bubble up collation state from args, just like for lists.
+				 */
+				collation = inner_cxt.collation;
+				state = inner_cxt.state;
+			}
+			break;
+	    default:
 
 			/*
 			 * If it's anything else, assume it's unsafe.  This list can be
@@ -985,6 +1022,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	deparse_expr_cxt context;
 	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) rel->fdw_private;
 	List	   *quals;
+	List	   *row_exprs_list = NIL;
 
 	/*
 	 * We handle relations for foreign tables, joins between those and upper
@@ -998,6 +1036,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	context.foreignrel = rel;
 	context.scanrel = IS_UPPER_REL(rel) ? fpinfo->outerrel : rel;
 	context.params_list = params_list;
+	context.row_exprs_list = &row_exprs_list;
 
 	/* Construct SELECT clause */
 	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
@@ -1117,6 +1156,7 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
 	RelOptInfo *scanrel = context->scanrel;
+	List 	  **row_exprs_list = context->row_exprs_list;
 
 	/* For upper relations, scanrel must be either a joinrel or a baserel */
 	Assert(!IS_UPPER_REL(context->foreignrel) ||
@@ -1124,6 +1164,32 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 
 	/* Construct FROM clause */
 	appendStringInfoString(buf, " FROM ");
+
+	// We have one or more row expressions. Add the corresponding subqueries
+	if (*row_exprs_list != NIL)
+	{
+		ListCell *lcre;
+		foreach(lcre, *row_exprs_list)
+		{
+			RowExpr    *node = (RowExpr *) lfirst(lcre);
+			bool		first;
+			ListCell   *lc;
+
+			appendStringInfoString(buf, "(SELECT ");
+			first = true;
+			foreach(lc, node->args)
+			{
+				if (!first)
+					appendStringInfo(buf, ", ");
+				deparseExpr((Expr *) lfirst(lc), context);
+				first = false;
+			}
+
+			appendStringInfoString(buf, " FROM ");
+
+		}
+	}
+
 	deparseFromExprForRel(buf, context->root, scanrel,
 						  (bms_num_members(scanrel->relids) > 1),
 						  (Index) 0, NULL, context->params_list);
@@ -1133,6 +1199,20 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 	{
 		appendStringInfoString(buf, " WHERE ");
 		appendConditions(quals, context);
+	}
+
+	// Close subquery and add an alias
+	if (*row_exprs_list != NIL)
+	{
+		ListCell *lc;
+		int i = list_length(*row_exprs_list);
+		foreach(lc, *row_exprs_list)
+		{
+			appendStringInfo(buf, ") %s%d",
+							 SUBQUERY_REL_ALIAS_PREFIX,
+							 i);
+			i--;
+		}
 	}
 }
 
@@ -2354,11 +2434,29 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_Aggref:
 			deparseAggref((Aggref *) node, context);
 			break;
+	    case T_RowExpr:
+			deparseRowExpr((RowExpr *) node, context);
+			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
 				 (int) nodeTag(node));
 			break;
 	}
+}
+
+static void
+deparseRowExpr(RowExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	List 	  **row_exprs_list = context->row_exprs_list;
+
+	// Just save the node for later generation of subquery
+	*row_exprs_list = lappend(*row_exprs_list, node);
+
+	// Add an arbitrary alias
+	appendStringInfo(buf, "%s%d",
+					 SUBQUERY_REL_ALIAS_PREFIX,
+					 list_length(*row_exprs_list));
 }
 
 /*
