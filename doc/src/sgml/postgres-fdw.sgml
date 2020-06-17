@@ -443,7 +443,7 @@
   </sect3>
  </sect2>
 
- <sect2>
+ <sect2 id="postgres-fdw-connection-management">
   <title>Connection Management</title>
 
   <para>
@@ -528,7 +528,7 @@
   </para>
  </sect2>
 
- <sect2>
+ <sect2 id="postgres-fdw-execution-environment">
   <title>Remote Query Execution Environment</title>
 
   <para>
@@ -582,6 +582,185 @@
    changing the session-level settings of these parameters; that is likely
    to cause <filename>postgres_fdw</filename> to malfunction.
   </para>
+ </sect2>
+
+ <sect2>
+  <title>Remote Execution of Arbitrary Queries</title>
+
+  <para>
+   In some instances it may be useful to ship queries to a remote server not
+   depending upon the local planning on a foreign table. To that end, <xref
+   linkend="postgres-fdw-query"/> can be used.
+  </para>
+  <para>
+   Mind that <emphasis>it is the user's responsibility</emphasis> to ensure
+   session state is not affected by queries sent through
+   <function>postgres_fdw_query()</function> to the remote server.
+  </para>    
+
+  <refentry id="postgres-fdw-query" xreflabel="postgres_fdw_query">
+   <indexterm>
+    <primary>postgres-fdw</primary>
+  </indexterm>
+
+  <refmeta>
+   <refentrytitle>postgres_fdw_query</refentrytitle>
+   <manvolnum>3</manvolnum>
+  </refmeta>
+
+  <refnamediv>
+   <refname>postgres_fdw_query</refname>
+   <refpurpose>executes a query in a foreign server</refpurpose>
+  </refnamediv>
+
+  <refsynopsisdiv>
+<synopsis>
+postgres_fdw_query(server name, sql text) returns setof record
+</synopsis>
+  </refsynopsisdiv>
+
+  <refsect1>
+   <title>Description</title>
+
+   <para>
+    <function>postgres_fdw_query</function> executes a query (usually a <command>SELECT</command>,
+    but it can be any SQL statement that returns rows) in a foreign server.
+   </para>
+  </refsect1>
+
+  <refsect1>
+   <title>Arguments</title>
+
+   <variablelist>
+    <varlistentry>
+     <term><parameter>server</parameter></term>
+     <listitem>
+      <para>
+       Name of the foreign server to use, defined with
+       <command>CREATE SERVER</command> and accessed with the applicable user
+       mapping.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><parameter>sql</parameter></term>
+     <listitem>
+      <para>
+       The SQL query that you wish to execute in the foreign server,
+       for example <literal>SELECT * FROM foo</literal>.
+      </para>
+     </listitem>
+    </varlistentry>
+   </variablelist>
+  </refsect1>
+
+  <refsect1>
+   <title>Return Value</title>
+
+   <para>
+    The function returns the row(s) produced by the query.  Since
+    <function>postgres_fdw_query</function> can be used with any query, it is
+    declared to return <type>record</type>, rather than specifying any
+    particular set of columns.  This means that you must specify the expected
+    set of columns in the calling query &mdash; otherwise
+    <productname>PostgreSQL</productname> would not know what to expect. Here
+    is an example:
+
+<programlisting>
+SELECT * FROM postgres_fdw_query('foreign_server', $$SELECT table_name,
+table_type
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+    ORDER BY table_name$$
+) AS schemas(table_name text, table_type text);
+</programlisting>
+
+    The <quote>alias</quote> part of the <literal>FROM</literal> clause must
+    specify the column names and types that the function will return.
+   </para>
+  </refsect1>
+
+  <refsect1>
+   <title>Caveats</title>
+
+   <para>
+    The function <function>postgres_fdw_query</function> does not perform any
+    checks on the input <parameter>sql</parameter>.
+   </para>
+
+   <para>
+    It also has the potential to change the state of the remote session. In
+    particular, it is recommended <emphasis>not</emphasis> to change
+    session-level settings and avoid using prepared statements prefixed with
+    <literal>pgsql_fdw_prep_</literal>. Otherwise it can interfere with the
+    regular functioning of <literal>postgres_fdw</literal>. It it is the
+    caller's responsibility not to interfere the session state managed by
+    <literal>postgres_fdw</literal>.
+   </para>
+
+   <para>
+    Please see <xref linkend="postgres-fdw-connection-management" /> and <xref
+    linkend="postgres-fdw-execution-environment" /> to understand how
+    connections and sessions are managed by <literal>postgres_fdw</literal>.
+   </para>
+
+   <para>
+    As an alternative, the older <xref linkend="dblink"/> module offers
+    similar functionality and sessions are managed independently from
+    <literal>postgres_fdw</literal>.
+   </para>
+
+  </refsect1>
+
+  <refsect1>
+   <title>Examples</title>
+
+<screen>
+-- Simple query
+SELECT * FROM postgres_fdw_query('loopback', 'SELECT 42') AS t(i int);
+ i  
+----
+ 42
+(1 row)
+
+-- Retrieve info from the foreign information_schema
+SELECT * FROM postgres_fdw_query('loopback', $$SELECT table_name, table_type
+    FROM information_schema.tables
+    WHERE table_schema = 'S 1'
+    ORDER BY table_name$$
+) AS schemas(table_name text, table_type text);
+ table_name | table_type 
+------------+------------
+ T 1        | BASE TABLE
+ T 2        | BASE TABLE
+ T 3        | BASE TABLE
+ T 4        | BASE TABLE
+(4 rows)
+
+-- Prepared statements
+SELECT * FROM postgres_fdw_query('loopback', $$PREPARE fooplan (int) AS
+SELECT $1 + 42$$) AS t(res text);
+   res   
+---------
+ PREPARE
+(1 row)
+
+SELECT * FROM postgres_fdw_query('loopback', 'EXECUTE fooplan (1)') AS t(i int);
+ i  
+----
+ 43
+(1 row)
+
+SELECT * FROM postgres_fdw_query('loopback', 'DEALLOCATE fooplan') AS t(res text);
+    res     
+------------
+ DEALLOCATE
+(1 row)
+</screen>
+  </refsect1>
+ </refentry>
+  
  </sect2>
 
  <sect2>

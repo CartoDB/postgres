@@ -2407,3 +2407,33 @@ SELECT b, avg(a), max(a), count(*) FROM pagg_tab GROUP BY b HAVING sum(a) < 700 
 
 -- Clean-up
 RESET enable_partitionwise_aggregate;
+
+
+-- ===================================================================
+-- test postgres_fdw_query(server name, sql text)
+-- ===================================================================
+
+-- Most simple SELECT through postgres_fdw_query
+SELECT * FROM postgres_fdw_query('loopback', 'SELECT 42') AS t(i int);
+
+-- Select schemas owned by the role configured in the user mapping
+SELECT * FROM postgres_fdw_query('loopback', $$SELECT s.nspname
+    FROM pg_catalog.pg_namespace s
+    JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+    WHERE u.usename = current_user
+    ORDER BY s.nspname$$
+) AS schemas(schema_name name);
+
+-- Select tables and views in a given foreign schema that the role
+-- configured in the user mapping has access to
+SELECT * FROM postgres_fdw_query('loopback', $$SELECT table_name, table_type
+    FROM information_schema.tables
+    WHERE table_schema = 'S 1'
+    ORDER BY table_name$$
+) AS schemas(table_name text, table_type text);
+
+-- Test we can send commands (e.g: prepared statements)
+SELECT * FROM postgres_fdw_query('loopback', $$PREPARE fooplan (int) AS
+SELECT $1 + 42$$) AS t(res text);
+SELECT * FROM postgres_fdw_query('loopback', 'EXECUTE fooplan (1)') AS t(i int);
+SELECT * FROM postgres_fdw_query('loopback', 'DEALLOCATE fooplan') AS t(res text);

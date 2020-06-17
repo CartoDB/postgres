@@ -5900,3 +5900,200 @@ find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 	/* We didn't find any suitable equivalence class expression */
 	return NULL;
 }
+
+
+
+static void prepTuplestoreResult(FunctionCallInfo fcinfo);
+
+PG_FUNCTION_INFO_V1(postgres_fdw_query);
+
+Datum
+postgres_fdw_query(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo 	*rsinfo;
+	Name             server_name;
+	text            *sql_text;
+	char            *server;
+	char 			*sql;
+	Oid			     userid;
+	PGconn	   		*conn;
+	UserMapping     *user_mapping;
+	ForeignServer   *foreign_server;
+	PGresult   		*res = NULL;
+	TupleDesc	     tupdesc;
+	int				 ntuples;
+	int 			 nfields;
+	bool			 is_sql_cmd;
+
+	prepTuplestoreResult(fcinfo);
+	rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	/* One-time setup code appears here: */
+
+	// Get input args
+	server_name = PG_GETARG_NAME(0);
+	sql_text = PG_GETARG_TEXT_PP(1);
+
+	server = NameStr(*server_name);
+	sql = text_to_cstring(sql_text);
+
+	elog(DEBUG3, "server = %s", server);
+	elog(DEBUG3, "sql = %s", sql);
+
+	// Get a connection to the server with the current user
+	userid = GetUserId();
+	foreign_server = GetForeignServerByName(server, false);
+	user_mapping = GetUserMapping(userid, foreign_server->serverid);
+	conn = GetConnection(user_mapping, false);
+
+	// Execute the sql query
+	PG_TRY();
+	{
+		res = pgfdw_exec_query(conn, sql);
+
+		if (PQresultStatus(res) == PGRES_COMMAND_OK)
+		{
+			is_sql_cmd = true;
+
+			/*
+			 * need a tuple descriptor representing one TEXT column to return
+			 * the command status string as our result tuple
+			 */
+			tupdesc = CreateTemplateTupleDesc(1, false);
+			TupleDescInitEntry(tupdesc, (AttrNumber) 1, "status",
+							   TEXTOID, -1, 0);
+			ntuples = 1;
+			nfields = 1;
+		}
+		else
+		{
+			is_sql_cmd = false;
+
+			if (PQresultStatus(res) != PGRES_TUPLES_OK)
+				pgfdw_report_error(ERROR, res, conn, false, sql);
+
+			nfields = PQnfields(res);
+
+			/* get a tuple descriptor for our result type */
+			switch (get_call_result_type(fcinfo, NULL, &tupdesc))
+			{
+				case TYPEFUNC_COMPOSITE:
+					/* success */
+					break;
+				case TYPEFUNC_RECORD:
+					/* failed to determine actual type of RECORD */
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("function returning record called in context "
+									"that cannot accept type record")));
+					break;
+				default:
+					/* result type isn't composite */
+					elog(ERROR, "return type must be a row type");
+					break;
+			}
+
+			/* make sure we have a persistent copy of the tupdesc */
+			tupdesc = CreateTupleDescCopy(tupdesc);
+			ntuples = PQntuples(res);
+			nfields = PQnfields(res);
+		}
+
+		/* check result and tuple descriptor have the same number of columns */
+		if (nfields != tupdesc->natts)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("remote query result rowtype does not match "
+							"the specified FROM clause rowtype")));
+
+		if (ntuples > 0)
+		{
+			AttInMetadata *attinmeta;
+			Tuplestorestate *tupstore;
+			MemoryContext oldcontext;
+			int			row;
+			char	  **values;
+
+			attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+			oldcontext = MemoryContextSwitchTo(
+				rsinfo->econtext->ecxt_per_query_memory);
+			tupstore = tuplestore_begin_heap(true, false, work_mem);
+			rsinfo->setResult = tupstore;
+			rsinfo->setDesc = tupdesc;
+			MemoryContextSwitchTo(oldcontext);
+
+			values = (char **) palloc(nfields * sizeof(char *));
+
+			/* put all tuples into the tuplestore */
+			for (row = 0; row < ntuples; row++)
+			{
+				HeapTuple	tuple;
+
+				if (is_sql_cmd)
+				{
+					values[0] = PQcmdStatus(res);
+				}
+				else
+				{
+					int			i;
+
+					for (i = 0; i < nfields; i++)
+					{
+						if (PQgetisnull(res, row, i))
+							values[i] = NULL;
+						else
+							values[i] = PQgetvalue(res, row, i);
+					}
+				}
+
+				/* build the tuple and put it into the tuplestore. */
+				tuple = BuildTupleFromCStrings(attinmeta, values);
+				tuplestore_puttuple(tupstore, tuple);
+			}
+
+			/* clean up and return the tuplestore */
+			tuplestore_donestoring(tupstore);
+		}
+
+		PQclear(res);
+	}
+	PG_CATCH();
+	{
+		if (res)
+			PQclear(res);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	ReleaseConnection(conn);
+	return (Datum) 0;
+}
+
+/*
+ * Verify function caller can handle a tuplestore result, and set up for that.
+ *
+ * Note: if the caller returns without actually creating a tuplestore, the
+ * executor will treat the function result as an empty set.
+ */
+static void
+prepTuplestoreResult(FunctionCallInfo fcinfo)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	/* check to see if query supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* let the executor know we're sending back a tuplestore */
+	rsinfo->returnMode = SFRM_Materialize;
+
+	/* caller must fill these to return a non-empty result */
+	rsinfo->setResult = NULL;
+	rsinfo->setDesc = NULL;
+}
